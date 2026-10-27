@@ -141,13 +141,21 @@ export function serviceQuotaState(
   return { used, limit, constrained: true };
 }
 
+/** The object-storage quota display; `used` undefined means "cannot provision here", i.e. unconstrained. */
+function objectStorageQuotaState(
+  limit: number,
+  used: number | undefined
+): { used: number; limit: number; constrained: boolean } {
+  return used === undefined || limit <= 0 ? { used: 0, limit, constrained: false } : { used, limit, constrained: true };
+}
+
 /**
  * The object-storage block of `GET /db/:name` (#301), plus the set of apps
  * holding an allocation for the quota display. Never throws: a corrupt
  * allocation store reports `unreadable` (and no quota data) rather than
  * taking the whole panel down — the attach itself fails closed regardless.
  */
-async function objectStorageFields(name: string): Promise<{
+async function objectStorageFields(name: string, ownerUserId: string | undefined): Promise<{
   view: {
     provisioned: boolean;
     available: boolean;
@@ -155,7 +163,8 @@ async function objectStorageFields(name: string): Promise<{
     region?: string;
     unreadable?: true;
   };
-  allocated?: Set<string>;
+  /** The owner's bucket count — the provisioner's own, shared with the attach enforcer. */
+  used?: number;
 }> {
   const provisioner = getObjectStorageProvisioner();
   try {
@@ -163,6 +172,10 @@ async function objectStorageFields(name: string): Promise<{
       provisioner.availability(),
       provisioner.listAllocations(),
     ]);
+    // Kept (retired) buckets count too, and have no app to be found through,
+    // so this is NOT derived from `allocations`.
+    const used =
+      availability.available && ownerUserId ? await provisioner.countForOwner(ownerUserId) : undefined;
     const mine = allocations.find((a) => a.appName === name);
     return {
       view: {
@@ -172,7 +185,7 @@ async function objectStorageFields(name: string): Promise<{
       },
       // No quota to show on a platform that cannot provision at all — the
       // same reason Postgres/Redis report unconstrained without a provisioner.
-      allocated: availability.available ? new Set(allocations.map((a) => a.appName)) : undefined,
+      used,
     };
   } catch (err) {
     console.warn(`[db] object storage state unreadable for '${name}':`, err);
@@ -225,7 +238,7 @@ db.get('/:name', async c => {
 
   const redisProvisioner = getRedisProvisioner();
   const dbProvisioner = getDatabaseProvisioner();
-  const objectStorage = await objectStorageFields(name);
+  const objectStorage = await objectStorageFields(name, ownerUserId);
   const serviceFields = {
     redis: { provisioned: redisProvisioner?.isProvisioned(name) ?? false },
     // #301. Bucket and region only — never the key, which is the app's.
@@ -254,12 +267,7 @@ db.get('/:name', async c => {
         redisProvisioner ? (n) => redisProvisioner.isProvisioned(n) : undefined
       ),
       // Truthy-gated like Postgres — see checkObjectStorageQuota (platform.ts).
-      'object-storage': serviceQuotaState(
-        ownerUserId,
-        getMaxObjectStoragePerUser(),
-        Boolean(ownerUserId),
-        objectStorage.allocated ? (n) => objectStorage.allocated!.has(n) : undefined
-      ),
+      'object-storage': objectStorageQuotaState(getMaxObjectStoragePerUser(), objectStorage.used),
     },
   };
 

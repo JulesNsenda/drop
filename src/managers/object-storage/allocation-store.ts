@@ -16,7 +16,8 @@ import { encrypt, decrypt, loadPlatformMasterKey, EncryptedData } from '../secre
 import type { AppStorageAllocation, AppStorageCredentials } from './types';
 
 interface StoredAllocation extends AppStorageAllocation {
-  secretAccessKey: EncryptedData;
+  /** Absent on a retired record: nothing reads a key back once its app is gone. */
+  secretAccessKey?: EncryptedData;
 }
 
 /**
@@ -54,6 +55,14 @@ export class AllocationStore {
     return allocation;
   }
 
+  /** A retired record by its key (see `listRetired`), or null. */
+  async getRetired(key: string): Promise<AppStorageAllocation | null> {
+    const stored = own(await this.load(), key);
+    if (!stored?.retired) return null;
+    const { secretAccessKey: _secret, ...allocation } = stored;
+    return allocation;
+  }
+
   /** Every LIVE allocation (one per app), without secrets. */
   async list(): Promise<AppStorageAllocation[]> {
     return Object.values(await this.load())
@@ -72,6 +81,7 @@ export class AllocationStore {
   async getCredentials(appName: string): Promise<AppStorageCredentials | null> {
     const stored = own(await this.load(), appName);
     if (!stored) return null;
+    if (stored.retired || !stored.secretAccessKey) return null;
     const key = await loadPlatformMasterKey(this.keyFilePath);
     if (!key) throw new Error('encryption.key is absent or not 32 bytes — cannot read storage credentials');
     return { ...stored, secretAccessKey: decrypt(stored.secretAccessKey, key) };
@@ -97,17 +107,48 @@ export class AllocationStore {
    * tenant's bucket — and its key — to whoever registers that name next,
    * because provisioning is idempotent on exactly this lookup. `#` cannot
    * appear in an app name, so the new key can never be asked for by one.
+   *
+   * The app's key secret is dropped here: a retired record is only ever torn
+   * down by the names of its resources, never run.
+   *
+   * Returns the retired record's key, or null when the app had none.
    */
-  async retire(appName: string, reason: 'teardown-failed' | 'kept'): Promise<void> {
+  async retire(appName: string, reason: 'teardown-failed' | 'kept'): Promise<string | null> {
+    let retiredKey: string | null = null;
     await this.write(async (file) => {
       const stored = own(file, appName);
       if (!stored) return;
       const at = new Date().toISOString();
       let key = `${appName}#retired-${Date.now()}`;
       for (let n = 1; Object.hasOwn(file, key); n += 1) key = `${appName}#retired-${Date.now()}-${n}`;
-      file[key] = { ...stored, retired: { at, reason } };
+      const { secretAccessKey: _secret, ...rest } = stored;
+      file[key] = { ...rest, retired: { at, reason } };
       delete file[appName];
+      retiredKey = key;
     });
+    return retiredKey;
+  }
+
+  /**
+   * Merge fields into an existing record — live (keyed by app name) or
+   * retired (keyed as `listRetired` reports). False when there is none.
+   */
+  async amend(key: string, fields: Partial<Pick<AppStorageAllocation, 'accessRevoked'>> & {
+    retiredReason?: 'teardown-failed' | 'kept';
+  }): Promise<boolean> {
+    let found = false;
+    await this.write(async (file) => {
+      const stored = own(file, key);
+      if (!stored) return;
+      found = true;
+      const { retiredReason, ...rest } = fields;
+      file[key] = {
+        ...stored,
+        ...rest,
+        ...(retiredReason && stored.retired ? { retired: { ...stored.retired, reason: retiredReason } } : {}),
+      };
+    });
+    return found;
   }
 
   /** Forget a retired record, once its resources are gone. */

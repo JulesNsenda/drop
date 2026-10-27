@@ -24,6 +24,7 @@ import {
   getObjectStorageProvisioner,
   getStorageCredentialStore,
   AWS_REGION_RE,
+  AllocationStoreCorruptError,
   BUCKET_PREFIX_RE,
 } from '../../managers/object-storage';
 import type { ObjectStorageSettings } from '../../managers/settings/settings-manager';
@@ -1156,6 +1157,63 @@ admin.post('/object-storage/test', async (c) => {
   const authRefusal = requireAuthForStorageRoutes();
   if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
   return c.json(success(await getObjectStorageProvisioner().testConnection()));
+});
+
+// GET /admin/object-storage/retired - buckets whose app was deleted and which
+// DROP did not destroy: `kept` ones (a keepData delete — the bucket is the
+// owner's data, nobody else is allowed to remove it) and teardown failures the
+// sweep is still retrying. They still bill the operator, and still count
+// against their owner's cap. Metadata only: no key exists on these records.
+admin.get('/object-storage/retired', async (c) => {
+  const authRefusal = requireAuthForStorageRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+  try {
+    const records = await getObjectStorageProvisioner().listRetiredRecords();
+    return c.json(
+      success({
+        retired: records.map(({ id, allocation }) => ({
+          id,
+          appName: allocation.appName,
+          bucket: allocation.bucket,
+          region: allocation.region,
+          ownerUserId: allocation.ownerUserId ?? null,
+          retiredAt: allocation.retired?.at ?? null,
+          reason: allocation.retired?.reason ?? null,
+          accessRevoked: allocation.accessRevoked === true,
+        })),
+      })
+    );
+  } catch (err) {
+    if (err instanceof AllocationStoreCorruptError) {
+      return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'The object-storage allocation store is unreadable.'), 503);
+    }
+    throw err;
+  }
+});
+
+// DELETE /admin/object-storage/retired/:id - DESTROY a kept bucket: every
+// object, then the bucket. The only way a `kept` record ever goes away.
+admin.delete('/object-storage/retired/:id', async (c) => {
+  const authRefusal = requireAuthForStorageRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const id = c.req.param('id');
+  let result;
+  try {
+    result = await getObjectStorageProvisioner().destroyRetired(id);
+  } catch (err) {
+    if (err instanceof AllocationStoreCorruptError) {
+      return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'The object-storage allocation store is unreadable.'), 503);
+    }
+    // The AWS error NAME only — a raw message can carry request detail.
+    return c.json(
+      error(ErrorCodes.SERVICE_UNAVAILABLE, `The bucket could not be removed (${(err as { name?: string })?.name || 'Error'}); retry once AWS is reachable.`),
+      503
+    );
+  }
+  if (!result) return c.json(error(ErrorCodes.NOT_FOUND, 'No such retired bucket'), 404);
+  await logActivityFor(authCtx, { action: 'object-storage-settings-set', detail: `Destroyed retired bucket ${id}` });
+  return c.json(success({ destroyed: true, objectsDeleted: result.objectsDeleted, bucketDeleted: result.bucketDeleted }));
 });
 
 export default admin;

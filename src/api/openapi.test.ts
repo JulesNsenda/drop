@@ -153,6 +153,9 @@ describe('GET /api/v1/openapi.json (#297)', () => {
       ['GET', '/api/v1/auth/users', 'admin'],
       ['GET', '/api/v1/auth/me', 'authenticated'],
       ['GET', '/api/v1/health/stats', 'readonly'],
+      // #301: kept buckets are the owner's data, so listing and destroying them is admin-only.
+      ['GET', '/api/v1/admin/object-storage/retired', 'admin'],
+      ['DELETE', '/api/v1/admin/object-storage/retired/{id}', 'admin'],
     ])('%s %s has floor %s', (method, p, role) => {
       const operation = op(method, p);
       expect(operation['x-drop-min-role']).toBe(role);

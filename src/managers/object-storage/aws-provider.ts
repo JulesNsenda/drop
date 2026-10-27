@@ -37,7 +37,7 @@ import {
   DeleteUserCommand,
 } from '@aws-sdk/client-iam';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
-import { IAM_USER_PATH, assertGeneratedResourcePair, bucketOnlyPolicy } from './naming';
+import { IAM_USER_PATH, assertGeneratedResourcePair, assertGeneratedUserName, bucketOnlyPolicy } from './naming';
 import type { ObjectStorageProvider, StorageDeprovisionResult } from './types';
 
 /** The one method DROP uses on each SDK client — injectable for tests. */
@@ -158,6 +158,11 @@ export class AwsObjectStorageProvider implements ObjectStorageProvider {
     const userDeleted = await this.removeUser(input.userName);
     const { objectsDeleted, bucketDeleted } = await this.removeBucket(input.bucket);
     return { objectsDeleted, bucketDeleted, userDeleted };
+  }
+
+  async revokeAccess(input: { userName: string }): Promise<boolean> {
+    assertGeneratedUserName(input.userName);
+    return this.removeUser(input.userName);
   }
 
   async whoAmI(): Promise<{ account: string }> {

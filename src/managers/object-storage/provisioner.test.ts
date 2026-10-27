@@ -58,6 +58,7 @@ describe('object storage stores and provisioner', () => {
     allocations = new AllocationStore(path.join(dir, 'object-storage.json'), keyFile);
     provider = {
       provision: jest.fn().mockResolvedValue({ accessKeyId: 'AKIAAPP', secretAccessKey: 'app-secret-value' }),
+      revokeAccess: jest.fn().mockResolvedValue(true),
       deprovision: jest.fn().mockResolvedValue({ objectsDeleted: 3, bucketDeleted: true, userDeleted: true }),
       whoAmI: jest.fn().mockResolvedValue({ account: '123456789012' }),
     };
@@ -310,15 +311,81 @@ describe('object storage stores and provisioner', () => {
         expect(provider.provision).toHaveBeenCalledTimes(2);
       });
 
-      it('keeps the resources for a keepData delete, but still frees the name', async () => {
+      it('keeps ONLY the bucket for a keepData delete: key revoked, user deleted, name freed, no secret kept', async () => {
         await configure();
         const p = makeProvisioner();
-        await p.provisionAppStorage('site');
+        const live = await p.provisionAppStorage('site', { ownerUserId: 'u1' });
 
         expect(await p.teardownForDeletedApp('site', { keepData: true })).toEqual({ outcome: 'retired', reason: 'kept' });
         expect(provider.deprovision).not.toHaveBeenCalled();
+        expect(provider.revokeAccess).toHaveBeenCalledWith({ userName: live.userName });
         expect(await p.getAllocation('site')).toBeNull();
-        expect(await p.listRetired()).toEqual([expect.objectContaining({ retired: expect.objectContaining({ reason: 'kept' }) })]);
+        expect(await p.listRetired()).toEqual([
+          expect.objectContaining({
+            bucket: live.bucket,
+            ownerUserId: 'u1',
+            accessRevoked: true,
+            retired: expect.objectContaining({ reason: 'kept' }),
+          }),
+        ]);
+        expect(await fs.readFile(path.join(dir, 'object-storage.json'), 'utf-8')).not.toMatch(/secretAccessKey|app-secret-value/);
+      });
+
+      it('finishes revoking a kept bucket whose key AWS would not revoke at delete time', async () => {
+        await configure();
+        const p = makeProvisioner();
+        await p.provisionAppStorage('site', { ownerUserId: 'u1' });
+        provider.revokeAccess.mockRejectedValueOnce(new Error('Throttling'));
+
+        await p.teardownForDeletedApp('site', { keepData: true });
+        expect((await p.listRetired())[0].accessRevoked).toBeFalsy();
+
+        expect(await p.sweepRetired()).toEqual({ destroyed: 0, failed: 0 });
+        expect(provider.revokeAccess).toHaveBeenCalledTimes(2);
+        expect((await p.listRetired())[0].accessRevoked).toBe(true);
+        expect(provider.deprovision).not.toHaveBeenCalled();
+      });
+
+      it('counts kept buckets against the owner cap, so attach->keepData->re-attach cannot escape it', async () => {
+        await configure();
+        const p = makeProvisioner();
+        const cap = 3;
+        let refusedAt = -1;
+        for (let i = 0; i < 6; i += 1) {
+          if ((await p.countForOwner('u1')) >= cap) {
+            refusedAt = i;
+            break;
+          }
+          await p.provisionAppStorage('site', { ownerUserId: 'u1' });
+          await p.teardownForDeletedApp('site', { keepData: true });
+        }
+
+        expect(refusedAt).toBe(cap);
+        expect(await p.countForOwner('u1')).toBe(cap);
+        expect(await p.countForOwner('someone-else')).toBe(0);
+        // A live allocation counts in the same figure.
+        await p.provisionAppStorage('other', { ownerUserId: 'u1' });
+        expect(await p.countForOwner('u1')).toBe(cap + 1);
+      });
+
+      it('lets an admin destroy a kept bucket, and only then forgets it', async () => {
+        await configure();
+        const p = makeProvisioner();
+        const live = await p.provisionAppStorage('site', { ownerUserId: 'u1' });
+        await p.teardownForDeletedApp('site', { keepData: true });
+        const [{ id }] = await p.listRetiredRecords();
+
+        provider.deprovision.mockRejectedValueOnce(new Error('AccessDenied'));
+        await expect(p.destroyRetired(id)).rejects.toThrow('AccessDenied');
+        expect(await p.listRetiredRecords()).toHaveLength(1);
+
+        expect(await p.destroyRetired(id)).toEqual({ objectsDeleted: 3, bucketDeleted: true, userDeleted: true });
+        expect(provider.deprovision).toHaveBeenLastCalledWith({ bucket: live.bucket, userName: live.userName });
+        expect(await p.listRetiredRecords()).toEqual([]);
+        expect(await p.destroyRetired(id)).toBeNull();
+        // A live allocation's name is not a retired id.
+        await p.provisionAppStorage('site', { ownerUserId: 'u1' });
+        expect(await p.destroyRetired('site')).toBeNull();
       });
 
       it('refuses to act on a corrupt allocation store rather than treat it as empty', async () => {

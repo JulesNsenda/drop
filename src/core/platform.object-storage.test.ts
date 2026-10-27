@@ -66,6 +66,7 @@ describe('DropPlatform object storage (#301)', () => {
     getEnvVars: jest.Mock;
     getAllocation: jest.Mock;
     listAllocations: jest.Mock;
+    countForOwner: jest.Mock;
     canDeprovision: jest.Mock;
     deprovisionAppStorage: jest.Mock;
     teardownForDeletedApp: jest.Mock;
@@ -75,6 +76,8 @@ describe('DropPlatform object storage (#301)', () => {
   const stubStorage = (opts?: {
     available?: boolean;
     allocated?: string[];
+    /** app -> owner, for the quota count. */
+    owners?: Record<string, string>;
     canDeprovision?: boolean;
   }): StorageStub => {
     const allocated = new Set(opts?.allocated ?? []);
@@ -93,6 +96,9 @@ describe('DropPlatform object storage (#301)', () => {
         allocated.has(name) ? { appName: name, bucket: ENV.S3_BUCKET, region: 'eu-central-1' } : null
       ),
       listAllocations: jest.fn(async () => [...allocated].map((appName) => ({ appName }))),
+      countForOwner: jest.fn(
+        async (owner: string) => [...allocated].filter((name) => opts?.owners?.[name] === owner).length
+      ),
       canDeprovision: jest.fn().mockResolvedValue(opts?.canDeprovision ?? true),
       deprovisionAppStorage: jest.fn(async (name: string) => {
         allocated.delete(name);
@@ -129,7 +135,7 @@ describe('DropPlatform object storage (#301)', () => {
 
       expect(result).toEqual({ attached: true, envVarNames: Object.keys(ENV) });
       expect(JSON.stringify(result)).not.toContain(ENV.AWS_SECRET_ACCESS_KEY);
-      expect(storage.provisionAppStorage).toHaveBeenCalledWith(appName);
+      expect(storage.provisionAppStorage).toHaveBeenCalledWith(appName, { ownerUserId: baseState().userId });
       expect(setServiceIntent).toHaveBeenCalledWith(appName, 'object-storage', 'attached');
       expect(storage.provisionAppStorage.mock.invocationCallOrder[0]).toBeLessThan(
         setServiceIntent.mock.invocationCallOrder[0]
@@ -220,7 +226,7 @@ describe('DropPlatform object storage (#301)', () => {
         baseStateFixture('c', { userId: 'someone-else' }),
       ]);
       stubSecrets();
-      const storage = stubStorage({ allocated: ['a', 'b', 'c'] });
+      const storage = stubStorage({ allocated: ['a', 'b', 'c'], owners: { a: 'user-1', b: 'user-1', c: 'someone-else' } });
 
       expect(await platform.attachService(appName, 'object-storage')).toEqual({
         attached: false,

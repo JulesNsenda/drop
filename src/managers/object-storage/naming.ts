@@ -68,10 +68,14 @@ const GENERATED_USER_RE = /^drop-[a-z0-9][a-z0-9-]*-[A-Za-z0-9_-]+-[0-9a-f]{8}$/
  * remove what the old prefix created.
  */
 export function isGeneratedResourcePair(bucket: unknown, userName: unknown): boolean {
-  if (typeof bucket !== 'string' || typeof userName !== 'string') return false;
-  if (bucket.length < 3 || bucket.length > 63 || userName.length > 64) return false;
-  if (!GENERATED_BUCKET_RE.test(bucket) || !GENERATED_USER_RE.test(userName)) return false;
+  if (!isGeneratedUserName(userName) || typeof bucket !== 'string') return false;
+  if (bucket.length < 3 || bucket.length > 63 || !GENERATED_BUCKET_RE.test(bucket)) return false;
   return bucket.match(SUFFIX_RE)?.[0] === userName.match(SUFFIX_RE)?.[0];
+}
+
+/** The user half of the check, for revoking a user without touching its bucket. */
+export function isGeneratedUserName(userName: unknown): userName is string {
+  return typeof userName === 'string' && userName.length <= 64 && GENERATED_USER_RE.test(userName);
 }
 
 export class UnsafeResourceNameError extends Error {
@@ -84,6 +88,11 @@ export class UnsafeResourceNameError extends Error {
 /** Throws UnsafeResourceNameError unless the pair has the shape DROP generates. */
 export function assertGeneratedResourcePair(bucket: unknown, userName: unknown): void {
   if (!isGeneratedResourcePair(bucket, userName)) throw new UnsafeResourceNameError();
+}
+
+/** Throws UnsafeResourceNameError unless the user name has the shape DROP generates. */
+export function assertGeneratedUserName(userName: unknown): void {
+  if (!isGeneratedUserName(userName)) throw new UnsafeResourceNameError();
 }
 
 /** A policy granting object read/write/list on one bucket, and nothing else. */

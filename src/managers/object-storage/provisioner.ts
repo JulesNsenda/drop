@@ -110,7 +110,10 @@ export class ObjectStorageProvisioner {
    * idempotent, so a retried attach recovers instead of creating a second
    * bucket. Throws ObjectStorageUnavailableError when not configured.
    */
-  async provisionAppStorage(appName: string): Promise<AppStorageAllocation> {
+  async provisionAppStorage(
+    appName: string,
+    owner: { ownerUserId?: string } = {}
+  ): Promise<AppStorageAllocation> {
     const existing = await this.allocations.get(appName);
     if (existing) return existing;
 
@@ -132,6 +135,7 @@ export class ObjectStorageProvisioner {
       userName,
       accessKeyId: key.accessKeyId,
       createdAt: new Date().toISOString(),
+      ...(owner.ownerUserId ? { ownerUserId: owner.ownerUserId } : {}),
     };
     try {
       await this.allocations.put({ ...allocation, secretAccessKey: key.secretAccessKey });
@@ -202,7 +206,11 @@ export class ObjectStorageProvisioner {
     const allocation = await this.allocations.get(appName);
     if (!allocation) return { outcome: 'none' };
     if (opts.keepData) {
-      await this.allocations.retire(appName, 'kept');
+      // The bucket is the owner's data; the credential is not. Retire the
+      // record, then revoke the key and delete the IAM user so nothing keeps
+      // write access to a bucket with no app. Only the bucket is kept.
+      const key = await this.allocations.retire(appName, 'kept');
+      if (key) await this.revokeRetiredAccess(key, allocation).catch(() => undefined);
       return { outcome: 'retired', reason: 'kept' };
     }
     try {
@@ -221,7 +229,11 @@ export class ObjectStorageProvisioner {
    */
   async sweepRetired(): Promise<{ destroyed: number; failed: number }> {
     const pending = (await this.allocations.listRetired()).filter(
-      ({ allocation }) => allocation.retired?.reason === 'teardown-failed'
+      ({ allocation }) =>
+        allocation.retired?.reason === 'teardown-failed' ||
+        // A kept bucket whose key could not be revoked at delete time: finish
+        // that half. Its bucket is still never touched.
+        (allocation.retired?.reason === 'kept' && !allocation.accessRevoked)
     );
     if (pending.length === 0 || !(await this.credentials.isConfigured())) {
       return { destroyed: 0, failed: 0 };
@@ -231,6 +243,10 @@ export class ObjectStorageProvisioner {
     for (const { key, allocation } of pending) {
       try {
         assertGeneratedResourcePair(allocation.bucket, allocation.userName);
+        if (allocation.retired?.reason === 'kept') {
+          await this.revokeRetiredAccess(key, allocation);
+          continue;
+        }
         const provider = await this.providerFor(allocation.region);
         await provider.deprovision({ bucket: allocation.bucket, userName: allocation.userName });
         await this.allocations.removeRetired(key);
@@ -242,9 +258,52 @@ export class ObjectStorageProvisioner {
     return { destroyed, failed };
   }
 
+  /** Revoke a retired record's IAM key and user, and remember that it is done. */
+  private async revokeRetiredAccess(key: string, allocation: AppStorageAllocation): Promise<void> {
+    assertGeneratedResourcePair(allocation.bucket, allocation.userName);
+    const provider = await this.providerFor(allocation.region);
+    await provider.revokeAccess({ userName: allocation.userName });
+    await this.allocations.amend(key, { accessRevoked: true });
+  }
+
   /** Retired allocations, for the operator's view. */
   async listRetired(): Promise<AppStorageAllocation[]> {
     return (await this.allocations.listRetired()).map(({ allocation }) => allocation);
+  }
+
+  /** Retired allocations with the id `destroyRetired` takes — the admin view. */
+  async listRetiredRecords(): Promise<Array<{ id: string; allocation: AppStorageAllocation }>> {
+    return (await this.allocations.listRetired()).map(({ key, allocation }) => ({ id: key, allocation }));
+  }
+
+  /**
+   * DESTROY a retired bucket on an admin's say-so (a `kept` one is otherwise
+   * never touched). The record is forgotten only once AWS reports it gone.
+   * Null when there is no such retired record.
+   */
+  async destroyRetired(id: string): Promise<StorageDeprovisionResult | null> {
+    const allocation = await this.allocations.getRetired(id);
+    if (!allocation) return null;
+    assertGeneratedResourcePair(allocation.bucket, allocation.userName);
+    const provider = await this.providerFor(allocation.region);
+    const result = await provider.deprovision({ bucket: allocation.bucket, userName: allocation.userName });
+    await this.allocations.removeRetired(id);
+    return result;
+  }
+
+  /**
+   * How many buckets this user holds in the operator's AWS account: live
+   * allocations AND retired ones (a kept bucket bills exactly like a live
+   * one). The ONE count both the attach enforcer and the dashboard display
+   * use. A corrupt store throws — it must never read as "none used".
+   */
+  async countForOwner(ownerUserId: string): Promise<number> {
+    const live = await this.allocations.list();
+    const retired = await this.allocations.listRetired();
+    return (
+      live.filter((a) => a.ownerUserId === ownerUserId).length +
+      retired.filter(({ allocation }) => allocation.ownerUserId === ownerUserId).length
+    );
   }
 
   /** Check the admin credential against AWS. Never throws; the message is AWS's error name only. */

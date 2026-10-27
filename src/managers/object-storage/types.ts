@@ -15,10 +15,24 @@ export interface AppStorageAllocation {
   accessKeyId: string;
   createdAt: string;
   /**
+   * Who owned the app when the bucket was created. Carried onto the retired
+   * record, because by the time a deleted app's storage is settled the app
+   * (and its owner) is gone — and the per-user cap must keep counting a bucket
+   * that is still billing the operator.
+   */
+  ownerUserId?: string;
+  /**
+   * The IAM key is revoked and its user deleted; only the bucket survives. Set
+   * by a `keepData` delete (the bucket is the owner's data, the credential is
+   * not) and by the first half of a detach.
+   */
+  accessRevoked?: boolean;
+  /**
    * Set when the app this belonged to was deleted and its resources were NOT
-   * destroyed — the record is moved off the app's name so a new app of the
-   * same name can never inherit the bucket. `teardown-failed` is retried by
-   * the sweep; `kept` (a `keepData` delete) is left for the operator.
+   * (all) destroyed — the record is moved off the app's name so a new app of
+   * the same name can never inherit the bucket. `teardown-failed` is retried by
+   * the sweep; `kept` (a `keepData` delete) is left for an admin, who can list
+   * and destroy it.
    */
   retired?: { at: string; reason: 'teardown-failed' | 'kept' };
 }
@@ -51,6 +65,11 @@ export interface ObjectStorageProvider {
     accessKeyId: string;
     secretAccessKey: string;
   }>;
+  /**
+   * Delete the key(s), the inline policy and the user — and nothing else, so
+   * the bucket and its objects survive. Idempotent; true when the user existed.
+   */
+  revokeAccess(input: { userName: string }): Promise<boolean>;
   /** Delete the key(s), the user, every object and the bucket. Idempotent. */
   deprovision(input: { bucket: string; userName: string }): Promise<StorageDeprovisionResult>;
   /** Confirm the admin credential works; returns the account it belongs to. */

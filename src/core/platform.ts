@@ -3679,10 +3679,10 @@ backup:
     if (!ownerUserId || this.config.maxObjectStoragePerUser <= 0 || !this.objectStorage) {
       return { allowed: true };
     }
-    const allocated = new Set((await this.objectStorage.listAllocations()).map((a) => a.appName));
-    const used = (this.stateManager?.getAllApps() ?? []).filter(
-      (a) => a.userId === ownerUserId && allocated.has(a.name)
-    ).length;
+    // The provisioner's own count, shared with the dashboard's display: it
+    // includes buckets kept by a keepData delete, which no longer have an app
+    // to be counted through but still bill the operator.
+    const used = await this.objectStorage.countForOwner(ownerUserId);
     if (used >= this.config.maxObjectStoragePerUser) {
       return { allowed: false, used, limit: this.config.maxObjectStoragePerUser };
     }
@@ -8521,7 +8521,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
         try {
           // Idempotent: a retried attach gets the same bucket back.
-          await this.objectStorage.provisionAppStorage(appName);
+          await this.objectStorage.provisionAppStorage(appName, { ownerUserId });
         } catch (err) {
           // The settings or credential changed between the check above and
           // here — still the "not configured" refusal, not a failure.

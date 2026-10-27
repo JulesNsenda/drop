@@ -83,7 +83,9 @@ const mockGetObjectStorageProvisioner = getObjectStorageProvisioner as jest.Mock
 >;
 const objectStorageStub = (opts: {
   available: boolean;
-  allocations?: Array<{ appName: string; bucket: string; region: string }>;
+  allocations?: Array<{ appName: string; bucket: string; region: string; ownerUserId?: string }>;
+  /** Owner id -> buckets held (live + retired); defaults to counting `allocations`. */
+  counts?: Record<string, number>;
 }) =>
   ({
     availability: jest.fn().mockResolvedValue(
@@ -92,6 +94,9 @@ const objectStorageStub = (opts: {
         : { available: false, reason: 'disabled', detail: 'x' }
     ),
     listAllocations: jest.fn().mockResolvedValue(opts.allocations ?? []),
+    countForOwner: jest.fn(async (owner: string) =>
+      opts.counts ? (opts.counts[owner] ?? 0) : (opts.allocations ?? []).filter((a) => a.ownerUserId === owner).length
+    ),
   }) as unknown as ReturnType<typeof getObjectStorageProvisioner>;
 
 describe('database panel routes (DROP-120)', () => {
@@ -457,8 +462,8 @@ describe('database panel routes (DROP-120)', () => {
         objectStorageStub({
           available: true,
           allocations: [
-            { appName: 'alice-app', bucket: 'dropkit-alice-app-a1b2c3d4', region: 'eu-central-1' },
-            { appName: 'bob-app', bucket: 'dropkit-bob-app-e5f6a7b8', region: 'eu-central-1' },
+            { appName: 'alice-app', bucket: 'dropkit-alice-app-a1b2c3d4', region: 'eu-central-1', ownerUserId: aliceId },
+            { appName: 'bob-app', bucket: 'dropkit-bob-app-e5f6a7b8', region: 'eu-central-1', ownerUserId: 'bob' },
           ],
         })
       );
@@ -478,6 +483,21 @@ describe('database panel routes (DROP-120)', () => {
       // bob-app belongs to someone else, so only alice's own bucket counts.
       expect(json.data.quota['object-storage']).toEqual({
         used: 1,
+        limit: getMaxObjectStoragePerUser(),
+        constrained: true,
+      });
+    });
+
+    it("counts the owner's KEPT buckets against the quota, via the provisioner's own count (#301)", async () => {
+      mockGetOverview.mockResolvedValue({ provisioned: false });
+      mockGetObjectStorageProvisioner.mockReturnValue(
+        objectStorageStub({ available: true, allocations: [], counts: { [aliceId]: 2 } })
+      );
+
+      const res = await app.request('/api/v1/db/alice-app', { headers: authHeader(aliceToken) });
+      const json = (await res.json()) as { data: { quota: Record<string, unknown> } };
+      expect(json.data.quota['object-storage']).toEqual({
+        used: 2,
         limit: getMaxObjectStoragePerUser(),
         constrained: true,
       });

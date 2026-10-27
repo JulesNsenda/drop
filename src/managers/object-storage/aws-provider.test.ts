@@ -157,6 +157,27 @@ describe('AwsObjectStorageProvider.deprovision', () => {
   });
 });
 
+describe('AwsObjectStorageProvider.revokeAccess', () => {
+  it('removes the keys, policy and user, and never touches the bucket', async () => {
+    const { calls, clients } = fakeClients({
+      ListAccessKeysCommand: () => ({ AccessKeyMetadata: [{ AccessKeyId: 'K1' }] }),
+    });
+
+    await expect(new AwsObjectStorageProvider('eu-central-1', clients).revokeAccess({ userName: USER })).resolves.toBe(true);
+
+    const names = calls.map((c) => c.command);
+    expect(names).toEqual(['ListAccessKeysCommand', 'DeleteAccessKeyCommand', 'DeleteUserPolicyCommand', 'DeleteUserCommand']);
+  });
+
+  it('refuses an empty user name (IAM would read it as the caller)', async () => {
+    const { calls, clients } = fakeClients({});
+    await expect(new AwsObjectStorageProvider('eu-central-1', clients).revokeAccess({ userName: '' })).rejects.toMatchObject({
+      name: 'UnsafeResourceNameError',
+    });
+    expect(calls).toEqual([]);
+  });
+});
+
 describe('AwsObjectStorageProvider.whoAmI', () => {
   it('reports the account of the admin credential', async () => {
     const { clients } = fakeClients({ GetCallerIdentityCommand: () => ({ Account: '123456789012' }) });
