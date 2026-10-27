@@ -89,6 +89,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Redeploy an existing app (#359).** `POST /api/v1/apps/:name/redeploy`
+  rebuilds an app and swaps it in, without uploading anything. A git-backed app
+  first pulls its repository's newest commit, a monorepo container is
+  re-expanded in the background, and any other app is rebuilt from the source
+  already on disk. It answers 202 with a `deployId` once a builder slot is free,
+  or `accepted` if the redeploy carries on in the background, plus a `follow`
+  link to the deploy stream. A service of a git-deployed group is redeployed
+  through its container. The new MCP `redeploy_app` tool does the same for
+  agents, waits for the build like `deploy_files`, and needs the `deploy` scope
+  for the app. A refused redeploy says why, with a retry hint where waiting
+  helps: `APP_BUSY`, `APP_STOPPED`, `APP_SOURCE_MISSING`, `INVALID_GIT_SOURCE`,
+  `REDEPLOY_VIA_CONTAINER`, `RATE_LIMITED` or `INSUFFICIENT_DISK`.
+
 - **Attach object storage to an app (#301).** Once an operator has set object
   storage up, an app owner can attach a private S3 bucket from the app's
   Database tab or `POST /api/v1/apps/:name/services/object-storage`. The app

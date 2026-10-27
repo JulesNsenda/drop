@@ -28,7 +28,6 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { AuthContext, getUserById } from '../middleware/auth';
 import { canAccessScoped, tokenCallerOf } from '../access';
 import { scopesAllowCreate } from '../agent-scopes';
-import { deployActorOf } from '../deploy-actor';
 import { redeployFor } from '../redeploy-for';
 import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
@@ -532,7 +531,8 @@ export async function handleDeployFiles(
       callerIsAdmin: auth?.role === 'admin',
       principalId: auth?.principalId,
       // Derived from the credential, never from tool input.
-      agentCaller: deployActorOf(auth).agent,
+      // Deliberately not deployActorOf: that counts an OAuth session as an agent, which would mark apps a connector session creates as agentCreated.
+      agentCaller: auth?.kind === 'agent',
       ephemeral: args.ephemeral === true,
       ttlMinutes: args.ttl_minutes,
     });
@@ -671,7 +671,8 @@ export async function handleDeployFromGit(
         branch: args.branch,
         userId: auth?.userId,
         principalId: auth?.principalId,
-        agentCaller: deployActorOf(auth).agent,
+        // Deliberately not deployActorOf: that counts an OAuth session as an agent, which would mark apps a connector session creates as agentCreated.
+        agentCaller: auth?.kind === 'agent',
         callerIsAdmin: auth?.role === 'admin',
       },
       tokenCaller
