@@ -1367,7 +1367,16 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
   }
 
   if (updates.enabled !== undefined) setUserEnabled(user, updates.enabled);
-  if (updates.role) user.role = updates.role;
+  if (updates.role) {
+    // A LOWERING of rank invalidates every credential issued under the old,
+    // higher role (sessions, API keys, refresh tokens, OAuth connector grants)
+    // the same way a suspension does, so the user must re-authorize at the new
+    // rank. A raise or an unchanged role leaves them alone.
+    if (rankOf(updates.role) < rankOf(user.role)) {
+      user.credentialsInvalidBefore = new Date().toISOString();
+    }
+    user.role = updates.role;
+  }
   if (updates.maxApps !== undefined) user.maxApps = updates.maxApps;
   if (updates.email !== undefined) user.email = updates.email;
   await saveCredentials(config.credentialsPath, credentials);

@@ -345,14 +345,19 @@ describe('principalId', () => {
 
     it('honours a DEMOTION immediately, rather than 15 minutes later', async () => {
       // role rode in the claim, so a demoted admin kept admin standing for the
-      // rest of the token's life.
+      // rest of the token's life. A demotion now also stamps
+      // credentialsInvalidBefore, so the old token stops authenticating at all
+      // and the user must re-authorize; the new grant carries the live role.
       const user = await createUser({ username: 'rita', role: 'admin', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUD, 'sid-demote');
       expect((await verifyOAuthAccessToken(token, AUD))?.role).toBe('admin');
 
       await updateUser(user.id, { role: 'readonly' });
 
-      expect((await verifyOAuthAccessToken(token, AUD))?.role).toBe('readonly');
+      expect(await verifyOAuthAccessToken(token, AUD)).toBeNull();
+      await new Promise(resolve => setTimeout(resolve, 1100));
+      const fresh = await mintOAuthAccessToken(user, AUD, 'sid-demote-2');
+      expect((await verifyOAuthAccessToken(fresh, AUD))?.role).toBe('readonly');
     });
 
     it('leaves an untouched user working after a restart', async () => {
