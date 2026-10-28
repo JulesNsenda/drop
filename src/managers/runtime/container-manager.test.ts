@@ -576,6 +576,7 @@ describe('ContainerManager', () => {
       const info = await mgr.restart('my-app');
 
       expect(container.restart).toHaveBeenCalledTimes(1);
+      expect(container.restart).toHaveBeenCalledWith({ t: 10 });
       expect(info.name).toBe('my-app');
     });
   });

@@ -629,6 +629,18 @@ describe('handleAppUpdate exit trace', () => {
       expect(appState.error).toMatch(/still present after delete/);
     });
 
+    it('a survivor of delete leaves the status/outcome trace of a failed swap, closing nothing as success', async () => {
+      p().runtime.getStatus.mockResolvedValue({ status: 'running' });
+      const r = await update();
+      const t = r.trace;
+      expect(r.result).toBe(false);
+      expect(t.some((e: string) => e.startsWith('status:errored:The previous instance of'))).toBe(true);
+      expect(t).toContain('outcome:false');
+      expect(t.some((e: string) => e === 'status:running' || e.startsWith('status:running'))).toBe(false);
+      expect(t[t.length - 1]).toBe(`inprogress.delete:${appName}`);
+      expectReleased();
+    });
+
     it('a build held for promotion releases the keys without charging the window', async () => {
       p().holdForPromotion.mockResolvedValue(true);
       const r = await update();

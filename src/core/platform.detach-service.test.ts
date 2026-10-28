@@ -591,6 +591,25 @@ describe('DropPlatform.detachService', () => {
     expect(result).toMatchObject({ restart: 'restarted' });
   });
 
+  it('treats a runtime status of "starting" as live for redis too: stops it BEFORE deprovision, then restarts', async () => {
+    stubAppConfigService(baseConfig());
+    stubStateManager(baseState({ status: 'errored' }));
+    const runtime = stubRuntime({ live: true });
+    runtime.getStatus.mockResolvedValue({ status: 'starting' });
+    stubDbProvisioner();
+    const redisProvisioner = stubRedisProvisioner({ provisionedNames: [appName] });
+    const doRestartSpy = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+
+    const result = await platform.detachService(appName, 'redis');
+
+    expect(runtime.stop).toHaveBeenCalledWith(appName);
+    const stopCall = (runtime.stop as jest.Mock).mock.invocationCallOrder[0];
+    const deprovisionCall = redisProvisioner!.deprovisionAppRedis.mock.invocationCallOrder[0];
+    expect(stopCall).toBeLessThan(deprovisionCall);
+    expect(doRestartSpy).toHaveBeenCalledWith(appName);
+    expect(result).toMatchObject({ restart: 'restarted' });
+  });
+
   it('does not stop anything when the runtime reports no live process, even though state says "running"', async () => {
     stubAppConfigService(baseConfig());
     const { setAppStatus } = stubStateManager(baseState({ status: 'running' }));
