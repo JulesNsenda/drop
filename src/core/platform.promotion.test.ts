@@ -178,7 +178,7 @@ describe('promoteApp', () => {
     // promoting something nobody approved.
     await platform.promoteApp('app');
 
-    expect(handleStartApp).toHaveBeenCalledWith('app', '/built');
+    expect(handleStartApp).toHaveBeenCalledWith('app', '/built', { closeEpisode: false, keepHeld: true });
   });
 
   it('clears the hold so a later deploy is not confused with this one', async () => {

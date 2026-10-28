@@ -53,7 +53,7 @@ export interface App {
    */
   groupGitBacked?: boolean;
   /** Present while an administrator has suspended the app; `by` and `reason` only for admins. */
-  suspended?: { at: string; by?: string; reason?: string; storeUnreadable?: boolean };
+  suspended?: AppSuspensionDto;
   /**
    * Present when the app speaks MCP (Step 11). `url` is composed server-side
    * from the app's own hostname and a validated path. `auth: 'none'` means DROP
@@ -68,6 +68,16 @@ export interface App {
   /** Live uptime in ms since the current process started (present only while status === 'running'). */
   uptime?: number | null;
 }
+
+/**
+ * Why an app cannot be started. `record` is a suspension (`at` for everyone,
+ * `by` and `reason` for admins only); the other two kinds, shown to admins only,
+ * mean the platform's suspension store cannot answer and every app is refused.
+ */
+export type AppSuspensionDto =
+  | { kind: 'record'; at?: string; by?: string; reason?: string }
+  | { kind: 'store-unreadable' }
+  | { kind: 'not-loaded' };
 
 export interface ComponentHealth {
   status: 'up' | 'down' | 'unknown';

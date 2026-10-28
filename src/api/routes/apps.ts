@@ -183,22 +183,28 @@ function appSuspendedResponse(c: Context, err: AppSuspendedError) {
 }
 
 /**
- * Everyone learns THAT an app is suspended and since when; who and why is for admins.
- * An unreadable store has no record to show, but every start is refused: say that
- * (`storeUnreadable`) rather than showing nothing, and never as an admin's act.
+ * The suspension as the wire shows it, from the store's one refusal predicate.
+ * Everyone learns THAT the app cannot be started (and, for a real record, since
+ * when); who and why is for admins. A store that is unreadable or not loaded
+ * refuses every app, and only an admin is told that is the cause: anyone else
+ * just sees a suspension, and no detail of the platform's own state.
  */
 function suspendedDto(appName: string, isAdmin: boolean): AppDto['suspended'] {
   const store = getSuspensionStore();
+  const refusal = store.refusalFor(appName);
+  if (!refusal) return undefined;
+  if (refusal !== 'record') return isAdmin ? { kind: refusal } : { kind: 'record' };
   const record = store.get(appName);
-  if (!record) return store.isCorrupt() ? { at: 'unknown', storeUnreadable: true } : undefined;
-  return isAdmin ? { at: record.at, by: record.by, reason: record.reason } : { at: record.at };
+  if (!record) return { kind: 'record' };
+  return isAdmin
+    ? { kind: 'record', at: record.at, by: record.by, reason: record.reason }
+    : { kind: 'record', at: record.at };
 }
 
 /** The refusal a start of this app would meet, for a route that must refuse BEFORE it changes anything. */
 function suspensionRefusal(appName: string): AppSuspendedError | null {
-  const store = getSuspensionStore();
-  if (!store.isSuspended(appName)) return null;
-  return new AppSuspendedError(appName, store.isUnavailable() ? 'store-unreadable' : 'record');
+  const refusal = getSuspensionStore().refusalFor(appName);
+  return refusal ? new AppSuspendedError(appName, refusal) : null;
 }
 
 // Helper to convert AppState to AppDto (role-aware)
@@ -2003,11 +2009,6 @@ apps.put('/:name/capabilities', async c => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  // Before the grant is written: the restart below would refuse, but by then the
-  // grant (a credential the app is handed on its next start) would already be stored.
-  const suspended = suspensionRefusal(name);
-  if (suspended) return appSuspendedResponse(c, suspended);
-
   const body = (await c.req.json()) as { scopes?: unknown };
   const scopes = body.scopes;
 
@@ -2020,6 +2021,17 @@ apps.put('/:name/capabilities', async c => {
   );
   if (unknownScopes.length > 0) {
     throw new ValidationError(`Unknown scope(s): ${unknownScopes.join(', ')}`);
+  }
+
+  // Before the grant is written: the restart below would refuse, but by then the
+  // grant (a credential the app is handed on its next start) would already be stored.
+  // A refused app may still have its grant NARROWED or cleared (the safe direction,
+  // and the only way to take a credential back from a suspended app): the new scopes
+  // must be a subset of the stored ones, and nothing is restarted.
+  const suspended = suspensionRefusal(name);
+  if (suspended) {
+    const stored = getAppConfigService().getConfig(name)?.grantedApiScopes ?? [];
+    if (scopes.some(s => !stored.includes(s))) return appSuspendedResponse(c, suspended);
   }
 
   // grantedApiScopes is a SYSTEM_CONFIG_FIELD — updateConfig strips it, so
@@ -2041,31 +2053,34 @@ apps.put('/:name/capabilities', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
-  try {
-    await ops.restartApp(name);
-  } catch (err) {
-    if (err instanceof AppSuspendedError) {
-      return appSuspendedResponse(c, err);
+  if (!suspended) {
+    try {
+      await ops.restartApp(name);
+    } catch (err) {
+      if (err instanceof AppSuspendedError) {
+        return appSuspendedResponse(c, err);
+      }
+      if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
+        return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+      }
+      if (err instanceof AppNeedsConfigError) {
+        return c.json(
+          error(
+            ErrorCodes.CONFLICT,
+            needsConfigDetail(err, name)
+          ),
+          409
+        );
+      }
+      const message = err instanceof Error ? err.message : 'Failed to restart';
+      return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
     }
-    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
-      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
-    }
-    if (err instanceof AppNeedsConfigError) {
-      return c.json(
-        error(
-          ErrorCodes.CONFLICT,
-          needsConfigDetail(err, name)
-        ),
-        409
-      );
-    }
-    const message = err instanceof Error ? err.message : 'Failed to restart';
-    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 
   await logActivityFor(auth, {
     action: 'grant-capabilities',
     appName: name,
+    ...(suspended ? { detail: 'Narrowed while the app is suspended; not restarted' } : {}),
   });
 
   return c.json(

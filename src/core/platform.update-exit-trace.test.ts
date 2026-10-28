@@ -156,7 +156,7 @@ describe('handleAppUpdate exit trace', () => {
     jest.spyOn(p(), 'isQuiesced').mockImplementation(() => quiesced);
     jest.spyOn(p(), 'holdForPromotion').mockResolvedValue(false);
     jest.spyOn(p(), 'tryCutover').mockResolvedValue(false);
-    jest.spyOn(p(), 'buildFreshStartSpec').mockResolvedValue({ spec: {}, port: 3005 });
+    jest.spyOn(p(), 'buildFreshStartSpec').mockResolvedValue({ spec: { name: appName }, port: 3005 });
     jest.spyOn(p(), 'noteRuntimeLogStart').mockResolvedValue(undefined);
     jest.spyOn(p(), 'noteRuntimeLogEnd').mockResolvedValue(undefined);
     jest.spyOn(p(), 'recordDeploySignature').mockResolvedValue(undefined);

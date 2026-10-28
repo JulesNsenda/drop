@@ -168,6 +168,7 @@ import {
   type RedeployRefusal,
   type RedeployStart,
   type SuspendAppResult,
+  type UnsuspendAppResult,
 } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
@@ -6054,7 +6055,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (this.pendingBuilds.size > 0) this.scheduleBuildDrain();
   }
 
-  private async handleStartApp(appName: string, buildOutputDir?: string): Promise<void> {
+  /**
+   * `intent` is the caller's, because it decides what a refused start (a
+   * suspension) must leave behind: `closeEpisode` says whether the deploy episode
+   * is this call's to close (the build:completed listener's is; a promotion's is
+   * not, its episode is the held build's and stays open), and `keepHeld` that the
+   * deploy target is a HELD release which must survive the refusal.
+   */
+  private async handleStartApp(
+    appName: string,
+    buildOutputDir?: string,
+    intent: { closeEpisode: boolean; keepHeld?: boolean } = { closeEpisode: true }
+  ): Promise<void> {
+    let keepHeld = false;
     if (!this.runtime || !this.detector) {
       // Only reachable during teardown; release the guard so a queued deploy
       // isn't left wedged in appsInProgress forever.
@@ -6269,7 +6282,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // so a caller that asked for this start (a promotion) hears it was refused;
       // the build:completed listener, which did not ask, swallows it.
       if (error instanceof AppSuspendedError) {
-        await this.settleSuspendedDeploy(appName, error, { closeEpisode: true });
+        keepHeld = intent.keepHeld === true;
+        await this.settleSuspendedDeploy(appName, error, {
+          closeEpisode: intent.closeEpisode,
+          keepTarget: keepHeld,
+        });
         throw error;
       }
       // Secret preflight park (PRD-051): not a failure — the app declared
@@ -6312,8 +6329,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Terminal handler: always release the in-progress guard on every settled
       // path (success, error, or a throw from the initial 'starting' write), so
       // a transient failure can never wedge the app out of future rebuilds.
-      // A release this start did not commit is discarded (no-op after success).
-      await this.discardDeployTarget(appName);
+      // A release this start did not commit is discarded (no-op after success),
+      // unless it is a held build a refused promotion must give back intact.
+      if (keepHeld) this.deployTargets.delete(appName);
+      else await this.discardDeployTarget(appName);
       this.appsInProgress.delete(appName);
     }
   }
@@ -9520,7 +9539,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const oldPort = await this.cutoverEligibility(appName, release.path);
     if (oldPort !== null) {
       const detection = await this.detector.detect(release.path, { silent: true });
-      const result = await this.cutoverTo(appName, release.path, detection, release.outputDirectory, oldPort);
+      let result;
+      try {
+        result = await this.cutoverTo(appName, release.path, detection, release.outputDirectory, oldPort);
+      } catch (error) {
+        // cutoverTo re-threw a suspension: revoke the key the start re-minted and
+        // leave the status true. The release is the previous one, not a deploy target.
+        if (error instanceof AppSuspendedError) {
+          await this.settleSuspendedDeploy(appName, error, { closeEpisode: false, keepTarget: true });
+        }
+        throw error;
+      }
       if (!result.ok) {
         const reason = result.error instanceof Error ? result.error.message : String(result.error);
         throw new Error(
@@ -9570,12 +9599,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * front of a runtime call with nothing awaited between the two.
    */
   private assertStartable(appName: string): void {
-    const store = getSuspensionStore();
-    if (store.isSuspended(appName)) {
-      // An unreadable store refuses every app: say so, rather than attributing
-      // the refusal to an administrator who never suspended this one.
-      throw new AppSuspendedError(appName, store.isUnavailable() ? 'store-unreadable' : 'record');
+    // A start with no usable name cannot be checked against a name-keyed record:
+    // refuse it rather than let it through as "not suspended".
+    if (typeof appName !== 'string' || appName === '') {
+      throw new Error('Cannot start an app without a name');
     }
+    // The refusal says WHY (a record, an unreadable store, a store not yet
+    // loaded), rather than attributing it to an administrator who never acted.
+    const refusal = getSuspensionStore().refusalFor(appName);
+    if (refusal) throw new AppSuspendedError(appName, refusal);
   }
 
   /**
@@ -9614,46 +9646,66 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    *   3. the deploy target is discarded and the runtime-log window closed;
    *   4. the app's minted provisioning key is revoked, best-effort: every start
    *      path re-mints it in buildStartSpec BEFORE the guard throws;
-   *   5. the status is written ONLY when the runtime shows nothing live (a
-   *      cutover's old instance may still be serving, and an unreadable runtime
-   *      proves nothing): 'stopped' with the suspension text, or 'errored' when
-   *      the refusal was an unreadable store and not an administrator's act.
+   *   5. the status is left TRUE, by reason and by what the runtime shows (and
+   *      not at all while the platform is stopping):
+   *        - nothing live: 'stopped' ("Suspended by admin"), or 'errored' when
+   *          the refusal was the store and not an administrator's act;
+   *        - live, an administrator's suspension: left alone (suspendApp is
+   *          taking it down and writes 'stopped' when it is done);
+   *        - live, the store refusing: 'running' with the error, because
+   *          something IS serving and the app is not suspended;
+   *        - liveness unknown (the runtime could not be listed): 'errored'.
    *
-   * It never arms the prober or the crash-loop watch.
+   * It never arms the prober or the crash-loop watch. `keepTarget` forgets the
+   * deploy target without deleting it (a held build a promotion must give back).
    */
   private async settleSuspendedDeploy(
     appName: string,
     error: AppSuspendedError,
-    opts: { progress?: UpdateProgress; closeEpisode: boolean }
+    opts: { progress?: UpdateProgress; closeEpisode: boolean; keepTarget?: boolean }
   ): Promise<void> {
-    const unreadable = error.reason === 'store-unreadable';
-    const message = unreadable
-      ? 'suspension store unreadable; starts are refused until it is repaired'
-      : 'Suspended by admin';
+    const unreadable = error.reason !== 'record';
+    const message =
+      error.reason === 'record'
+        ? 'Suspended by admin'
+        : error.reason === 'not-loaded'
+          ? 'suspension store not loaded yet; starts are refused until it is'
+          : 'suspension store unreadable; starts are refused until it is repaired';
     this.logger.warn(`Deploy of ${appName} stopped: ${error.message}`, 'SUSPENSION');
     this.releaseGuardrailKeys(appName);
     if (opts.closeEpisode && !opts.progress?.episodeClosed && this.deployEpisodeOpen(appName)) {
       if (opts.progress) opts.progress.episodeClosed = true;
       this.failDeployEpisode(appName, new Error(message), undefined, 'DEPLOY_STOPPED');
     }
-    await this.discardDeployTarget(appName);
+    if (opts.keepTarget) this.deployTargets.delete(appName);
+    else await this.discardDeployTarget(appName);
     await this.noteRuntimeLogEnd(appName);
     try {
       await deleteApiKeysByName(appProvisionKeyName(appName));
     } catch (err) {
       this.logger.warn(`Could not revoke the provisioning key of ${appName}`, 'SECURITY', err);
     }
+    // A platform that is stopping owns its own shutdown of the state: no write.
+    if (this.stopping) return;
     let live: boolean | null = null;
     try {
       live = (await this.runtimeInstancesOf(appName)).some(isLiveRuntimeState);
     } catch (err) {
       this.logger.warn(`Could not read the runtime for ${appName}`, 'SUSPENSION', err);
     }
-    if (live === false) {
+    if (live === null) {
+      await this.stateManager?.setAppStatus(appName, 'errored', {
+        error: 'runtime unreadable after a refused start',
+      });
+    } else if (!live) {
       await this.stateManager?.setAppStatus(appName, unreadable ? 'errored' : 'stopped', { error: message });
+    } else if (unreadable) {
+      await this.stateManager?.setAppStatus(appName, 'running', {
+        error: 'starts are refused: suspension store unreadable',
+      });
     } else {
       this.logger.warn(
-        `${appName} is ${live ? 'still live' : 'of unknown liveness'} after a refused start; its status is left as it is`,
+        `${appName} is still live after a refused start; its status is left for the suspension to write`,
         'SUSPENSION'
       );
     }
@@ -9749,6 +9801,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       };
     }
 
+    // Names are matched ignoring case by the store; another existing app that
+    // differs only in case would be suspended with this one.
+    const collisions = this.caseCollisionsOf(appName);
+    if (collisions.length > 0) return { refused: 'case-collision', names: collisions };
+
     const record = await getSuspensionStore().suspend(appName, by, reason);
 
     const stopErrors = await this.takeAppDown(appName, { revokeKey: true });
@@ -9763,12 +9820,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * 'errored' or 'crash-looping'), so its owner starts it deliberately. A name
    * with a record but no app state (the app was deleted) just loses the record.
    */
-  async unsuspendApp(appName: string): Promise<boolean> {
+  async unsuspendApp(appName: string): Promise<UnsuspendAppResult> {
+    // The store matches ignoring case: lifting this name would lift another app's.
+    const collisions = this.caseCollisionsOf(appName);
+    if (collisions.length > 0) return { refused: 'case-collision', names: collisions };
+
     const lifted = await getSuspensionStore().unsuspend(appName);
     if (lifted && this.stateManager?.getApp(appName)) {
       await this.stateManager.setAppStatus(appName, 'stopped', { error: undefined });
     }
-    return lifted;
+    return { unsuspended: lifted };
+  }
+
+  /** Other existing apps whose name equals `appName` ignoring case (never `appName` itself). */
+  private caseCollisionsOf(appName: string): string[] {
+    const key = appName.toLowerCase();
+    return (this.stateManager?.getAllApps() ?? [])
+      .map((a) => a.name)
+      .filter((name) => name !== appName && name.toLowerCase() === key);
   }
 
   /**
@@ -11765,13 +11834,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const oldPort = await this.cutoverEligibility(appName, pending.releasePath);
         if (oldPort !== null && this.detector) {
           const detection = await this.detector.detect(pending.releasePath, { silent: true });
-          const result = await this.cutoverTo(
-            appName,
-            pending.releasePath,
-            detection,
-            pending.outputDirectory,
-            oldPort
-          );
+          let result;
+          try {
+            result = await this.cutoverTo(
+              appName,
+              pending.releasePath,
+              detection,
+              pending.outputDirectory,
+              oldPort
+            );
+          } catch (error) {
+            // Not settled by handleStartApp on this branch: revoke the key and
+            // leave the status true, but keep the held release (see the catch below).
+            if (error instanceof AppSuspendedError) {
+              await this.settleSuspendedDeploy(appName, error, { closeEpisode: false, keepTarget: true });
+            }
+            throw error;
+          }
           if (result.ok) return;
           await this.discardDeployTarget(appName);
           const reason = result.error instanceof Error ? result.error.message : String(result.error);
@@ -11780,10 +11859,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           );
         }
       }
-      await this.handleStartApp(appName, pending.outputDirectory);
+      await this.handleStartApp(appName, pending.outputDirectory, { closeEpisode: false, keepHeld: true });
     } catch (err) {
-      // cutoverTo re-throws a suspension without touching the deploy target.
-      if (err instanceof AppSuspendedError) await this.discardDeployTarget(appName);
+      // A refused promotion gives the held build back exactly as it was: forget
+      // (never discard) the target, restore the hold, and leave the held episode open.
+      if (err instanceof AppSuspendedError) {
+        this.deployTargets.delete(appName);
+        await this.appConfigService?.updateConfig(appName, { pendingPromotion: pending });
+        await this.stateManager?.updateApp(appName, { awaitingPromotion: true });
+      }
       throw err;
     } finally {
       this.appsInProgress.delete(appName);

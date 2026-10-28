@@ -320,7 +320,9 @@ const SUSPENDED_FOR_AGENTS = (err: AppSuspendedError): string =>
   err.reason === 'record'
     ? `Application '${err.appName}' is suspended by an administrator and cannot be started. ` +
       'Only an administrator can lift the suspension; do not retry.'
-    : `The suspension store is unreadable, so '${err.appName}' cannot be started until an operator repairs it; do not retry.`;
+    : err.reason === 'not-loaded'
+      ? `The suspension store is not loaded yet, so '${err.appName}' cannot be started; retry shortly.`
+      : `The suspension store is unreadable, so '${err.appName}' cannot be started until an operator repairs it; do not retry.`;
 
 /** Stamp a known deploy id on a result: in the text and as `deploy_id`, so every answer can reach get_deploy_logs. */
 function withDeployId(result: CallToolResult, deployId: string): CallToolResult {

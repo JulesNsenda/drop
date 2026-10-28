@@ -178,7 +178,7 @@ describe('app suspension routes', () => {
     });
 
     it('404s when the app is not suspended', async () => {
-      ops({ unsuspendApp: jest.fn().mockResolvedValue(false) });
+      ops({ unsuspendApp: jest.fn().mockResolvedValue({ unsuspended: false }) });
       const res = await post('/api/v1/admin/apps/shop/unsuspend', adminToken);
       expect(res.status).toBe(404);
     });
@@ -225,49 +225,114 @@ describe('app suspension routes', () => {
     });
   });
 
-  describe('PUT /apps/:name/capabilities', () => {
-    it('refuses a suspended app BEFORE the grant is written', async () => {
-      const ops_ = ops();
-      await getSuspensionStore().suspend('shop', adminId);
-      const updateSystemConfig = jest.fn().mockResolvedValue({});
-      jest.spyOn(appConfigModule, 'getAppConfigService').mockReturnValue({ updateSystemConfig } as never);
-
-      const res = await t.hono.request('/api/v1/apps/shop/capabilities', {
+  describe('PUT /apps/:name/capabilities on a suspended app', () => {
+    function putScopes(scopes: string[]) {
+      return t.hono.request('/api/v1/apps/shop/capabilities', {
         method: 'PUT',
         headers: { ...bearer(adminToken), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scopes: ['users:create'] }),
+        body: JSON.stringify({ scopes }),
       });
+    }
+
+    function storedGrant(scopes: string[]) {
+      const updateSystemConfig = jest.fn().mockResolvedValue({});
+      jest.spyOn(appConfigModule, 'getAppConfigService').mockReturnValue({
+        updateSystemConfig,
+        getConfig: jest.fn().mockReturnValue({ grantedApiScopes: scopes }),
+      } as never);
+      return updateSystemConfig;
+    }
+
+    it('refuses a WIDENING grant BEFORE it is written', async () => {
+      const ops_ = ops();
+      await getSuspensionStore().suspend('shop', adminId);
+      const updateSystemConfig = storedGrant([]);
+
+      const res = await putScopes(['users:create']);
 
       expect(res.status).toBe(409);
       expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
       expect(updateSystemConfig).not.toHaveBeenCalled();
       expect(ops_.restartApp).not.toHaveBeenCalled();
     });
+
+    it('lets an admin CLEAR a grant (a subset of the stored one) without restarting the app', async () => {
+      const ops_ = ops();
+      await getSuspensionStore().suspend('shop', adminId);
+      const updateSystemConfig = storedGrant(['users:create']);
+
+      const res = await putScopes([]);
+
+      expect(res.status).toBe(200);
+      expect(updateSystemConfig).toHaveBeenCalledWith('shop', { grantedApiScopes: [] });
+      expect(ops_.restartApp).not.toHaveBeenCalled();
+    });
+
+    it('lets an unchanged grant through too (nothing widens), still without a restart', async () => {
+      const ops_ = ops();
+      await getSuspensionStore().suspend('shop', adminId);
+      const updateSystemConfig = storedGrant(['users:create']);
+
+      const res = await putScopes(['users:create']);
+
+      expect(res.status).toBe(200);
+      expect(updateSystemConfig).toHaveBeenCalled();
+      expect(ops_.restartApp).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('case collisions', () => {
+    it.each([
+      ['suspend', 'suspendApp'],
+      ['unsuspend', 'unsuspendApp'],
+    ] as const)('%s answers 409 naming the colliding apps', async (verb, op) => {
+      ops({ [op]: jest.fn().mockResolvedValue({ refused: 'case-collision', names: ['Shop'] }) } as Partial<PlatformOps>);
+
+      const res = await post(`/api/v1/admin/apps/shop/${verb}`, adminToken);
+
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { message: string; details: { names: string[] } } };
+      expect(body.error.details.names).toEqual(['Shop']);
+      expect(body.error.message).toContain("'Shop'");
+    });
   });
 
   describe('the DTO', () => {
     interface AppBody {
-      data: { suspended?: { at: string; by?: string; reason?: string } };
+      data: { suspended?: { kind: string; at?: string; by?: string; reason?: string } };
     }
 
     it('shows everyone THAT the app is suspended and since when, but only admins by whom and why', async () => {
       const record = await getSuspensionStore().suspend('shop', adminId, 'abuse report');
 
       const asOwner = (await (await t.hono.request('/api/v1/apps/shop', { headers: bearer(ownerToken) })).json()) as AppBody;
-      expect(asOwner.data.suspended).toEqual({ at: record.at });
+      expect(asOwner.data.suspended).toEqual({ kind: 'record', at: record.at });
 
       const asAdmin = (await (await t.hono.request('/api/v1/apps/shop', { headers: bearer(adminToken) })).json()) as AppBody;
-      expect(asAdmin.data.suspended).toEqual({ at: record.at, by: adminId, reason: 'abuse report' });
+      expect(asAdmin.data.suspended).toEqual({ kind: 'record', at: record.at, by: adminId, reason: 'abuse report' });
     });
 
-    it('says the store is unreadable when it is, instead of showing nothing', async () => {
+    it('tells an admin the store is unreadable, but anyone else only that the app is suspended (no detail of the platform)', async () => {
       await fs.writeFile(path.join(t.tempDir, 'suspensions.json'), '{ broken');
       jest.spyOn(console, 'error').mockImplementation();
       await getSuspensionStore().load();
 
-      const res = await t.hono.request('/api/v1/apps/shop', { headers: bearer(ownerToken) });
+      const asAdmin = await t.hono.request('/api/v1/apps/shop', { headers: bearer(adminToken) });
+      expect(((await asAdmin.json()) as AppBody).data.suspended).toEqual({ kind: 'store-unreadable' });
 
-      expect(((await res.json()) as AppBody).data.suspended).toEqual({ at: 'unknown', storeUnreadable: true });
+      const asOwner = await t.hono.request('/api/v1/apps/shop', { headers: bearer(ownerToken) });
+      expect(((await asOwner.json()) as AppBody).data.suspended).toEqual({ kind: 'record' });
+    });
+
+    it('tells an admin the store is not loaded yet, and an owner only that the app is suspended', async () => {
+      resetSuspensionStore();
+      getSuspensionStore(path.join(t.tempDir, 'never-loaded.json'));
+
+      const asAdmin = await t.hono.request('/api/v1/apps/shop', { headers: bearer(adminToken) });
+      expect(((await asAdmin.json()) as AppBody).data.suspended).toEqual({ kind: 'not-loaded' });
+
+      const asOwner = await t.hono.request('/api/v1/apps/shop', { headers: bearer(ownerToken) });
+      expect(((await asOwner.json()) as AppBody).data.suspended).toEqual({ kind: 'record' });
     });
 
     it('carries the same field on the list, and nothing for an app that is not suspended', async () => {
@@ -278,7 +343,7 @@ describe('app suspension routes', () => {
       const res = await t.hono.request('/api/v1/apps', { headers: bearer(ownerToken) });
       const apps = ((await res.json()) as { data: Array<{ name: string; suspended?: unknown }> }).data;
 
-      expect(apps.find((a) => a.name === 'shop')?.suspended).toEqual({ at: record.at });
+      expect(apps.find((a) => a.name === 'shop')?.suspended).toEqual({ kind: 'record', at: record.at });
       expect(apps.find((a) => a.name === 'other')?.suspended).toBeUndefined();
     });
   });

@@ -149,7 +149,7 @@ describe('POST /apps/:name/redeploy, followed', () => {
     };
     jest.spyOn(p(), 'holdForPromotion').mockResolvedValue(false);
     jest.spyOn(p(), 'tryCutover').mockResolvedValue(false);
-    jest.spyOn(p(), 'buildFreshStartSpec').mockResolvedValue({ spec: {}, port: 3005 });
+    jest.spyOn(p(), 'buildFreshStartSpec').mockResolvedValue({ spec: { name: appName }, port: 3005 });
     jest.spyOn(p(), 'noteRuntimeLogStart').mockResolvedValue(undefined);
     jest.spyOn(p(), 'recordDeploySignature').mockResolvedValue(undefined);
     jest.spyOn(p(), 'commitServedPath').mockResolvedValue(undefined);

@@ -73,8 +73,7 @@ function isValidRecord(raw: unknown): raw is SuspensionRecord {
 }
 
 function keyOf(appName: string): string {
-  // String(): a start spec built by a test double may lack a name; that cannot match a record.
-  return String(appName).toLowerCase();
+  return appName.toLowerCase();
 }
 
 export class SuspensionStore {
@@ -139,14 +138,21 @@ export class SuspensionStore {
     return this.corrupt;
   }
 
-  /** Whether the store cannot answer: never loaded, or unreadable. Every app then reads as suspended. */
-  isUnavailable(): boolean {
-    return !this.loaded || this.corrupt;
+  /**
+   * THE refusal predicate: why a start of this app must be refused, or null.
+   * `not-loaded` and `store-unreadable` refuse EVERY app (the store cannot say
+   * either way); `record` is one app's own suspension. Everything that decides
+   * "refuse?" reads this, so no caller can disagree about what the cases are.
+   */
+  refusalFor(appName: string): null | 'record' | 'store-unreadable' | 'not-loaded' {
+    if (!this.loaded) return 'not-loaded';
+    if (this.corrupt) return 'store-unreadable';
+    return this.records.has(keyOf(appName)) ? 'record' : null;
   }
 
-  /** Whether starts and builds of the app must be refused. True for every app while unavailable. */
+  /** Whether starts and builds of the app must be refused (see `refusalFor`). */
   isSuspended(appName: string): boolean {
-    return this.isUnavailable() || this.records.has(keyOf(appName));
+    return this.refusalFor(appName) !== null;
   }
 
   /** The app's record, or undefined (also undefined while unavailable: there is nothing to report). */
@@ -185,7 +191,7 @@ export class SuspensionStore {
     const run = this.chain
       .catch(() => undefined)
       .then(async () => {
-        if (this.isUnavailable()) throw new SuspensionStoreCorruptError();
+        if (!this.loaded || this.corrupt) throw new SuspensionStoreCorruptError();
         const next = new Map(this.records);
         const result = apply(next);
         if (!shouldWrite(result)) return result;

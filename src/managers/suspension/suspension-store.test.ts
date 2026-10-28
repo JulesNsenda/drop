@@ -152,13 +152,31 @@ describe('SuspensionStore', () => {
   it('fails closed until it has been loaded, and refuses changes meanwhile', async () => {
     const store = new SuspensionStore(file);
     expect(store.isCorrupt()).toBe(false);
-    expect(store.isUnavailable()).toBe(true);
+    expect(store.refusalFor('anything')).toBe('not-loaded');
     expect(store.isSuspended('anything')).toBe(true);
     await expect(store.suspend('shop', 'admin-1')).rejects.toBeInstanceOf(SuspensionStoreCorruptError);
 
     await store.load();
-    expect(store.isUnavailable()).toBe(false);
+    expect(store.refusalFor('anything')).toBeNull();
     expect(store.isSuspended('anything')).toBe(false);
+  });
+
+  it('refusalFor is the one predicate: a record, an unreadable store, or a store not loaded yet', async () => {
+    const store = new SuspensionStore(file);
+    expect(store.refusalFor('shop')).toBe('not-loaded');
+
+    await store.load();
+    expect(store.refusalFor('shop')).toBeNull();
+    await store.suspend('shop', 'admin-1');
+    expect(store.refusalFor('shop')).toBe('record');
+    expect(store.refusalFor('SHOP')).toBe('record');
+    expect(store.refusalFor('other')).toBeNull();
+
+    await fs.writeFile(file, '{ broken');
+    await store.load();
+    // The unreadable store refuses EVERY app, including ones with no record.
+    expect(store.refusalFor('shop')).toBe('store-unreadable');
+    expect(store.refusalFor('other')).toBe('store-unreadable');
   });
 
   it('singleton binds on first use and resets', async () => {

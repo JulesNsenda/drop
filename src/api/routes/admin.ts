@@ -299,6 +299,11 @@ admin.get('/quota', async (c) => {
   );
 });
 
+/** Suspensions match names ignoring case, so an app that differs only in case cannot be told apart from this one. */
+function caseCollisionMessage(appName: string, names: string[]): string {
+  return `'${appName}' differs only in case from ${names.map((n) => `'${n}'`).join(', ')}; suspensions match names ignoring case, so it cannot be changed without affecting them`;
+}
+
 // POST /admin/apps/:name/suspend - Take an app down until an admin lifts it
 // The suspension is a durable, name-keyed record (see managers/suspension):
 // every start path refuses while it exists, so the owner's start does not undo
@@ -336,6 +341,9 @@ admin.post('/apps/:name/suspend', async (c) => {
   }
 
   if ('refused' in result) {
+    if (result.refused === 'case-collision') {
+      return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
+    }
     return c.json(
       error(
         ErrorCodes.CONFLICT,
@@ -383,7 +391,11 @@ admin.post('/apps/:name/unsuspend', async (c) => {
 
   let lifted: boolean;
   try {
-    lifted = await ops.unsuspendApp(appName);
+    const result = await ops.unsuspendApp(appName);
+    if ('refused' in result) {
+      return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
+    }
+    lifted = result.unsuspended;
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unsuspend failed';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, `Could not lift the suspension of '${appName}': ${message}`), 500);

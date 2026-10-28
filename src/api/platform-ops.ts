@@ -56,20 +56,25 @@ export class AppInProgressError extends Error {
  *
  * `reason` says WHY: a `record` is an administrator's act; `store-unreadable`
  * means the suspension store cannot be read, so every app is refused until it is
- * repaired. The two must not be conflated, or an operator hunts for an
- * administrator who suspended an app that nobody suspended.
+ * repaired; `not-loaded` means it has not been loaded yet (early boot). They must
+ * not be conflated, or an operator hunts for an administrator who suspended an
+ * app that nobody suspended.
  */
+export type AppSuspendedReason = 'record' | 'store-unreadable' | 'not-loaded';
+
 export class AppSuspendedError extends Error {
   readonly code = 'APP_SUSPENDED';
 
   constructor(
     readonly appName: string,
-    readonly reason: 'record' | 'store-unreadable' = 'record'
+    readonly reason: AppSuspendedReason = 'record'
   ) {
     super(
       reason === 'record'
         ? `Application '${appName}' is suspended by an administrator`
-        : `The suspension store is unreadable, so starting '${appName}' is refused until it is repaired`
+        : reason === 'not-loaded'
+          ? `Starting '${appName}' is refused: suspension store not loaded yet`
+          : `The suspension store is unreadable, so starting '${appName}' is refused until it is repaired`
     );
     this.name = 'AppSuspendedError';
   }
@@ -201,7 +206,12 @@ export type SuspendAppResult =
   /** `stopErrors` names instances still live afterwards; the suspension is recorded regardless. */
   | { suspended: true; at: string; stopErrors?: string[] }
   /** A monorepo container runs nothing itself - its services are the runtime apps. */
-  | { refused: 'group-container'; services: string[] };
+  | { refused: 'group-container'; services: string[] }
+  /** Another existing app differs only in case; the store matches ignoring case, so it would be suspended too. */
+  | { refused: 'case-collision'; names: string[] };
+
+/** What `unsuspendApp` did: whether a record was lifted, or the same case-collision refusal. */
+export type UnsuspendAppResult = { unsuspended: boolean } | { refused: 'case-collision'; names: string[] };
 
 export interface PlatformOps {
   /**
@@ -226,9 +236,9 @@ export interface PlatformOps {
 
   /**
    * Lift a suspension (admin). Writes `stopped` explicitly, so the owner then
-   * starts the app deliberately. Resolves false when there was no suspension.
+   * starts the app deliberately. `unsuspended: false` when there was no suspension.
    */
-  unsuspendApp(appName: string): Promise<boolean>;
+  unsuspendApp(appName: string): Promise<UnsuspendAppResult>;
 
   /**
    * Attach a backing service (postgres|redis) to an app: quota check,
