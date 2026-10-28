@@ -13,6 +13,35 @@ import * as path from 'path';
 import { pathTaken } from '../utils/paths';
 import type { AppStateManager } from '../managers/app/state-manager';
 import type { AppConfigService } from '../managers/app/app-config';
+import { getSuspensionStore } from '../managers/suspension';
+
+/**
+ * Every name `isNameTaken` reads from state and configs (app, group, recorded
+ * container), for the callers that need the names and not just the verdict.
+ */
+function recordedNames(deps: { stateManager: AppStateManager; appConfigService?: AppConfigService }): string[] {
+  const names: string[] = [];
+  for (const app of deps.stateManager.getAllApps()) names.push(app.name, ...(app.group ? [app.group] : []));
+  for (const config of deps.appConfigService?.getAllConfigs() ?? []) {
+    names.push(config.name);
+    if (config.group) names.push(config.group);
+    if (config.groupContainer) names.push(config.groupContainer);
+  }
+  return names;
+}
+
+/**
+ * Existing names that equal `name` ignoring case but are not spelled exactly
+ * like it, from the same sources `isNameTaken` reads. The suspension store
+ * matches ignoring case, so suspending or lifting `name` would act on these too.
+ */
+export function caseVariantsOf(
+  name: string,
+  deps: { stateManager: AppStateManager; appConfigService?: AppConfigService }
+): string[] {
+  const wanted = name.toLowerCase();
+  return [...new Set(recordedNames(deps))].filter((n) => n !== name && n.toLowerCase() === wanted);
+}
 
 /**
  * Whether `name` is already spoken for: equal, ignoring case, to an existing
@@ -21,6 +50,12 @@ import type { AppConfigService } from '../managers/app/app-config';
  * name is an identity (it decides teardown and which OAuth resource an app
  * resolves to), and a deleted container's name lives on in its surviving
  * children's stamps.
+ *
+ * A name with a suspension record (matched ignoring case) is taken too, even
+ * when no app holds it any more: the record outlives the app, and a variant
+ * created later would strand the record, since suspend and unsuspend refuse a
+ * name that collides in case with another app. (An unreadable or unloaded
+ * suspension store lists nothing; it refuses every start anyway.)
  *
  * Fails CLOSED: with no config service the recorded names cannot be read, and
  * "nothing recorded" must not read as "free".
@@ -40,8 +75,10 @@ export function isNameTaken(
   const own = deps.ownGroup?.toLowerCase();
   const isOwnChild = (entryName: string, group: string | undefined): boolean =>
     own !== undefined && entryName === name && group?.toLowerCase() === own;
+  let ownChildExists = false;
   for (const app of deps.stateManager.getAllApps()) {
     if ((same(app.name) && !isOwnChild(app.name, app.group)) || same(app.group)) return true;
+    if (same(app.name)) ownChildExists = true;
   }
   for (const config of deps.appConfigService.getAllConfigs()) {
     if (
@@ -51,8 +88,10 @@ export function isNameTaken(
     ) {
       return true;
     }
+    if (same(config.name)) ownChildExists = true;
   }
-  return false;
+  // The container's own existing child keeps its (possibly suspended) name.
+  return !ownChildExists && getSuspensionStore().list().some((record) => same(record.name));
 }
 
 /**

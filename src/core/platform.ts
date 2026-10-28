@@ -182,7 +182,7 @@ import {
   isLocalhostDomain,
 } from '../utils/domain-validator';
 import { appProvisionKeyName, createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
-import { isNameTaken } from './app-names';
+import { caseVariantsOf, isNameTaken } from './app-names';
 import { resetDeployReservations } from './deploy-reservations';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
 // check: this decides whether a name is safe to write into a Caddy literal.
@@ -9829,10 +9829,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   /** Other existing apps whose name equals `appName` ignoring case (never `appName` itself). */
   private caseCollisionsOf(appName: string): string[] {
-    const key = appName.toLowerCase();
-    return (this.stateManager?.getAllApps() ?? [])
-      .map((a) => a.name)
-      .filter((name) => name !== appName && name.toLowerCase() === key);
+    if (!this.stateManager) return [];
+    return caseVariantsOf(appName, {
+      stateManager: this.stateManager,
+      appConfigService: this.appConfigService ?? undefined,
+    });
   }
 
   /**

@@ -309,6 +309,17 @@ describe('app suspension (platform, Item 1)', () => {
       expect(getSuspensionStore().list()).toHaveLength(1);
     }, 20000);
 
+    it('counts a variant that exists only as a config or a group, as isNameTaken does', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await getAppConfigService().upsertSystemConfig('Shop', { type: 'static' });
+      await getAppConfigService().upsertSystemConfig('shop-web', { type: 'static', group: 'SHOP', groupContainer: 'Shop-Repo' });
+
+      expect(await platform.suspendApp('shop', 'admin-1')).toEqual({ refused: 'case-collision', names: ['Shop', 'SHOP'] });
+      expect(await platform.unsuspendApp('shop-repo')).toEqual({ refused: 'case-collision', names: ['Shop-Repo'] });
+      expect(getSuspensionStore().list()).toHaveLength(0);
+    }, 20000);
+
     it('a start with no usable name is refused, not read as "not suspended"', async () => {
       platform = makePlatform();
       await platform.start();

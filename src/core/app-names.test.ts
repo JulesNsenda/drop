@@ -1,7 +1,8 @@
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { isNameTaken } from './app-names';
+import { caseVariantsOf, isNameTaken } from './app-names';
+import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
 import { AppConfigService } from '../managers/app/app-config';
 import { getStateManager, resetStateManager } from '../managers/app/state-manager';
 
@@ -20,6 +21,7 @@ describe('isNameTaken', () => {
   afterEach(async () => {
     await getStateManager().close();
     resetStateManager();
+    resetSuspensionStore();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }).catch(() => undefined);
   });
 
@@ -35,6 +37,35 @@ describe('isNameTaken', () => {
     for (const name of ['existing', 'EXISTING', 'stategroup', 'StateGroup', 'confgroup', 'gone-repo', 'GONE-REPO', 'b-web']) {
       expect(check(name)).toBe(true);
     }
+  });
+
+  it('is true for a name with a suspension record and no app, ignoring case, so a variant cannot strand it', async () => {
+    resetSuspensionStore();
+    await getSuspensionStore(path.join(tempDir, 'suspensions.json')).load();
+    await getSuspensionStore().suspend('Gone-Shop', 'boss');
+
+    expect(check('gone-shop')).toBe(true);
+    expect(check('GONE-SHOP')).toBe(true);
+    expect(check('other-shop')).toBe(false);
+  });
+
+  it("does not count a suspended child of the asking container as a rival", async () => {
+    resetSuspensionStore();
+    await getSuspensionStore(path.join(tempDir, 'suspensions.json')).load();
+    await acs.upsertSystemConfig('acme-web', { type: 'static', group: 'acme', groupContainer: 'acme-repo' });
+    await getSuspensionStore().suspend('acme-web', 'boss');
+
+    expect(check('acme-web', 'acme')).toBe(false);
+  });
+
+  it('lists the case variants of a name from state, configs and groups, never the name itself', async () => {
+    await getStateManager().registerApp('Shop', '/x');
+    await acs.upsertSystemConfig('SHOP', { type: 'static', group: 'shop', groupContainer: 'ShOp' });
+    await getStateManager().registerApp('shop', '/y');
+
+    const deps = { stateManager: getStateManager(), appConfigService: acs };
+    expect(caseVariantsOf('shop', deps).sort()).toEqual(['SHOP', 'Shop', 'ShOp'].sort());
+    expect(caseVariantsOf('fresh', deps)).toEqual([]);
   });
 
   it('is false for a fresh name', () => {
