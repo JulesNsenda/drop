@@ -972,12 +972,18 @@ function redeployRefusalOf(appName: string, refused: UpdateRefused): { refused: 
       return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
     case 'stopped':
       return redeployRefusal('APP_STOPPED', `Application '${appName}' was stopped while it waited for a build slot`);
-    case 'suspended':
-      // The store's own state (unreadable, not loaded) is not for a tenant: tenantMessage.
-      return redeployRefusal(
-        'APP_SUSPENDED',
-        new AppSuspendedError(appName, refused.suspension ?? 'record').tenantMessage
-      );
+    case 'suspended': {
+      // The message is the tenant-safe one (the store's own state is not for a
+      // tenant); a surface that may say more renders `suspension` itself.
+      const suspension = refused.suspension ?? 'record';
+      return {
+        refused: {
+          code: 'APP_SUSPENDED',
+          message: new AppSuspendedError(appName, suspension).tenantMessage,
+          suspension,
+        },
+      };
+    }
     case 'disk':
       return redeployRefusal(
         'INSUFFICIENT_DISK',
@@ -4710,6 +4716,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     /** True only for the watcher's ready scan at boot; see bootCurrentChildren. */
     incidentalFirstSight = false
   ): Promise<void> {
+    // A container cannot be suspended, so a suspended `repoName` is a plain app
+    // whose tree now looks like one: expanding it would create, build and start
+    // children the suspension never named. Covers every caller (the watcher,
+    // reExpandContainer, a redeploy's re-classification and boot).
+    if (suspendedUpdateRefusal(repoName)) {
+      this.logger.info(`Not expanding '${repoName}': app is suspended`, 'MONOREPO');
+      return;
+    }
     const group = (config.group || config.name || repoName).trim();
     const services = config.services ?? {};
     const serviceNames = new Set(Object.keys(services));
@@ -5448,12 +5462,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // isCloning guard above: don't let the watcher onboard mid-upload.
     if (this.uploadDeployService?.isUploading(payload.name)) return;
 
+    // Decided BEFORE the drop.yaml is read, so a container-shaped tree under a
+    // suspended name is not intercepted and expanded into children either.
+    const suspendedHere = suspendedUpdateRefusal(payload.name) !== null;
+
     // Monorepo interception (M2): a root drop.yaml with a `services:` map
     // describes a group container, never a single app. Materialize each
     // declared service as its own top-level sibling app and skip the
     // normal single-app onboarding below for the container folder itself.
     const rootYaml = await parseDropYaml(payload.path);
-    if (isMonorepoContainer(rootYaml)) {
+    if (!suspendedHere && isMonorepoContainer(rootYaml)) {
       this.watcher?.markAppKnown(payload.name);
       // Hold the container name in appsInProgress for the duration of the
       // expansion: the DELETE route's in-progress guard keys off it (a
@@ -5552,7 +5570,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Build the app if auto-build is enabled (skip if user stopped it)
     const currentApp = this.stateManager?.getApp(payload.name);
     // A suspended app is neither built nor marked errored (that would overwrite its 'stopped').
-    const suspendedHere = suspendedUpdateRefusal(payload.name) !== null;
     if (suspendedHere) {
       this.logger.info(`Not building ${payload.name} - app is suspended`, 'BUILD');
     } else if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
@@ -5776,6 +5793,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         const buildPath = await this.prepareDeployTarget(appName, appPath, deployId);
 
+        // Re-checked synchronously, nothing awaited before the build starts: a
+        // build runs tenant code, and the awaits above can outlive a suspension.
+        this.assertStartable(appName);
         builderEntered = true;
         result = await this.builder.build({
           appName,
@@ -5850,6 +5870,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch (error) {
       const err = error instanceof Error ? error : new Error('Build failed');
       await this.discardDeployTarget(appName);
+      // Checked first, as in buildAndSwap: a suspension is closed by the one
+      // closer (uncharged, left stopped), not written 'errored' and charged.
+      if (error instanceof AppSuspendedError) {
+        await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason }, { closeEpisode: true });
+        this.appsInProgress.delete(appName);
+        return;
+      }
       this.logger.appEvent('error', appName, err.message);
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'errored', { error: err.message });
@@ -6172,6 +6199,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         : cfgAtStart?.path || path.join(this.config.appsDirectory, appName));
 
     try {
+      // First: before the port, the data directory and any database or Redis
+      // provisioning, none of which a suspended app may cause.
+      this.assertStartable(appName);
       // Update state to starting. Kept inside the try: if this write throws it
       // must not escape to the EventBus handler wrapper (which only logs) and
       // leave the app wedged in appsInProgress with no cleanup.
@@ -7997,7 +8027,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           appName,
           new Error(redeployRefusalOf(appName, refused).refused.message),
           crypto.randomUUID(),
-          'DEPLOY_REFUSED',
+          refused.refused === 'suspended' ? 'DEPLOY_STOPPED' : 'DEPLOY_REFUSED',
           admitted.trigger,
           { newEpisode: true }
         );
@@ -8265,6 +8295,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     try {
       await this.gitDeployService!.landUnderHold(appState, deployActorOfInfo(actor), caller);
     } catch (error) {
+      if (error instanceof AppSuspendedError) {
+        // The suspension landed after the entry check: nothing was pulled, so
+        // nothing is charged (the keys are released, not set) and the caller
+        // is told with the tenant text, as a stopped deploy.
+        this.releaseGuardrailKeys(appName);
+        this.failDeployEpisode(
+          appName,
+          new Error(error.tenantMessage),
+          crypto.randomUUID(),
+          'DEPLOY_STOPPED',
+          'deploy',
+          { newEpisode: true }
+        );
+        throw error;
+      }
       this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
       this.failDeployEpisode(
         appName,
@@ -8682,6 +8727,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           detection.type,
           appName
         );
+        // Re-checked synchronously, nothing awaited before the build starts.
+        this.assertStartable(appName);
         progress.builderEntered = true;
         buildResult = await this.builder!.build({
           appName,
@@ -9668,13 +9715,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Not running, or not something traffic can be cut over for: serve the
     // previous release from the next start, as a snapshot rollback would.
-    // Re-checked before the first write and again right before the commit: the
-    // upsert between them is an await a suspension can land in.
+    // Re-checked before the first write; a second check after it would leave
+    // the outputDirectory written and the release not committed (a torn rollback).
     this.assertStartable(appName);
     if (release.outputDirectory !== undefined) {
       await this.appConfigService.upsertConfig(appName, { outputDirectory: release.outputDirectory });
     }
-    this.assertStartable(appName);
     await this.commitServedPath(appName, release.path);
     this.appDeployTimes.set(appName, Date.now());
     this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');

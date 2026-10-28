@@ -91,6 +91,11 @@ export class AppSuspendedError extends Error {
       ? this.message
       : `Starting '${this.appName}' is refused right now; contact your administrator`;
   }
+
+  /** The one renderer: the specific text for an administrator, the tenant-safe one for anyone else. */
+  messageFor(isAdmin: boolean): string {
+    return isAdmin ? this.message : this.tenantMessage;
+  }
 }
 
 /**
@@ -200,6 +205,8 @@ export interface RedeployRefusal {
   code: RedeployRefusalCode;
   message: string;
   retryAfterSeconds?: number;
+  /** For APP_SUSPENDED: why, so each surface renders it through AppSuspendedError.messageFor. */
+  suspension?: AppSuspendedReason;
 }
 
 /**

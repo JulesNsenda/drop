@@ -42,6 +42,7 @@ import type { AppDetectedPayload } from '../event-bus';
 import type { AppUpdatePayload } from '../event-bus/event-bus.types';
 import { setPlatformOps, resetPlatformOps, AppInProgressError } from '../../api/platform-ops';
 import { AppSuspendedError } from '../../api/platform-ops';
+import * as rollbackModule from '../../managers/rollback';
 import { getSuspensionStore, resetSuspensionStore } from '../../managers/suspension';
 import { makePlatformOpsStub } from '../../api/__testutils__/platform-ops';
 
@@ -864,6 +865,59 @@ describe('UploadDeployService', () => {
       expect(published).toEqual([]);
       expect(service.isUploading('frozen')).toBe(false);
       expect(isReserved('frozen')).toBe(false);
+    });
+
+    it('a suspension landing during extraction leaves the tree unchanged and takes no rollback snapshot', async () => {
+      await service.deploy({
+        appName: 'frozen',
+        archivePath: await buildArchive('x1', { 'index.js': 'v1', 'keep.js': 'keep' }),
+        userId: 'user-1',
+      });
+      const before = await snapshotTree(path.join(appsDir, 'frozen'));
+      const capture = jest.spyOn(rollbackModule, 'captureBeforeRedeploy');
+      // The disk check runs right after extraction: the suspension lands in that window.
+      jest.spyOn(diskUtils, 'hasEnoughDisk').mockImplementationOnce(async () => {
+        await getSuspensionStore().suspend('frozen', 'admin-1');
+        return { ok: true, freeMb: 10000 };
+      });
+      const published: string[] = [];
+      const unsub = eventBus.subscribe('app:update', (p) => void published.push(p.name));
+
+      try {
+        await expect(
+          service.deploy({
+            appName: 'frozen',
+            archivePath: await buildArchive('x2', { 'index.js': 'v2 tenant' }),
+            userId: 'user-1',
+          })
+        ).rejects.toBeInstanceOf(AppSuspendedError);
+      } finally {
+        unsub();
+      }
+
+      expect(capture).not.toHaveBeenCalled();
+      expect(await snapshotTree(path.join(appsDir, 'frozen'))).toEqual(before);
+      expect(published).toEqual([]);
+      expect(service.isUploading('frozen')).toBe(false);
+    });
+
+    it('a NEW app whose name is suspended during extraction is unregistered again and nothing is left on disk', async () => {
+      jest.spyOn(diskUtils, 'hasEnoughDisk').mockImplementationOnce(async () => {
+        await getSuspensionStore().suspend('late', 'admin-1');
+        return { ok: true, freeMb: 10000 };
+      });
+
+      await expect(
+        service.deploy({
+          appName: 'late',
+          archivePath: await buildArchive('late', { 'index.js': 'tenant' }),
+          userId: 'admin-1',
+          callerIsAdmin: true,
+        })
+      ).rejects.toBeInstanceOf(AppSuspendedError);
+
+      expect(getStateManager().hasApp('late')).toBe(false);
+      expect(fssync.existsSync(path.join(appsDir, 'late'))).toBe(false);
     });
 
     it('refuses an admin upload the same way: suspension is not an ownership question', async () => {

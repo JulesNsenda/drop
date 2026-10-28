@@ -176,8 +176,7 @@ export class UploadDeployService {
       // quota) and before anything is extracted or landed. After the ownership
       // checks above, so a caller who may not know the app is answered as for
       // an unknown one. A recreated name stays suspended (the store is name-keyed).
-      const suspension = getSuspensionStore().refusalFor(appName);
-      if (suspension) throw new AppSuspendedError(appName, suspension);
+      this.assertNotSuspended(appName);
       await admitDeploy(appName, !existingApp, { principalId, actorUserId: userId });
 
       // Ephemeral quota, checked here for the same reason the guardrail is:
@@ -318,6 +317,10 @@ export class UploadDeployService {
       // Held from before the snapshot to the end of the write: a build running
       // in the folder, or a restart, must not overlap either.
       if (!isNew) releaseClaim = await this.claimFolder(appName);
+      // Re-checked synchronously after the claim and the extraction, before the
+      // snapshot and the write: a suspension can land in either await. The catch
+      // below undoes a registration this call made.
+      this.assertNotSuspended(appName);
 
       if (!isNew) {
       // Rollback snapshot of the tree that is SERVING, before it is replaced
@@ -330,6 +333,8 @@ export class UploadDeployService {
         }
       }
 
+      // And again right before the write (the snapshot above is an await).
+      this.assertNotSuspended(appName);
       await this.landFiles(stagingDir, destPath, refuseExisting, landing);
 
       // The write is done: give the claim back before publishing, or the
@@ -403,6 +408,12 @@ export class UploadDeployService {
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
       }
     }
+  }
+
+  /** Throws AppSuspendedError when the app is suspended (or the store cannot say), synchronously. */
+  private assertNotSuspended(appName: string): void {
+    const suspension = getSuspensionStore().refusalFor(appName);
+    if (suspension) throw new AppSuspendedError(appName, suspension);
   }
 
   /**

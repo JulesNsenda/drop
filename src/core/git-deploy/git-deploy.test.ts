@@ -2100,6 +2100,98 @@ describe('GitDeployService', () => {
       expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
     });
 
+    it('a queued request behind a clone that the suspension interrupts is refused before it is charged, and the tree is unchanged', async () => {
+      const appName = 'frozen-chain';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      (execFile as unknown as jest.Mock).mockClear();
+      mockCloneFiles = { 'index.html': '<h1>v2 pushed</h1>' };
+      let open!: () => void;
+      mockCloneGate = new Promise<void>((resolve) => (open = resolve));
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+
+      const first = service.redeploy(appName, { automation: 'webhook' }, null);
+      const second = service.redeploy(appName, { automation: 'webhook' }, null);
+      first.catch(() => undefined);
+      second.catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 100));
+      // The first is mid-clone, the second waits behind it: the suspension lands now.
+      await getSuspensionStore().suspend(appName, 'admin-1');
+      open();
+      mockCloneGate = null;
+
+      await expect(first).rejects.toBeInstanceOf(AppSuspendedError);
+      await expect(second).rejects.toBeInstanceOf(AppSuspendedError);
+      // Only the first was admitted (charged); the queued one never was.
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+      expect(reservedNow.size).toBe(0);
+      expect(service.isCloning(appName)).toBe(false);
+    });
+
+    it('a suspension landing during the clone leaves the serving tree unchanged (no files landed)', async () => {
+      const appName = 'frozen-clone';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      let open!: () => void;
+      mockCloneGate = new Promise<void>((resolve) => (open = resolve));
+      mockCloneFiles = { 'index.html': '<h1>v2 pushed</h1>', 'extra.js': 'only in v2' };
+
+      const run = service.redeploy(appName, { automation: 'webhook' }, null);
+      run.catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 100));
+      await getSuspensionStore().suspend(appName, 'admin-1');
+      open();
+      mockCloneGate = null;
+
+      await expect(run).rejects.toBeInstanceOf(AppSuspendedError);
+      expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+      await expect(fs.access(path.join(appDir(appName), 'extra.js'))).rejects.toThrow();
+    });
+
+    it('the replay keeps a push queued while the store cannot answer: nothing is pulled, recorded or dropped', async () => {
+      const appName = 'frozen-keep';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      service.queueRedeploy(appName, { automation: 'webhook' });
+      resetSuspensionStore();
+      const file = path.join(tempDir, 'suspensions.json');
+      await fs.writeFile(file, '{not json');
+      await getSuspensionStore(file).load();
+      (execFile as unknown as jest.Mock).mockClear();
+      const failed: string[] = [];
+      const unsub = eventBus.subscribe('build:failed', (p) => void failed.push(p.appId));
+
+      try {
+        await (service as unknown as { flushPending(): Promise<void> }).flushPending();
+      } finally {
+        unsub();
+      }
+
+      expect(gitCalls('clone')).toHaveLength(0);
+      expect(failed).toEqual([]);
+      expect((service as unknown as { pending: Map<string, unknown> }).pending.has(appName)).toBe(true);
+    });
+
+    it('a queued redeploy refused after the entry check is recorded as a stopped deploy with the tenant text', async () => {
+      resetDeployTracker();
+      getDeployTracker(path.join(tempDir, 'deploys.json'));
+      const events: Array<{ code?: string; message: string }> = [];
+      const unsub = eventBus.subscribe('build:failed', (p) => {
+        events.push({ code: (p as { code?: string }).code, message: p.error.message });
+      });
+
+      try {
+        await (service as unknown as { recordQueuedFailure(a: string, e: unknown): Promise<void> }).recordQueuedFailure(
+          'frozen-rec',
+          new AppSuspendedError('frozen-rec', 'store-unreadable')
+        );
+      } finally {
+        unsub();
+      }
+
+      expect(events).toEqual([
+        { code: 'DEPLOY_STOPPED', message: "Starting 'frozen-rec' is refused right now; contact your administrator" },
+      ]);
+    });
+
     it('webhook matching skips it, and matches again once the suspension is lifted', async () => {
       const appName = 'frozen-hook';
       await deployAndSuspend(appName);

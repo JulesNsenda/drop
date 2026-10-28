@@ -115,8 +115,19 @@ interface PlatformInternals {
   handleBuildApp: (appPath: string, appName: string, appType: string) => Promise<void>;
   handleAppUpdate: (appName: string, appPath: string, reason: string, bypassCooldown?: boolean) => Promise<boolean>;
   staleCheckToolchainId: (appType: string) => Promise<string | null>;
+  prepareDeployTarget: (appName: string, appPath: string, deployId: string) => Promise<string>;
+  allocatePort: (appName: string, declared?: number) => number;
+  handleStartApp: (
+    appName: string,
+    buildOutputDir: string | undefined,
+    intent: { closeEpisode: boolean; callerOwnsTarget: boolean }
+  ) => Promise<void>;
+  expandMonorepo: (repoPath: string, repoName: string, config: unknown) => Promise<void>;
+  gitDeployService: unknown;
   appDatabaseUrlSource: (appName: string, appPath: string) => Promise<string | undefined>;
 }
+
+const servicesYaml = 'services:\n  web:\n    path: web\n    type: static\n';
 
 describe('app suspension (platform, Item 2: the build choke point and the re-checks)', () => {
   let tempDir: string;
@@ -249,6 +260,152 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
       expect(fakeRuntime.startCount).toBe(starts);
       expect(fakeRuntime.restartCount).toBe(0);
       expect(internals().appsInProgress.has('site')).toBe(false);
+    }, 20000);
+  });
+
+  describe('a container-shaped tree under a suspended name is never expanded', () => {
+    async function containerShaped(name: string): Promise<string> {
+      const appPath = await createStaticApp(name);
+      await fs.mkdir(path.join(appPath, 'web'), { recursive: true });
+      await fs.writeFile(path.join(appPath, 'web', 'index.html'), '<h1>web</h1>');
+      await fs.writeFile(path.join(appPath, 'drop.yaml'), servicesYaml);
+      return appPath;
+    }
+
+    const expectNoChild = async (child: string): Promise<void> => {
+      expect(getStateManager().getApp(child)).toBeUndefined();
+      await expect(fs.access(path.join(webappsDir, child))).rejects.toThrow();
+      expect(fakeRuntime.startCount).toBe(0);
+    };
+
+    it('expandMonorepo returns at once: no child is created, built or started', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await containerShaped('site');
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const build = jest.spyOn(internals().builder!, 'build');
+
+      await internals().expandMonorepo(appPath, 'site', { services: { web: { path: 'web', type: 'static' } } });
+
+      expect(build).not.toHaveBeenCalled();
+      await expectNoChild('site-web');
+    }, 20000);
+
+    it('handleAppDetected does not intercept and expand it either', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await containerShaped('site');
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const build = jest.spyOn(internals().builder!, 'build');
+
+      eventBus.publish('app:detected', { name: 'site', path: appPath, type: undefined });
+      await waitFor(() => getStateManager().getApp('site') !== undefined);
+      await new Promise((r) => setTimeout(r, 300));
+
+      expect(build).not.toHaveBeenCalled();
+      await expectNoChild('site-web');
+    }, 20000);
+
+    it('a git redeploy whose suspension lands mid-clone and whose landed tree adds a root services: creates no child', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deploy('site');
+      const url = 'https://github.com/user/site';
+      await getStateManager().updateApp('site', { gitSource: { repoUrl: url, branch: 'main' } } as never);
+      // The land: the suspension arrives while the clone runs, and the landed tree is now a container.
+      internals().gitDeployService = {
+        isAvailable: () => true,
+        isCloning: () => false,
+        recordedCloneUrl: () => url,
+        supersedeQueued: () => undefined,
+        landUnderHold: async () => {
+          await getSuspensionStore().suspend('site', 'admin-1');
+          await fs.mkdir(path.join(appPath, 'web'), { recursive: true });
+          await fs.writeFile(path.join(appPath, 'web', 'index.html'), '<h1>web</h1>');
+          await fs.writeFile(path.join(appPath, 'drop.yaml'), servicesYaml);
+          return { appName: 'site', repoUrl: url };
+        },
+      };
+      const build = jest.spyOn(internals().builder!, 'build');
+      const starts = fakeRuntime.startCount;
+
+      const out = await (platform as unknown as {
+        redeployApp: (n: string, a: Record<string, unknown>, o: unknown) => Promise<unknown>;
+      }).redeployApp('site', { principalId: 'p-1', actorUserId: 'u-1' }, { caller: null });
+      expect(out).toEqual({ accepted: true });
+      await waitFor(() => !internals().appsInProgress.has('site'));
+      await new Promise((r) => setTimeout(r, 300));
+
+      expect(build).not.toHaveBeenCalled();
+      expect(getStateManager().getApp('site-web')).toBeUndefined();
+      await expect(fs.access(path.join(webappsDir, 'site-web'))).rejects.toThrow();
+      expect(fakeRuntime.startCount).toBe(starts);
+    }, 30000);
+  });
+
+  describe('a re-check right before the build runs tenant code', () => {
+    it('a first deploy: a suspension landing after the target is prepared builds nothing and leaves the app stopped, not errored', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('fresh');
+      await getStateManager().registerApp('fresh', appPath, 'static');
+      const original = internals().prepareDeployTarget.bind(platform);
+      jest.spyOn(internals(), 'prepareDeployTarget').mockImplementationOnce(async (...args) => {
+        const target = await original(...args);
+        await getSuspensionStore().suspend('fresh', 'admin-1');
+        return target;
+      });
+      const build = jest.spyOn(internals().builder!, 'build');
+      const recorded = recordStatuses('fresh');
+
+      await internals().handleBuildApp(appPath, 'fresh', 'static');
+      recorded.stop();
+
+      expect(build).not.toHaveBeenCalled();
+      expect(recorded.statuses).not.toContain('errored');
+      expect(getStateManager().getApp('fresh')?.status).toBe('stopped');
+      expect(fakeRuntime.startCount).toBe(0);
+      expect(internals().appsInProgress.has('fresh')).toBe(false);
+    }, 20000);
+
+    it('a redeploy: the same window builds nothing, and nothing is written errored', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deploy('site');
+      const original = internals().prepareDeployTarget.bind(platform);
+      jest.spyOn(internals(), 'prepareDeployTarget').mockImplementationOnce(async (...args) => {
+        const target = await original(...args);
+        await getSuspensionStore().suspend('site', 'admin-1');
+        return target;
+      });
+      const build = jest.spyOn(internals().builder!, 'build');
+      const recorded = recordStatuses('site');
+
+      expect(await internals().handleAppUpdate('site', appPath, 'file change', true)).toBe(false);
+      recorded.stop();
+
+      expect(build).not.toHaveBeenCalled();
+      expect(recorded.statuses).not.toContain('errored');
+      expect(internals().appsInProgress.has('site')).toBe(false);
+    }, 20000);
+
+    it('handleStartApp refuses before the port, the data directory and any provisioning', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const port = jest.spyOn(internals(), 'allocatePort');
+      const provision = getDatabaseProvisioner()!.provisionAppDatabase as jest.Mock;
+      provision.mockClear();
+      const starts = fakeRuntime.startCount;
+
+      await expect(
+        internals().handleStartApp('site', undefined, { closeEpisode: false, callerOwnsTarget: false })
+      ).rejects.toBeInstanceOf(AppSuspendedError);
+
+      expect(port).not.toHaveBeenCalled();
+      expect(provision).not.toHaveBeenCalled();
+      expect(fakeRuntime.startCount).toBe(starts);
     }, 20000);
   });
 

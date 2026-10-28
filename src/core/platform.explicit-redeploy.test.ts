@@ -34,6 +34,7 @@ import {
 } from '../managers/deploy-tracker';
 import { hasEnoughDisk } from '../utils/disk';
 import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
+import { AppSuspendedError } from '../api/platform-ops';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -1094,6 +1095,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expect(out.refused).toEqual({
         code: 'APP_SUSPENDED',
         message: `Application '${appName}' is suspended by an administrator`,
+        suspension: 'record',
       });
       expect(admit).not.toHaveBeenCalled();
       expect(p().builder.reserveSlot).not.toHaveBeenCalled();
@@ -1141,6 +1143,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expect(out.refused).toEqual({
         code: 'APP_SUSPENDED',
         message: `Starting '${appName}' is refused right now; contact your administrator`,
+        suspension: 'store-unreadable',
       });
       expect(p().builder.build).not.toHaveBeenCalled();
       expectNothingHeld();
@@ -1160,6 +1163,38 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expectNothingHeld();
     });
 
+    it('a suspension landing during the land (continueRedeploy) is a stopped deploy: uncharged, the tenant text, and rethrown', async () => {
+      const url = 'https://github.com/user/repo';
+      appState = { ...appState, gitSource: { repoUrl: url, branch: 'main' } };
+      const land = jest.fn().mockRejectedValue(new AppSuspendedError(appName, 'store-unreadable'));
+      p().gitDeployService = {
+        isAvailable: () => true,
+        isCloning: () => false,
+        recordedCloneUrl: jest.fn().mockReturnValue(url),
+        supersedeQueued: jest.fn(),
+        landUnderHold: land,
+      };
+      const failure = jest.spyOn(getDeployBreaker(), 'recordFailure');
+      const loggedErrors = jest.spyOn(p().logger, 'error').mockImplementation(() => undefined);
+
+      const out = await p().redeployApp(appName, actor, { caller: null });
+      expect(out).toEqual({ accepted: true });
+      await settle();
+
+      expect(land).toHaveBeenCalledTimes(1);
+      expect(failure).not.toHaveBeenCalled();
+      expect(p().breakerKeys.has(appName)).toBe(false);
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      expect(loggedErrors).toHaveBeenCalled();
+      const [episode] = getDeployTracker().getEpisodes(appName);
+      expect(episode.status).toBe('failed');
+      const detail = getDeployDetailStore().getDetail(episode.deployId);
+      expect(detail?.errorCode).toBe('DEPLOY_STOPPED');
+      // Never the store's own state.
+      expect(JSON.stringify(detail)).not.toContain('unreadable');
+      expectNothingHeld();
+    });
+
     it('a redeploy queued behind a full builder cap is refused AFTER the slot wait: no build, no start, nothing held', async () => {
       let freeSlot!: () => void;
       slotGate = new Promise<void>((resolve) => (freeSlot = resolve));
@@ -1175,9 +1210,10 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expect(p().stateManager.setAppStatus).not.toHaveBeenCalled();
       expectNothingHeld();
       // Nobody is left to be told, so it is a failed deploy the caller can follow, and an uncharged one.
+      // A stop, not a refusal of the caller: the same code the closer gives a start.
       const [episode] = getDeployTracker().getEpisodes(appName);
       expect(episode.status).toBe('failed');
-      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
     });
   });
 });

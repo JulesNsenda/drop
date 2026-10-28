@@ -306,7 +306,10 @@ export class GitDeployService {
 
   /** A queued redeploy that failed must leave a deploy record and an audit entry, not only a log line. */
   private async recordQueuedFailure(appName: string, err: unknown): Promise<void> {
-    const message = err instanceof Error ? err.message : 'unknown error';
+    // A suspension that landed after the entry check: a stopped deploy told with
+    // the tenant text (never the store's state), not a failure of the push.
+    const suspended = err instanceof AppSuspendedError;
+    const message = suspended ? err.tenantMessage : err instanceof Error ? err.message : 'unknown error';
     logger.warn(`Queued redeploy of ${appName} failed: ${message}`, 'GIT-DEPLOY');
     try {
       const tracker = getDeployTracker();
@@ -315,8 +318,9 @@ export class GitDeployService {
       eventBus.publish('build:failed', {
         appId: appName,
         buildId,
-        error: err instanceof Error ? err : new Error(message),
+        error: suspended || !(err instanceof Error) ? new Error(message) : err,
         stage: 'pre-build',
+        ...(suspended ? { code: 'DEPLOY_STOPPED' as const } : {}),
       });
     } catch {
       // Tracker not initialised (isolated tests): observability only.
@@ -377,7 +381,10 @@ export class GitDeployService {
       await this.persistPending();
       // Queued before the suspension: dropped, before any pull. Not a failed
       // deploy (no episode, no breaker): the refusal is the administrator's.
-      if (getSuspensionStore().isSuspended(appName)) {
+      // Only a real record drops it; a store that cannot answer keeps it queued,
+      // because the push was never refused by anyone.
+      const refusal = getSuspensionStore().refusalFor(appName);
+      if (refusal === 'record') {
         logger.info(`Dropped the queued redeploy of ${appName}: app is suspended`, 'GIT-DEPLOY');
         continue;
       }
@@ -388,8 +395,8 @@ export class GitDeployService {
         await this.redeploy(appName, actor, null);
         logger.info(`Ran the queued redeploy of ${appName}`, 'GIT-DEPLOY');
       } catch (err) {
-        if (err instanceof AppInProgressError) {
-          // Still busy: keep it, unless a newer request arrived meanwhile.
+        if (err instanceof AppInProgressError || (err instanceof AppSuspendedError && err.reason !== 'record')) {
+          // Still busy, or the suspension store cannot answer yet: keep it, unless a newer request arrived meanwhile.
           this.pending.set(appName, { ...actor, ...this.pending.get(appName) });
         } else {
           await this.recordQueuedFailure(appName, err);
@@ -761,6 +768,10 @@ export class GitDeployService {
         maxEntries: this.config.maxEntries ?? envDefaultCaps().maxEntries,
       };
       const info = await gitClone({ url, dest: cloneDir, branch, token, ...caps });
+      // A redeploy's clone is the long await a suspension lands in: re-checked
+      // before the tracked files are landed over the serving tree. A first deploy
+      // is exempt: it also runs in the CLI, which never loads the store.
+      if (!firstDeploy) this.assertNotSuspended(appName);
       if (info.symlinks.length > 0) {
         const shown = info.symlinks.slice(0, 5).join(', ');
         logger.warn(
@@ -874,6 +885,11 @@ export class GitDeployService {
       };
       this.supersedeQueued(appName);
       try {
+        // Re-checked under the reservation: this request may have waited in the
+        // per-app chain, and a suspension can have landed since the entry check.
+        // Before the quota is charged, so a queued request is never charged.
+        this.assertNotSuspended(appName);
+
         // GUARDRAIL + QUOTA, before the clone. A redeploy is the request an agent
         // repeats, and a clone + rebuild is not free.
         await admitDeploy(appName, false, {
@@ -1034,6 +1050,7 @@ export class GitDeployService {
     // cannot be rolled back, which the rollback route reports as such.
     // The tree carries no .git (every git deploy clones fresh), so a restore
     // puts the files back and the next redeploy simply clones again.
+    this.assertNotSuspended(appName);
     const snapshot = await captureBeforeRedeploy(appName);
     if (!snapshot.captured) {
       logger.info(`No rollback snapshot for ${appName}: ${snapshot.reason}`, 'GIT-DEPLOY');
