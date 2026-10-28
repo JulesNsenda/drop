@@ -218,4 +218,23 @@ describe('expandMonorepo: a child is busy while it is copied', () => {
     await expect(platform.rollbackApp(childName)).rejects.toBeInstanceOf(AppInProgressError);
     expect(p().appsInProgress.has(childName)).toBe(false);
   });
+
+  it('keeps a pending child build queued while its container is still expanding', async () => {
+    // The window after the copy: the marker is released, but the expansion is
+    // still writing the child's drop.yaml and will dispatch it itself.
+    await seedRunningChild();
+    await stateManager.updateApp(childName, { status: 'pending' });
+    await stateManager.registerApp(repoName, repoPath, 'static');
+    await stateManager.updateApp(repoName, { group: repoName, isGroupContainer: true });
+    p().appsInProgress.add(repoName);
+    p().pendingBuilds.set(childName, { appPath: childPath(), appType: 'static' });
+
+    await p().drainPendingBuilds();
+    expect(handleBuildApp).not.toHaveBeenCalled();
+    expect(p().pendingBuilds.has(childName)).toBe(true);
+
+    p().appsInProgress.delete(repoName);
+    await p().drainPendingBuilds();
+    expect(handleBuildApp).toHaveBeenCalledWith(childPath(), childName, 'static', undefined);
+  });
 });

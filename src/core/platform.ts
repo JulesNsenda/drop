@@ -5997,6 +5997,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (
         this.gitReserved.has(appName) ||
         this.materializing.has(appName) ||
+        // A service whose group is still being expanded: the expansion dispatches
+        // it itself once its drop.yaml is written.
+        (!this.stateManager?.getApp(appName)?.isGroupContainer && this.isGroupBusy(appName)) ||
         this.gitDeployService?.isCloning(appName) ||
         this.uploadDeployService?.isUploading(appName)
       ) {
