@@ -53,12 +53,24 @@ export class AppInProgressError extends Error {
  * Thrown when an administrator has suspended the app: nothing may start it
  * (a start, restart, deploy step or the health prober) until it is unsuspended.
  * Thrown by the platform's single start choke point, so no start path can skip it.
+ *
+ * `reason` says WHY: a `record` is an administrator's act; `store-unreadable`
+ * means the suspension store cannot be read, so every app is refused until it is
+ * repaired. The two must not be conflated, or an operator hunts for an
+ * administrator who suspended an app that nobody suspended.
  */
 export class AppSuspendedError extends Error {
   readonly code = 'APP_SUSPENDED';
 
-  constructor(readonly appName: string) {
-    super(`Application '${appName}' is suspended by an administrator`);
+  constructor(
+    readonly appName: string,
+    readonly reason: 'record' | 'store-unreadable' = 'record'
+  ) {
+    super(
+      reason === 'record'
+        ? `Application '${appName}' is suspended by an administrator`
+        : `The suspension store is unreadable, so starting '${appName}' is refused until it is repaired`
+    );
     this.name = 'AppSuspendedError';
   }
 }

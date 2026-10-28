@@ -1329,6 +1329,16 @@ describe('MCP tool handlers', () => {
       expect(firstText(result)).not.toContain('restart_app starts it');
     });
 
+    it('restart_app names an unreadable suspension store as the reason, not an administrator', async () => {
+      setPlatformOps(makeOps({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('alice-app', 'store-unreadable')) }));
+
+      const result = await handleRestartApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('suspension store is unreadable');
+      expect(firstText(result)).not.toContain('by an administrator');
+    });
+
     it('waits for a started redeploy by its deploy id, not the newest episode, and stamps the id on the answer', async () => {
       setPlatformOps(makeOps({ redeployApp: jest.fn().mockResolvedValue({ started: 'mine' }) }));
       // A newer episode of another deploy sits in front of ours, and an older start time would not match.

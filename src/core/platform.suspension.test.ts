@@ -97,7 +97,11 @@ import { getStateManager } from '../managers/app/state-manager';
 import { getSuspensionStore } from '../managers/suspension';
 import { getDeployTracker, getDeployDetailStore } from '../managers/deploy-tracker';
 import { getDeployBreaker } from '../managers/guardrail/deploy-breaker';
+import { getPrincipalQuota } from '../managers/guardrail/principal-quota';
 import { AppSuspendedError } from '../api/platform-ops';
+import { getAppConfigService } from '../managers/app/app-config';
+import { getDatabaseProvisioner } from '../managers/database';
+import { captureBeforeRedeploy, getRollbackStore } from '../managers/rollback';
 import * as authModule from '../api/middleware/auth';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 8000, intervalMs = 25): Promise<void> {
@@ -251,10 +255,12 @@ describe('app suspension (platform, Item 1)', () => {
 
       const result = await platform.suspendApp('site', 'admin-1');
 
-      expect((result as { stopErrors?: string[] }).stopErrors).toEqual([
-        expect.stringContaining('pm2 down'),
-        expect.stringContaining('pm2 down'),
-      ]);
+      const stopErrors = (result as { stopErrors?: string[] }).stopErrors ?? [];
+      expect(stopErrors).toEqual(
+        expect.arrayContaining([expect.stringContaining('site.a: pm2 down'), expect.stringContaining('site.b: pm2 down')])
+      );
+      // The process is still there, and the verification says so.
+      expect(stopErrors.some((e) => e.includes('still present after delete'))).toBe(true);
     }, 20000);
 
     it('refuses a monorepo container, naming its services, and records nothing', async () => {
@@ -305,7 +311,7 @@ describe('app suspension (platform, Item 1)', () => {
       expect(getStateManager().getApp('site')?.status).toBe('stopped');
     }, 20000);
 
-    it('refuses every start when the store is corrupt', async () => {
+    it('refuses every start when the store is corrupt, and says the store is the reason, not an administrator', async () => {
       platform = makePlatform();
       await platform.start();
       await deploy('site');
@@ -314,7 +320,11 @@ describe('app suspension (platform, Item 1)', () => {
       await getSuspensionStore().load();
       const starts = fakeRuntime.startCount;
 
-      await expect(platform.restartApp('site')).rejects.toBeInstanceOf(AppSuspendedError);
+      const refused = await platform.restartApp('site').catch((e) => e);
+      expect(refused).toBeInstanceOf(AppSuspendedError);
+      expect(refused.reason).toBe('store-unreadable');
+      expect(refused.message).toContain('suspension store is unreadable');
+      expect(refused.message).not.toContain('by an administrator');
 
       expect(fakeRuntime.startCount).toBe(starts);
       expect(fakeRuntime.restartCount).toBe(0);
@@ -392,12 +402,78 @@ describe('app suspension (platform, Item 1)', () => {
     }, 20000);
   });
 
+  describe('refusals at the entry of an operation that changes state first', () => {
+    it('rollbackApp refuses a suspended app and leaves the tree, the snapshot and the process untouched', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deploy('site');
+      expect((await captureBeforeRedeploy('site')).captured).toBe(true);
+      await fs.writeFile(path.join(appPath, 'index.html'), '<h1>v2 broken</h1>');
+      await fs.writeFile(path.join(appPath, 'extra.js'), 'only in v2');
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const starts = fakeRuntime.startCount;
+
+      await expect(platform.rollbackApp('site')).rejects.toBeInstanceOf(AppSuspendedError);
+
+      // The tree was NOT restored, and the snapshot is still there to restore later.
+      expect(await fs.readFile(path.join(appPath, 'index.html'), 'utf-8')).toBe('<h1>v2 broken</h1>');
+      await expect(fs.access(path.join(appPath, 'extra.js'))).resolves.toBeUndefined();
+      expect(await getRollbackStore()?.get('site')).toBeTruthy();
+      expect(fakeRuntime.startCount).toBe(starts);
+      expect(fakeRuntime.restartCount).toBe(0);
+      expect((platform as unknown as { appsInProgress: Set<string> }).appsInProgress.has('site')).toBe(false);
+    }, 30000);
+
+    it('attachService refuses a suspended app before provisioning anything or recording the intent', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const provision = getDatabaseProvisioner()!.provisionAppDatabase as jest.Mock;
+      provision.mockClear();
+
+      await expect(platform.attachService('site', 'postgres')).rejects.toBeInstanceOf(AppSuspendedError);
+
+      expect(provision).not.toHaveBeenCalled();
+      expect(getAppConfigService().getConfig('site')?.services?.postgres).toBeUndefined();
+      expect((platform as unknown as { appsInProgress: Set<string> }).appsInProgress.has('site')).toBe(false);
+    }, 30000);
+
+    it('promoteApp refuses a suspended app and the held build stays held', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      const pendingPromotion = { builtAt: '2026-07-27T00:00:00.000Z', outputDirectory: '.' };
+      await getAppConfigService().updateConfig('site', { pendingPromotion } as never);
+      await getStateManager().updateApp('site', { awaitingPromotion: true });
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const starts = fakeRuntime.startCount;
+
+      await expect(platform.promoteApp('site')).rejects.toBeInstanceOf(AppSuspendedError);
+
+      expect(getAppConfigService().getConfig('site')?.pendingPromotion).toEqual(pendingPromotion);
+      expect(getStateManager().getApp('site')?.awaitingPromotion).toBe(true);
+      expect(fakeRuntime.startCount).toBe(starts);
+    }, 30000);
+
+    it('detachService is still allowed on a suspended app', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      await getSuspensionStore().suspend('site', 'admin-1');
+
+      await expect(platform.detachService('site', 'postgres')).resolves.toBeDefined();
+    }, 30000);
+  });
+
   describe('the mid-deploy closer', () => {
     it('a suspension landing during an in-place redeploy stops the app, closes the episode once as DEPLOY_STOPPED and charges nothing', async () => {
       platform = makePlatform();
       await platform.start();
       const appPath = await deploy('site');
       const recordFailure = jest.spyOn(getDeployBreaker(), 'recordFailure');
+      const recordQuota = jest.spyOn(getPrincipalQuota(), 'record');
+      const revoke = jest.spyOn(authModule, 'deleteApiKeysByName');
       const recorded = recordStatuses('site');
       const starts = fakeRuntime.startCount;
       suspendBeforeNextStart('site');
@@ -425,6 +501,9 @@ describe('app suspension (platform, Item 1)', () => {
       expect(episodes[0].status).toBe('failed');
       expect(getDeployDetailStore().getDetail(episodes[0].deployId)?.errorCode).toBe('DEPLOY_STOPPED');
       expect(recordFailure).not.toHaveBeenCalled();
+      expect(recordQuota).not.toHaveBeenCalled();
+      // Every start re-mints the provisioning key before the guard throws; the closer revokes it.
+      expect(revoke).toHaveBeenCalledWith('app:site:provision');
     }, 30000);
 
     it('a first deploy that hits the guard in handleStartApp ends stopped, not errored', async () => {
@@ -433,6 +512,7 @@ describe('app suspension (platform, Item 1)', () => {
       const recordFailure = jest.spyOn(getDeployBreaker(), 'recordFailure');
       const recorded = recordStatuses('fresh');
       const appPath = await createStaticApp('fresh');
+      const episodesBefore = getDeployTracker().getEpisodes('fresh').length;
       suspendBeforeNextStart('fresh');
 
       eventBus.publish('app:detected', { name: 'fresh', path: appPath, type: undefined });
@@ -446,11 +526,76 @@ describe('app suspension (platform, Item 1)', () => {
       expect(recorded.statuses).not.toContain('errored');
       expect(recorded.statuses).not.toContain('running');
       expect(getDeployTracker().hasOpenEpisode('fresh')).toBe(false);
+      // Closed exactly once: one episode for the whole deploy, not a second one for the closure.
+      expect(getDeployTracker().getEpisodes('fresh')).toHaveLength(episodesBefore + 1);
       const [episode] = getDeployTracker().getEpisodes('fresh');
       expect(episode.status).toBe('failed');
       expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
       expect(recordFailure).not.toHaveBeenCalled();
       expect(internals().healthProbers.has('fresh')).toBe(false);
+    }, 30000);
+
+    it('an unreadable store mid-deploy parks the app errored with the store as the reason, not stopped by an administrator', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deploy('site');
+      jest.spyOn(console, 'error').mockImplementation();
+      const original = internals().noteRuntimeLogStart.bind(platform);
+      jest.spyOn(internals(), 'noteRuntimeLogStart').mockImplementationOnce(async (app: string) => {
+        await original(app);
+        await fs.writeFile(path.join(tempDir, 'data', 'drop-svc', 'suspensions.json'), '{ broken');
+        await getSuspensionStore().load();
+      });
+
+      await fs.writeFile(path.join(appPath, 'index.html'), 'v2');
+      eventBus.publish('app:update', { name: 'site', path: appPath, reason: 'edit', bypassCooldown: true });
+      await waitFor(() => getStateManager().getApp('site')?.status === 'errored');
+
+      const app = getStateManager().getApp('site')!;
+      expect(app.error).toBe('suspension store unreadable; starts are refused until it is repaired');
+      expect(app.error).not.toContain('admin');
+      const [episode] = getDeployTracker().getEpisodes('site');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+    }, 30000);
+
+    it('a start that hears it was refused (a promotion) rejects with AppSuspendedError instead of swallowing it', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      const outputDirectory = getAppConfigService().getConfig('site')?.outputDirectory;
+      await getAppConfigService().updateConfig('site', {
+        pendingPromotion: { builtAt: new Date().toISOString(), outputDirectory },
+      } as never);
+      // A real suspension (it takes the instances down), landing just before the start.
+      const original = internals().noteRuntimeLogStart.bind(platform);
+      jest.spyOn(internals(), 'noteRuntimeLogStart').mockImplementationOnce(async (app: string) => {
+        await original(app);
+        await platform!.suspendApp('site', 'admin-1');
+      });
+
+      await expect(platform.promoteApp('site')).rejects.toBeInstanceOf(AppSuspendedError);
+
+      expect(getStateManager().getApp('site')?.status).toBe('stopped');
+      expect((platform as unknown as { appsInProgress: Set<string> }).appsInProgress.has('site')).toBe(false);
+    }, 30000);
+
+    it('leaves the status alone while an instance is still live (the suspension will write it once the instance is gone)', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      // Record only: nothing takes the running instance down, so a live one blocks the write.
+      await getSuspensionStore().suspend('site', 'admin-1');
+      await getStateManager().setAppStatus('site', 'building');
+      await (platform as unknown as {
+        settleSuspendedDeploy: (a: string, e: AppSuspendedError, o: { closeEpisode: boolean }) => Promise<void>;
+      }).settleSuspendedDeploy('site', new AppSuspendedError('site'), { closeEpisode: false });
+      expect(getStateManager().getApp('site')?.status).toBe('building');
+
+      fakeRuntime.reset();
+      await (platform as unknown as {
+        settleSuspendedDeploy: (a: string, e: AppSuspendedError, o: { closeEpisode: boolean }) => Promise<void>;
+      }).settleSuspendedDeploy('site', new AppSuspendedError('site'), { closeEpisode: false });
+      expect(getStateManager().getApp('site')?.status).toBe('stopped');
     }, 30000);
 
     it('a suspension landing during a restart rejects it as suspended and leaves the app stopped, with no phantom deploy', async () => {

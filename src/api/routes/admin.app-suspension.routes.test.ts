@@ -8,8 +8,10 @@
  * the admin floor, the human-only unsuspend, stopErrors on a partial stop, the
  * container refusal, and who may see by/reason.
  */
+import * as fs from 'fs/promises';
 import * as path from 'path';
 import { createUser, createApiKey } from '../middleware/auth';
+import * as appConfigModule from '../../managers/app/app-config';
 import { getTestToken } from '../__testutils__/auth';
 import { createTestApiServer, teardownTestApiServer, type TestApiServer } from '../__testutils__/api-server';
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
@@ -45,7 +47,7 @@ describe('app suspension routes', () => {
     t = await createTestApiServer({ port: 3197, tempPrefix: 'drop-suspend-route-' });
     logSpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
     resetSuspensionStore();
-    getSuspensionStore(path.join(t.tempDir, 'suspensions.json'));
+    await getSuspensionStore(path.join(t.tempDir, 'suspensions.json')).load();
 
     const admin = await createUser({ username: 'boss', role: 'admin', credential: { password: 'password123' } });
     adminId = admin.id;
@@ -101,6 +103,11 @@ describe('app suspension routes', () => {
       expect(res.status).toBe(200);
       const body = (await res.json()) as { data: { stopErrors?: string[] } };
       expect(body.data.stopErrors).toEqual(['shop.b: still present after delete']);
+      // The audit trail says the stop was incomplete, not just that a suspension happened.
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ detail: expect.stringContaining('shop.b: still present after delete') })
+      );
     });
 
     it('409s on a monorepo container, naming its services', async () => {
@@ -192,6 +199,50 @@ describe('app suspension routes', () => {
       expect(res.status).toBe(409);
       expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
     });
+
+    it.each([
+      ['promote', '/api/v1/apps/shop/promote', 'promoteApp'],
+      ['rollback', '/api/v1/apps/shop/rollback', 'rollbackApp'],
+      ['attach', '/api/v1/apps/shop/services/postgres', 'attachService'],
+    ] as const)('POST %s maps AppSuspendedError to 409 APP_SUSPENDED', async (_name, url, op) => {
+      ops({ [op]: jest.fn().mockRejectedValue(new AppSuspendedError('shop')) } as Partial<PlatformOps>);
+
+      const res = await post(url, ownerToken);
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
+    });
+
+    it('an unreadable store is reported as the store, not as an administrator', async () => {
+      ops({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('shop', 'store-unreadable')) });
+
+      const res = await post('/api/v1/apps/shop/restart', ownerToken);
+
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: { message: string } };
+      expect(body.error.message).toContain('suspension store is unreadable');
+      expect(body.error.message).not.toContain('administrator');
+    });
+  });
+
+  describe('PUT /apps/:name/capabilities', () => {
+    it('refuses a suspended app BEFORE the grant is written', async () => {
+      const ops_ = ops();
+      await getSuspensionStore().suspend('shop', adminId);
+      const updateSystemConfig = jest.fn().mockResolvedValue({});
+      jest.spyOn(appConfigModule, 'getAppConfigService').mockReturnValue({ updateSystemConfig } as never);
+
+      const res = await t.hono.request('/api/v1/apps/shop/capabilities', {
+        method: 'PUT',
+        headers: { ...bearer(adminToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scopes: ['users:create'] }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
+      expect(updateSystemConfig).not.toHaveBeenCalled();
+      expect(ops_.restartApp).not.toHaveBeenCalled();
+    });
   });
 
   describe('the DTO', () => {
@@ -207,6 +258,16 @@ describe('app suspension routes', () => {
 
       const asAdmin = (await (await t.hono.request('/api/v1/apps/shop', { headers: bearer(adminToken) })).json()) as AppBody;
       expect(asAdmin.data.suspended).toEqual({ at: record.at, by: adminId, reason: 'abuse report' });
+    });
+
+    it('says the store is unreadable when it is, instead of showing nothing', async () => {
+      await fs.writeFile(path.join(t.tempDir, 'suspensions.json'), '{ broken');
+      jest.spyOn(console, 'error').mockImplementation();
+      await getSuspensionStore().load();
+
+      const res = await t.hono.request('/api/v1/apps/shop', { headers: bearer(ownerToken) });
+
+      expect(((await res.json()) as AppBody).data.suspended).toEqual({ at: 'unknown', storeUnreadable: true });
     });
 
     it('carries the same field on the list, and nothing for an app that is not suspended', async () => {

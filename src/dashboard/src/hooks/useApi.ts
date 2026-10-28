@@ -53,7 +53,7 @@ export interface App {
    */
   groupGitBacked?: boolean;
   /** Present while an administrator has suspended the app; `by` and `reason` only for admins. */
-  suspended?: { at: string; by?: string; reason?: string };
+  suspended?: { at: string; by?: string; reason?: string; storeUnreadable?: boolean };
   /**
    * Present when the app speaks MCP (Step 11). `url` is composed server-side
    * from the app's own hostname and a validated path. `auth: 'none'` means DROP

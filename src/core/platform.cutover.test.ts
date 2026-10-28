@@ -129,7 +129,6 @@ import { getStateManager } from '../managers/app/state-manager';
 import { getAppConfigService } from '../managers/app/app-config';
 import { getDeployTracker, getDeployDetailStore } from '../managers/deploy-tracker';
 import { getDeployBreaker } from '../managers/guardrail/deploy-breaker';
-import { getSuspensionStore } from '../managers/suspension';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 10000, intervalMs = 25): Promise<void> {
   const started = Date.now();
@@ -401,16 +400,18 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     const original = internals.noteRuntimeLogStart.bind(platform);
     jest.spyOn(internals, 'noteRuntimeLogStart').mockImplementationOnce(async (app: string) => {
       await original(app);
-      await getSuspensionStore().suspend('site', 'admin-1');
+      // A real suspension: record written, both instances taken down.
+      await platform!.suspendApp('site', 'admin-1');
     });
+    const episodesBefore = getDeployTracker().getEpisodes('site').length;
     log.length = 0;
 
     await redeploy('site', appPath, 'v2');
     unsubscribe();
 
-    // Refused at the start choke point: no instance was started or deleted, so
+    // Refused at the start choke point: the new instance was never started, so
     // there is no new slot to leave behind, and traffic never moved.
-    expect(log).toEqual([]);
+    expect(log.filter((entry) => entry.startsWith('start'))).toEqual([]);
     expect(setUpstream).not.toHaveBeenCalled();
     expect(fakeRuntime.getLiveInstance('site')).toBe('a');
     expect(cfg('site')?.runtimeSlot).toBeUndefined();
@@ -427,6 +428,8 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     expect(internals.crashLoopWatchers.has('site')).toBe(false);
 
     expect(getDeployTracker().hasOpenEpisode('site')).toBe(false);
+    // Closed exactly once: the redeploy is ONE new episode, failed once.
+    expect(getDeployTracker().getEpisodes('site')).toHaveLength(episodesBefore + 1);
     const [episode] = getDeployTracker().getEpisodes('site');
     expect(episode.status).toBe('failed');
     expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');

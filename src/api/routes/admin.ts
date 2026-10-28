@@ -350,7 +350,9 @@ admin.post('/apps/:name/suspend', async (c) => {
   await logActivityFor(authCtx, {
     action: 'suspend',
     appName,
-    detail: reason ? `App suspended by admin: ${reason}` : 'App suspended by admin',
+    detail:
+      (reason ? `App suspended by admin: ${reason}` : 'App suspended by admin') +
+      (result.stopErrors && result.stopErrors.length > 0 ? `; NOT fully stopped: ${result.stopErrors.join('; ')}` : ''),
   });
 
   return c.json(

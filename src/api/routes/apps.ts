@@ -182,11 +182,23 @@ function appSuspendedResponse(c: Context, err: AppSuspendedError) {
   return c.json(error(err.code, err.message), 409);
 }
 
-/** Everyone learns THAT an app is suspended and since when; who and why is for admins. */
+/**
+ * Everyone learns THAT an app is suspended and since when; who and why is for admins.
+ * An unreadable store has no record to show, but every start is refused: say that
+ * (`storeUnreadable`) rather than showing nothing, and never as an admin's act.
+ */
 function suspendedDto(appName: string, isAdmin: boolean): AppDto['suspended'] {
-  const record = getSuspensionStore().get(appName);
-  if (!record) return undefined;
+  const store = getSuspensionStore();
+  const record = store.get(appName);
+  if (!record) return store.isCorrupt() ? { at: 'unknown', storeUnreadable: true } : undefined;
   return isAdmin ? { at: record.at, by: record.by, reason: record.reason } : { at: record.at };
+}
+
+/** The refusal a start of this app would meet, for a route that must refuse BEFORE it changes anything. */
+function suspensionRefusal(appName: string): AppSuspendedError | null {
+  const store = getSuspensionStore();
+  if (!store.isSuspended(appName)) return null;
+  return new AppSuspendedError(appName, store.isUnavailable() ? 'store-unreadable' : 'record');
 }
 
 // Helper to convert AppState to AppDto (role-aware)
@@ -1990,6 +2002,11 @@ apps.put('/:name/capabilities', async c => {
   if (!app) {
     throw new NotFoundError(`Application '${name}' not found`);
   }
+
+  // Before the grant is written: the restart below would refuse, but by then the
+  // grant (a credential the app is handed on its next start) would already be stored.
+  const suspended = suspensionRefusal(name);
+  if (suspended) return appSuspendedResponse(c, suspended);
 
   const body = (await c.req.json()) as { scopes?: unknown };
   const scopes = body.scopes;

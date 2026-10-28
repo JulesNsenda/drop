@@ -882,6 +882,11 @@ function isLiveRuntimeState(info: AppProcessInfo | null): boolean {
   return !!info && info.status !== 'stopped' && info.status !== 'errored';
 }
 
+/** The name of an app's minted provisioning key (its DROP_API_KEY): minted, and revoked, under this name. */
+function appProvisionKeyName(appName: string): string {
+  return `app:${appName}:provision`;
+}
+
 /** How long a redeploy waits for a builder slot before answering `accepted` (DROP_REDEPLOY_START_WAIT_MS). */
 const DEFAULT_REDEPLOY_START_WAIT_MS = 10_000;
 
@@ -1683,9 +1688,6 @@ export class DropPlatform {
     // that a restart would lose, so this is a reset, not a flush-then-reset.
     resetAppGuests();
 
-    // Every write is awaited by its caller before it acknowledges anything.
-    resetSuspensionStore();
-
     // Stop API server
     if (this.apiServer) {
       await this.apiServer.stop();
@@ -1708,6 +1710,13 @@ export class DropPlatform {
       await this.settingsManager.close();
       resetSettingsManager();
     }
+
+    // After the API server too, for the same reason: the store answers "is this
+    // app suspended" and an unloaded one fails CLOSED, so reset while a route
+    // can still be served and a start would be refused for no reason, or a
+    // default-path store would be built that knows nothing. Every write is
+    // awaited by its caller before it acknowledges anything, so nothing is lost.
+    resetSuspensionStore();
 
     this.isRunning = false;
     this.eventBus.publish('platform:stopped', { timestamp: new Date() });
@@ -3497,7 +3506,13 @@ backup:
         // owns appsInProgress cleanup. outputPath rides the payload because
         // this dispatch happens synchronously inside build() — before
         // handleBuildApp can persist it to the app config.
-        await this.handleStartApp(payload.appId, payload.outputPath);
+        try {
+          await this.handleStartApp(payload.appId, payload.outputPath);
+        } catch (error) {
+          // Already settled by handleStartApp (the app is stopped, the episode closed).
+          if (!(error instanceof AppSuspendedError)) throw error;
+          this.logger.info(`Start of ${payload.appId} refused: ${error.message}`, 'SUSPENSION');
+        }
       } else {
         if (app?.status === 'stopped') {
           this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
@@ -6250,10 +6265,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.armPostDeployWatches(appName, port, spec.healthCheckPath);
     } catch (error) {
       // A suspension is not a failure of the app or of this deploy's caller:
-      // closed by the one closer, uncharged, and the app left stopped.
+      // closed by the one closer, uncharged, and the app left stopped. Re-thrown
+      // so a caller that asked for this start (a promotion) hears it was refused;
+      // the build:completed listener, which did not ask, swallows it.
       if (error instanceof AppSuspendedError) {
-        await this.settleSuspendedDeploy(appName);
-        return;
+        await this.settleSuspendedDeploy(appName, error, { closeEpisode: true });
+        throw error;
       }
       // Secret preflight park (PRD-051): not a failure — the app declared
       // required secrets that aren't set. Record them and stop, so the operator
@@ -8693,7 +8710,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Checked first: a suspension must not fall through to the 'errored'
       // write and the breaker charge below, which would undo the stop.
       if (error instanceof AppSuspendedError) {
-        await this.settleSuspendedDeploy(appName, progress);
+        await this.settleSuspendedDeploy(appName, error, { progress, closeEpisode: true });
         return false;
       }
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
@@ -9408,6 +9425,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * touched — see NOT_RESTORED.
    */
   async rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
+    // First: a rollback restores a tree or cuts over before it starts anything.
+    this.assertStartable(appName);
     if (this.isBusy(appName) || this.isGroupBusy(appName)) {
       throw new AppInProgressError(appName);
     }
@@ -9551,8 +9570,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * front of a runtime call with nothing awaited between the two.
    */
   private assertStartable(appName: string): void {
-    if (getSuspensionStore().isSuspended(appName)) {
-      throw new AppSuspendedError(appName);
+    const store = getSuspensionStore();
+    if (store.isSuspended(appName)) {
+      // An unreadable store refuses every app: say so, rather than attributing
+      // the refusal to an administrator who never suspended this one.
+      throw new AppSuspendedError(appName, store.isUnavailable() ? 'store-unreadable' : 'record');
     }
   }
 
@@ -9583,26 +9605,116 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * punish the caller for an administrator's act:
    *
    *   1. the guardrail keys are released, UNCHARGED;
-   *   2. the episode is closed once, as DEPLOY_STOPPED, and only when one is
-   *      open (a plain restart has none, and must not show up as a deploy).
-   *      failDeployEpisode is not idempotent, so `progress.episodeClosed` is
-   *      set first and closure is read from the tracker;
+   *   2. when `closeEpisode` (the deploy paths: buildAndSwap and a first
+   *      deploy), the episode is closed once, as DEPLOY_STOPPED, and only when
+   *      one is open. failDeployEpisode is not idempotent, so
+   *      `progress.episodeClosed` is set first and closure is read from the
+   *      tracker. A restart or a promotion passes false: a restart has no
+   *      episode, and a held build's is left open by design;
    *   3. the deploy target is discarded and the runtime-log window closed;
-   *   4. 'stopped' is written, with the suspension text.
+   *   4. the app's minted provisioning key is revoked, best-effort: every start
+   *      path re-mints it in buildStartSpec BEFORE the guard throws;
+   *   5. the status is written ONLY when the runtime shows nothing live (a
+   *      cutover's old instance may still be serving, and an unreadable runtime
+   *      proves nothing): 'stopped' with the suspension text, or 'errored' when
+   *      the refusal was an unreadable store and not an administrator's act.
    *
    * It never arms the prober or the crash-loop watch.
    */
-  private async settleSuspendedDeploy(appName: string, progress?: UpdateProgress): Promise<void> {
-    const message = 'Suspended by admin';
-    this.logger.warn(`Deploy of ${appName} stopped: the app is suspended`, 'SUSPENSION');
+  private async settleSuspendedDeploy(
+    appName: string,
+    error: AppSuspendedError,
+    opts: { progress?: UpdateProgress; closeEpisode: boolean }
+  ): Promise<void> {
+    const unreadable = error.reason === 'store-unreadable';
+    const message = unreadable
+      ? 'suspension store unreadable; starts are refused until it is repaired'
+      : 'Suspended by admin';
+    this.logger.warn(`Deploy of ${appName} stopped: ${error.message}`, 'SUSPENSION');
     this.releaseGuardrailKeys(appName);
-    if (!progress?.episodeClosed && this.deployEpisodeOpen(appName)) {
-      if (progress) progress.episodeClosed = true;
+    if (opts.closeEpisode && !opts.progress?.episodeClosed && this.deployEpisodeOpen(appName)) {
+      if (opts.progress) opts.progress.episodeClosed = true;
       this.failDeployEpisode(appName, new Error(message), undefined, 'DEPLOY_STOPPED');
     }
     await this.discardDeployTarget(appName);
     await this.noteRuntimeLogEnd(appName);
-    await this.stateManager?.setAppStatus(appName, 'stopped', { error: message });
+    try {
+      await deleteApiKeysByName(appProvisionKeyName(appName));
+    } catch (err) {
+      this.logger.warn(`Could not revoke the provisioning key of ${appName}`, 'SECURITY', err);
+    }
+    let live: boolean | null = null;
+    try {
+      live = (await this.runtimeInstancesOf(appName)).some(isLiveRuntimeState);
+    } catch (err) {
+      this.logger.warn(`Could not read the runtime for ${appName}`, 'SUSPENSION', err);
+    }
+    if (live === false) {
+      await this.stateManager?.setAppStatus(appName, unreadable ? 'errored' : 'stopped', { error: message });
+    } else {
+      this.logger.warn(
+        `${appName} is ${live ? 'still live' : 'of unknown liveness'} after a refused start; its status is left as it is`,
+        'SUSPENSION'
+      );
+    }
+  }
+
+  /**
+   * Every runtime instance of the app (both slots), from the runtime's own list.
+   * Not `getStatus`: PM2's swallows RPC errors, which would read as "absent". A
+   * runtime that cannot be listed throws, and the caller decides what that means.
+   */
+  private async runtimeInstancesOf(appName: string): Promise<AppProcessInfo[]> {
+    const all = await this.runtime!.getAllStatus();
+    return all.filter((p) => appNameOfInstance(p.instance ?? p.name) === appName);
+  }
+
+  /**
+   * Take an app's running instances away: disarm the prober and crash-loop
+   * watch (or one could restart what is removed next), delete BOTH slots by
+   * explicit reference (the bare name only ever means the live slot), verify
+   * through the runtime's own list, remove its routes and, when asked, its
+   * minted DROP_API_KEY. Returns what did not work; never throws on a failed
+   * step, because the caller reports all of them rather than stopping at one.
+   * Shared by suspension and by a stop that must hold (follow-up F).
+   */
+  private async takeAppDown(appName: string, opts: { revokeKey: boolean }): Promise<string[]> {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error('Platform is not fully initialized');
+
+    this.stopHealthProber(appName);
+    this.stopCrashLoopWatch(appName);
+
+    const errors: string[] = [];
+    for (const slot of ['a', 'b'] as const) {
+      const ref = instanceRef(appName, slot);
+      try {
+        await runtime.delete(ref);
+      } catch (err) {
+        errors.push(`${ref}: ${err instanceof Error ? err.message : 'delete failed'}`);
+      }
+    }
+    try {
+      for (const left of await this.runtimeInstancesOf(appName)) {
+        errors.push(`${left.instance ?? left.name}: still present after delete`);
+      }
+    } catch (err) {
+      errors.push(`runtime: could not verify the removal (${err instanceof Error ? err.message : 'unreadable'})`);
+    }
+
+    try {
+      await this.router?.removeRoutesForApp(appName);
+    } catch (err) {
+      errors.push(`routes: ${err instanceof Error ? err.message : 'removal failed'}`);
+    }
+    if (opts.revokeKey) {
+      try {
+        await deleteApiKeysByName(appProvisionKeyName(appName));
+      } catch (err) {
+        errors.push(`api key: ${err instanceof Error ? err.message : 'revoke failed'}`);
+      }
+    }
+    return errors;
   }
 
   /**
@@ -9639,30 +9751,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     const record = await getSuspensionStore().suspend(appName, by, reason);
 
-    this.stopHealthProber(appName);
-    this.stopCrashLoopWatch(appName);
-
-    const stopErrors: string[] = [];
-    for (const slot of ['a', 'b'] as const) {
-      const ref = instanceRef(appName, slot);
-      try {
-        await runtime.delete(ref);
-        if (await runtime.getStatus(ref)) stopErrors.push(`${ref}: still present after delete`);
-      } catch (err) {
-        stopErrors.push(`${ref}: ${err instanceof Error ? err.message : 'delete failed'}`);
-      }
-    }
-
-    try {
-      await this.router?.removeRoutesForApp(appName);
-    } catch (err) {
-      stopErrors.push(`routes: ${err instanceof Error ? err.message : 'removal failed'}`);
-    }
-    try {
-      await deleteApiKeysByName(`app:${appName}:provision`);
-    } catch (err) {
-      stopErrors.push(`api key: ${err instanceof Error ? err.message : 'revoke failed'}`);
-    }
+    const stopErrors = await this.takeAppDown(appName, { revokeKey: true });
 
     await state.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
 
@@ -9696,7 +9785,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!this.runtime || !this.detector || !this.stateManager || !this.appConfigService) {
       throw new Error('Platform is not fully initialized');
     }
-    // Before anything is deleted or read: attach and rollback reach here too.
+    // Before anything is deleted or read. (attachService and rollbackApp refuse
+    // at their own entry, before they change anything, and reach here after.)
     this.assertStartable(appName);
 
     // Resolve the app. Out-of-tree (admin-deployed) apps have state but no
@@ -9775,7 +9865,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // A suspension that landed after the entry check: settled, then re-thrown
       // so the caller/route reports it. Not an 'errored' app.
       if (error instanceof AppSuspendedError) {
-        await this.settleSuspendedDeploy(appName);
+        await this.settleSuspendedDeploy(appName, error, { closeEpisode: false });
         throw error;
       }
       // Secret preflight park (PRD-051): re-park in `needs-config` rather than
@@ -9883,6 +9973,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     serviceId: AttachableServiceId
   ): Promise<AttachServiceResult> {
+    // First: an attach provisions (and bills) before the restart that would refuse.
+    this.assertStartable(appName);
     if (this.isBusy(appName)) {
       throw new AppInProgressError(appName);
     }
@@ -11626,6 +11718,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * something nobody approved.
    */
   async promoteApp(appName: string): Promise<void> {
+    // First: a refusal here keeps the held build held (nothing is cleared yet).
+    this.assertStartable(appName);
     const config = this.appConfigService?.getConfig(appName);
     const pending = config?.pendingPromotion;
     if (!pending) {
@@ -12223,14 +12317,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // branch at all, so the previous key stayed valid indefinitely — and the
     // app is skip-eligible on top of that (grantedApiScopesCount is now 0).
     try {
-      await deleteApiKeysByName(`app:${appName}:provision`);
+      await deleteApiKeysByName(appProvisionKeyName(appName));
     } catch (err) {
       this.logger.warn(`Could not delete previous provisioning key for ${appName}`, 'SECURITY', err);
     }
     let dropApiKey: string | undefined;
     if (grantedScopes.length > 0) {
       try {
-        const { key } = await createApiKey(`app:${appName}:provision`, 'none', undefined, grantedScopes);
+        const { key } = await createApiKey(appProvisionKeyName(appName), 'none', undefined, grantedScopes);
         dropApiKey = key;
       } catch (err) {
         this.logger.warn(`Could not mint provisioning key for ${appName}`, 'SECURITY', err);
