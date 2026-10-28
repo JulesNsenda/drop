@@ -28,8 +28,8 @@ const PLATFORM = path.join(SRC, 'core', 'platform.ts');
 const ADAPTER_FILES = [
   path.join(SRC, 'managers', 'runtime', 'pm2-runtime.ts'),
   path.join(SRC, 'managers', 'runtime', 'container-manager.ts'),
+  path.join(SRC, 'managers', 'process', 'process-manager.ts'),
 ];
-const ADAPTER_DIRS = [path.join(SRC, 'managers', 'process')];
 const SKIPPED_DIRS = new Set(['node_modules', 'dashboard', '__testutils__', '__mocks__']);
 
 function sourceFiles(dir: string): string[] {
@@ -37,7 +37,7 @@ function sourceFiles(dir: string): string[] {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      if (SKIPPED_DIRS.has(entry.name) || ADAPTER_DIRS.includes(full)) continue;
+      if (SKIPPED_DIRS.has(entry.name)) continue;
       found.push(...sourceFiles(full));
     } else if (
       entry.name.endsWith('.ts') &&
