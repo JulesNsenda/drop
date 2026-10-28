@@ -299,7 +299,15 @@ admin.get('/quota', async (c) => {
   );
 });
 
-// POST /admin/apps/:name/suspend - Stop an app and mark it suspended
+/** Suspensions match names ignoring case, so an app that differs only in case cannot be told apart from this one. */
+function caseCollisionMessage(appName: string, names: string[]): string {
+  return `'${appName}' differs only in case from ${names.map((n) => `'${n}'`).join(', ')}; suspensions match names ignoring case, so it cannot be changed without affecting them`;
+}
+
+// POST /admin/apps/:name/suspend - Take an app down until an admin lifts it
+// The suspension is a durable, name-keyed record (see managers/suspension):
+// every start path refuses while it exists, so the owner's start does not undo
+// it. The body may carry an optional `{ reason }`.
 admin.post('/apps/:name/suspend', async (c) => {
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   const appName = c.req.param('name');
@@ -310,21 +318,99 @@ admin.post('/apps/:name/suspend', async (c) => {
     return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' not found`), 404);
   }
 
-  const runtime = getAppRuntime();
-  try {
-    await runtime.stop(appName);
-  } catch {
-    // Best-effort — app may already be stopped
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
-  await stateManager.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
+
+  let reason: string | undefined;
+  try {
+    const body = (await c.req.json()) as { reason?: unknown };
+    if (typeof body?.reason === 'string' && body.reason.trim()) reason = body.reason.trim().slice(0, 500);
+  } catch {
+    // No body, or not JSON: a suspension needs no reason.
+  }
+
+  let result;
+  try {
+    result = await ops.suspendApp(appName, authCtx?.userId ?? 'admin', reason);
+  } catch (err) {
+    // The record could not be written, so nothing was stopped: say so.
+    const message = err instanceof Error ? err.message : 'Suspend failed';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, `Could not suspend '${appName}': ${message}`), 500);
+  }
+
+  if ('refused' in result) {
+    if (result.refused === 'case-collision') {
+      return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
+    }
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        `'${appName}' is a monorepo container and runs nothing itself; suspend its services instead: ` +
+          (result.services.length > 0 ? result.services.join(', ') : '(none)'),
+        { services: result.services }
+      ),
+      409
+    );
+  }
 
   await logActivityFor(authCtx, {
     action: 'suspend',
     appName,
-    detail: 'App suspended by admin',
+    detail:
+      (reason ? `App suspended by admin: ${reason}` : 'App suspended by admin') +
+      (result.stopErrors && result.stopErrors.length > 0 ? `; NOT fully stopped: ${result.stopErrors.join('; ')}` : ''),
   });
 
-  return c.json(success({ appName, suspended: true }));
+  return c.json(
+    success({
+      appName,
+      suspended: true,
+      stopErrors: result.stopErrors && result.stopErrors.length > 0 ? result.stopErrors : undefined,
+    })
+  );
+});
+
+// POST /admin/apps/:name/unsuspend - Lift an app suspension
+// The app is left stopped: its owner starts it deliberately. Human sessions
+// only, like the other admin acts an agent credential must not perform.
+admin.post('/apps/:name/unsuspend', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const appName = c.req.param('name');
+
+  if (authCtx || isAuthEnabled()) {
+    const gate = interactiveSessionOnly(authCtx, 'Lifting an app suspension');
+    if (!gate.ok) return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  let lifted: boolean;
+  try {
+    const result = await ops.unsuspendApp(appName);
+    if ('refused' in result) {
+      return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
+    }
+    lifted = result.unsuspended;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unsuspend failed';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, `Could not lift the suspension of '${appName}': ${message}`), 500);
+  }
+  if (!lifted) {
+    return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' is not suspended`), 404);
+  }
+
+  await logActivityFor(authCtx, {
+    action: 'unsuspend',
+    appName,
+    detail: 'App suspension lifted by admin',
+  });
+
+  return c.json(success({ appName, suspended: false }));
 });
 
 // GET /admin/settings - Platform settings: the public base URL / OAuth

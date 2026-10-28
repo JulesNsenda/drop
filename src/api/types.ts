@@ -32,6 +32,18 @@ export interface ApiMeta {
 }
 
 // App DTOs
+
+/**
+ * Why an app cannot be started. `record` is a suspension (`at` for everyone,
+ * `by` and `reason` for admins only). `store-unreadable` and `not-loaded` mean
+ * the suspension store itself cannot answer, so every app is refused; only an
+ * admin is told that, anyone else gets a bare `{ kind: 'record' }`.
+ */
+export type AppSuspensionDto =
+  | { kind: 'record'; at?: string; by?: string; reason?: string }
+  | { kind: 'store-unreadable' }
+  | { kind: 'not-loaded' };
+
 export interface AppDto {
   name: string;
   type: AppType;
@@ -72,6 +84,11 @@ export interface AppDto {
    * and folder-dropped (non-git) groups.
    */
   groupGitBacked?: boolean;
+  /**
+   * Present while an administrator has suspended the app: it cannot be started
+   * until they lift it. `by` and `reason` are for admins only.
+   */
+  suspended?: AppSuspensionDto;
   /**
    * This app speaks MCP (Step 11). `url` is DROP-composed from the app's own
    * hostname and an allowlisted path — never a raw tenant string. `auth` is

@@ -9,6 +9,10 @@ import * as os from 'os';
 import * as fsPromises from 'fs/promises';
 import * as yaml from 'yaml';
 import { DropPlatform, createPlatform } from './platform';
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import { eventBus } from './event-bus';
 import { resetDeployBreaker, getDeployBreaker } from '../managers/guardrail/deploy-breaker';
 import * as detectorModule from './detector';

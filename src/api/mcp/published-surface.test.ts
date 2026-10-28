@@ -73,6 +73,8 @@ const PUBLISHED_DEPLOY_ERROR_CODES = [
   'QUOTA_EXCEEDED',
   // Owed to drop-site public/llms.txt (#359 Item 5): published here first.
   'DEPLOY_REFUSED',
+  // Owed to drop-site public/llms.txt (follow-up F2 Item 5): published here first.
+  'DEPLOY_STOPPED',
   'INSTALL_MISSING_DEP',
   'BUILD_TYPE_ERROR',
   'MIGRATION_FAILED',

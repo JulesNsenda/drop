@@ -35,6 +35,10 @@
 import * as path from 'path';
 import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import { AppInProgressError } from '../api/platform-ops';
 import { HOST_ALIAS } from '../managers/runtime/container-config';
 import type { AppState } from '../managers/app/state-manager';

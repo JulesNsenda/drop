@@ -33,7 +33,7 @@ import { isValidAppName } from '../middleware/validate';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getAppRuntime } from '../../managers/runtime';
-import { getPlatformOps, AppInProgressError, StaleDependenciesError } from '../platform-ops';
+import { getPlatformOps, AppInProgressError, AppSuspendedError, StaleDependenciesError } from '../platform-ops';
 import {
   getUploadDeployService,
   ArchiveRejectedError,
@@ -314,6 +314,15 @@ function awaitingPromotionResult(appName: string): CallToolResult {
 /** What an agent can do about a stale-dependency start: nothing it may do itself, so say so rather than loop. */
 const STALE_FOR_AGENTS =
   'An agent cannot rebuild this app: a person has to start or redeploy it from the dashboard.';
+
+/** A suspension is an administrator's act: no agent action lifts it, and retrying cannot help. */
+const SUSPENDED_FOR_AGENTS = (err: AppSuspendedError): string =>
+  err.reason === 'record'
+    ? `Application '${err.appName}' is suspended by an administrator and cannot be started. ` +
+      'Only an administrator can lift the suspension; do not retry.'
+    : err.reason === 'not-loaded'
+      ? `The suspension store is not loaded yet, so '${err.appName}' cannot be started; retry shortly.`
+      : `The suspension store is unreadable, so '${err.appName}' cannot be started until an operator repairs it; do not retry.`;
 
 /** Stamp a known deploy id on a result: in the text and as `deploy_id`, so every answer can reach get_deploy_logs. */
 function withDeployId(result: CallToolResult, deployId: string): CallToolResult {
@@ -1156,6 +1165,7 @@ export async function handleRollbackApp(
         `${err.message} A snapshot is taken only when deploy_files or a git redeploy replaces a running app.`
       );
     }
+    if (err instanceof AppSuspendedError) return toolError(SUSPENDED_FOR_AGENTS(err));
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return toolError(err.message);
     }
@@ -1257,6 +1267,7 @@ export async function handleRestartApp(
     await auditToolAction(auth, 'restart', args.name, 'restart_app');
     return toolText(`Application '${args.name}' restarted.`);
   } catch (err) {
+    if (err instanceof AppSuspendedError) return toolError(SUSPENDED_FOR_AGENTS(err));
     if (err instanceof AppInProgressError) return toolError(err.message);
     if (err instanceof StaleDependenciesError) return toolError(`${err.message} ${STALE_FOR_AGENTS}`);
     return toolError(

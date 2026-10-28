@@ -128,6 +128,7 @@ import { eventBus } from './event-bus';
 import { getStateManager } from '../managers/app/state-manager';
 import { getAppConfigService } from '../managers/app/app-config';
 import { getDeployTracker, getDeployDetailStore } from '../managers/deploy-tracker';
+import { getDeployBreaker } from '../managers/guardrail/deploy-breaker';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 10000, intervalMs = 25): Promise<void> {
   const started = Date.now();
@@ -374,6 +375,68 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     const [episode] = getDeployTracker().getEpisodes('site');
     expect(episode.status).toBe('failed');
     expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('READINESS_FAILED');
+  }, 30000);
+
+  it('a suspension landing before the new instance starts leaves it unstarted, writes no running, arms no prober and charges nothing', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await deployV1('site');
+    const oldPort = getStateManager().getApp('site')!.port!;
+    const internals = platform as unknown as {
+      noteRuntimeLogStart: (app: string) => Promise<void>;
+      healthProbers: Map<string, unknown>;
+      crashLoopWatchers: Map<string, unknown>;
+      cutovers: Set<string>;
+      usedPorts: Map<number, string>;
+      router: { setUpstream: (...a: unknown[]) => unknown };
+    };
+    const setUpstream = jest.spyOn(internals.router, 'setUpstream');
+    const recordFailure = jest.spyOn(getDeployBreaker(), 'recordFailure');
+    const statuses: string[] = [];
+    const unsubscribe = eventBus.subscribe('app:updated', (p) => {
+      const status = (p.changes as { status?: string })?.status;
+      if (p.appId === 'site' && status) statuses.push(status);
+    });
+    const original = internals.noteRuntimeLogStart.bind(platform);
+    jest.spyOn(internals, 'noteRuntimeLogStart').mockImplementationOnce(async (app: string) => {
+      await original(app);
+      // A real suspension: record written, both instances taken down.
+      await platform!.suspendApp('site', 'admin-1');
+      // What the suspension itself deleted is not what is under test: from here
+      // on NOTHING may be started or deleted.
+      log.length = 0;
+    });
+    const episodesBefore = getDeployTracker().getEpisodes('site').length;
+    log.length = 0;
+
+    await redeploy('site', appPath, 'v2');
+    unsubscribe();
+
+    // Refused at the start choke point: the new instance was never started, so
+    // there is no new slot to leave behind, and traffic never moved.
+    expect(log).toEqual([]);
+    expect(setUpstream).not.toHaveBeenCalled();
+    expect(fakeRuntime.getLiveInstance('site')).toBe('a');
+    expect(cfg('site')?.runtimeSlot).toBeUndefined();
+    expect(cfg('site')?.port).toBe(oldPort);
+    expect(internals.cutovers.has('site')).toBe(false);
+    // The extra port the cutover claimed is given back.
+    expect([...internals.usedPorts.entries()].filter(([, owner]) => owner === 'site')).toEqual([[oldPort, 'site']]);
+
+    // failCutover's 'errored' -> 'running' and its re-armed prober never happen.
+    expect(statuses).not.toContain('errored');
+    expect(statuses).not.toContain('running');
+    expect(getStateManager().getApp('site')?.status).toBe('stopped');
+    expect(internals.healthProbers.has('site')).toBe(false);
+    expect(internals.crashLoopWatchers.has('site')).toBe(false);
+
+    expect(getDeployTracker().hasOpenEpisode('site')).toBe(false);
+    // Closed exactly once: the redeploy is ONE new episode, failed once.
+    expect(getDeployTracker().getEpisodes('site')).toHaveLength(episodesBefore + 1);
+    const [episode] = getDeployTracker().getEpisodes('site');
+    expect(episode.status).toBe('failed');
+    expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+    expect(recordFailure).not.toHaveBeenCalled();
   }, 30000);
 
   it('never routes traffic to the new instance on its start event', async () => {

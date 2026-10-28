@@ -25,6 +25,10 @@ jest.mock('../utils/disk', () => ({
 }));
 
 import { DropPlatform, createPlatform } from './platform';
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import { BuilderService } from './builder';
 import { BuildContext, BuildStrategy } from './builder/builder.types';
 
@@ -111,7 +115,7 @@ describe('redeploy of a running app while the builder is at its cap', () => {
     };
     jest.spyOn(p(), 'holdForPromotion').mockResolvedValue(false);
     jest.spyOn(p(), 'tryCutover').mockResolvedValue(false);
-    jest.spyOn(p(), 'buildFreshStartSpec').mockResolvedValue({ spec: {}, port: 3005 });
+    jest.spyOn(p(), 'buildFreshStartSpec').mockResolvedValue({ spec: { name: appName }, port: 3005 });
     jest.spyOn(p(), 'noteRuntimeLogStart').mockResolvedValue(undefined);
     jest.spyOn(p(), 'recordDeploySignature').mockResolvedValue(undefined);
     jest.spyOn(p(), 'commitServedPath').mockResolvedValue(undefined);

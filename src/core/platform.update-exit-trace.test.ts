@@ -26,6 +26,10 @@ jest.mock('../utils/disk', () => ({
 }));
 
 import { DropPlatform, createPlatform } from './platform';
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import { eventBus } from './event-bus';
 import { AppNeedsConfigError } from '../api/platform-ops';
 import { getDeployBreaker, resetDeployBreaker } from '../managers/guardrail/deploy-breaker';
@@ -152,7 +156,7 @@ describe('handleAppUpdate exit trace', () => {
     jest.spyOn(p(), 'isQuiesced').mockImplementation(() => quiesced);
     jest.spyOn(p(), 'holdForPromotion').mockResolvedValue(false);
     jest.spyOn(p(), 'tryCutover').mockResolvedValue(false);
-    jest.spyOn(p(), 'buildFreshStartSpec').mockResolvedValue({ spec: {}, port: 3005 });
+    jest.spyOn(p(), 'buildFreshStartSpec').mockResolvedValue({ spec: { name: appName }, port: 3005 });
     jest.spyOn(p(), 'noteRuntimeLogStart').mockResolvedValue(undefined);
     jest.spyOn(p(), 'noteRuntimeLogEnd').mockResolvedValue(undefined);
     jest.spyOn(p(), 'recordDeploySignature').mockResolvedValue(undefined);

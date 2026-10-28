@@ -58,6 +58,9 @@ export type DeployErrorCode =
   // something else took the app or its group, or the disk filled. Nothing was
   // built, and the app itself is not at fault.
   | 'DEPLOY_REFUSED'
+  // The deploy was cut short because the app was stopped or suspended while it
+  // ran. The app is not at fault and nothing is left half-started.
+  | 'DEPLOY_STOPPED'
   // Classifier refinements (Step 5) — produced ONLY by classify.ts, which
   // sharpens a stage-derived code from the log tail. deriveErrorCode never
   // returns these: they are not derivable from DROP-generated signals alone.
@@ -123,6 +126,7 @@ export function deriveErrorCode(input: ErrorCodeInput): DeployErrorCode {
   if (input.builderCode === 'GUARDRAIL_TRIPPED') return 'GUARDRAIL_TRIPPED';
   if (input.builderCode === 'QUOTA_EXCEEDED') return 'QUOTA_EXCEEDED';
   if (input.builderCode === 'DEPLOY_REFUSED') return 'DEPLOY_REFUSED';
+  if (input.builderCode === 'DEPLOY_STOPPED') return 'DEPLOY_STOPPED';
 
   if (input.phase === 'boot') {
     return input.reason ? codeForReason(input.reason) : 'UNKNOWN';

@@ -136,6 +136,8 @@ const HINTS: Record<DeployErrorCode, string> = {
     'DROP refused this deploy because the caller has used its deploy allowance for the hour. Nothing was built. This is a volume cap, not a reaction to a failure, so a successful deploy does not reset it — wait, or ask an admin to raise the allowance.',
   DEPLOY_REFUSED:
     'DROP accepted this redeploy and then declined it before building anything: the app was stopped or removed meanwhile, the platform was paused for a backup, another operation took the app or its group, or the disk filled. Nothing was built and the running version is untouched. Retry once the cause is gone.',
+  DEPLOY_STOPPED:
+    'This deploy was cut short because the app was stopped or suspended while it deployed. Nothing is left half-started and the app is stopped. If an administrator suspended it, it stays down until they lift the suspension; otherwise start it again.',
   INSTALL_MISSING_DEP:
     'A dependency could not be resolved from the registry. Check the package name and version — a typo, a private package, or a version that does not exist are the usual causes.',
   BUILD_TYPE_ERROR:

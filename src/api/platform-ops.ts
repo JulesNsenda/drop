@@ -50,6 +50,37 @@ export class AppInProgressError extends Error {
 }
 
 /**
+ * Thrown when an administrator has suspended the app: nothing may start it
+ * (a start, restart, deploy step or the health prober) until it is unsuspended.
+ * Thrown by the platform's single start choke point, so no start path can skip it.
+ *
+ * `reason` says WHY: a `record` is an administrator's act; `store-unreadable`
+ * means the suspension store cannot be read, so every app is refused until it is
+ * repaired; `not-loaded` means it has not been loaded yet (early boot). They must
+ * not be conflated, or an operator hunts for an administrator who suspended an
+ * app that nobody suspended.
+ */
+export type AppSuspendedReason = 'record' | 'store-unreadable' | 'not-loaded';
+
+export class AppSuspendedError extends Error {
+  readonly code = 'APP_SUSPENDED';
+
+  constructor(
+    readonly appName: string,
+    readonly reason: AppSuspendedReason = 'record'
+  ) {
+    super(
+      reason === 'record'
+        ? `Application '${appName}' is suspended by an administrator`
+        : reason === 'not-loaded'
+          ? `Starting '${appName}' is refused: suspension store not loaded yet`
+          : `The suspension store is unreadable, so starting '${appName}' is refused until it is repaired`
+    );
+    this.name = 'AppSuspendedError';
+  }
+}
+
+/**
  * Thrown before a start, restart, rollback, promotion or attach that would run
  * a node_modules tree built for a different Node runtime. Those entry points
  * throw it before touching anything; the start-spec backstop beneath them can
@@ -170,6 +201,18 @@ export type RedeployStart =
   | { group: { container: string } }
   | { refused: RedeployRefusal };
 
+/** What `suspendApp` did: the app is down, or the suspension was refused. */
+export type SuspendAppResult =
+  /** `stopErrors` names instances still live afterwards; the suspension is recorded regardless. */
+  | { suspended: true; at: string; stopErrors?: string[] }
+  /** A monorepo container runs nothing itself - its services are the runtime apps. */
+  | { refused: 'group-container'; services: string[] }
+  /** Another existing app differs only in case; the store matches ignoring case, so it would be suspended too. */
+  | { refused: 'case-collision'; names: string[] };
+
+/** What `unsuspendApp` did: whether a record was lifted, or the same case-collision refusal. */
+export type UnsuspendAppResult = { unsuspended: boolean } | { refused: 'case-collision'; names: string[] };
+
 export interface PlatformOps {
   /**
    * Stop-if-running, rebuild the start spec from current state (secrets,
@@ -180,6 +223,22 @@ export interface PlatformOps {
    * to a fresh start. Rejects with AppInProgressError when the app is busy.
    */
   restartApp(appName: string): Promise<AppProcessInfo>;
+
+  /**
+   * Suspend an app (admin): record the suspension FIRST (a failed write
+   * rejects, and nothing is touched), then stop the prober and crash-loop
+   * watch, delete both runtime slots, remove its routes and its minted
+   * DROP_API_KEY, and leave it `stopped`. The record is name-keyed and
+   * outlives the app's config; every start path refuses while it exists.
+   * A monorepo container is refused (returned), naming its services.
+   */
+  suspendApp(appName: string, by: string, reason?: string): Promise<SuspendAppResult>;
+
+  /**
+   * Lift a suspension (admin). Writes `stopped` explicitly, so the owner then
+   * starts the app deliberately. `unsuspended: false` when there was no suspension.
+   */
+  unsuspendApp(appName: string): Promise<UnsuspendAppResult>;
 
   /**
    * Attach a backing service (postgres|redis) to an app: quota check,

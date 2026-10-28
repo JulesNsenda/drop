@@ -11,6 +11,10 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import {
   promotionModeFor,
   defaultPromotionMode,
@@ -174,7 +178,7 @@ describe('promoteApp', () => {
     // promoting something nobody approved.
     await platform.promoteApp('app');
 
-    expect(handleStartApp).toHaveBeenCalledWith('app', '/built');
+    expect(handleStartApp).toHaveBeenCalledWith('app', '/built', { closeEpisode: false, keepHeld: true });
   });
 
   it('clears the hold so a later deploy is not confused with this one', async () => {
