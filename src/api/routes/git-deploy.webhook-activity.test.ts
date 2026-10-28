@@ -13,7 +13,8 @@ import * as crypto from 'crypto';
 import { ApiServer } from './../server';
 import * as activity from '../../managers/activity';
 import * as gitDeployModule from '../../core/git-deploy';
-import { AppInProgressError } from '../platform-ops';
+import { AppInProgressError, setPlatformOps, resetPlatformOps } from '../platform-ops';
+import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 
 describe('git webhook activity logging (P2-4)', () => {
   let tempDir: string;
@@ -91,7 +92,8 @@ describe('git webhook activity logging (P2-4)', () => {
   });
 
   it('queues a push that arrives while the app is busy, reports it as queued, and audits it', async () => {
-    redeploy.mockRejectedValueOnce(new AppInProgressError('myapp'));
+    // Busy when the push arrives: the route sees it before starting anything.
+    setPlatformOps(makePlatformOpsStub({ isAppInProgress: jest.fn().mockReturnValue(true) }));
 
     const res = await app.request('/api/v1/git/webhook', {
       method: 'POST',
@@ -109,6 +111,8 @@ describe('git webhook activity logging (P2-4)', () => {
     expect(queueRedeploy).toHaveBeenCalledWith('myapp', { automation: 'webhook' });
     expect(logSpy).toHaveBeenCalledTimes(1);
     expect(logSpy.mock.calls[0][1].detail).toContain('queued');
+    expect(redeploy).not.toHaveBeenCalled();
+    resetPlatformOps();
   });
 
   it('maps a first deploy refused as busy (quiesced, stale build container) to 409, not 500', async () => {
