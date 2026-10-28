@@ -318,6 +318,21 @@ describe('app suspension routes', () => {
       expect(ops_.restartApp).not.toHaveBeenCalled();
     });
 
+    it('revokes the key on a narrowing PUT while the store is what refuses, without a restart', async () => {
+      const ops_ = ops();
+      jest.spyOn(console, 'error').mockImplementation();
+      await fs.writeFile(path.join(t.tempDir, 'suspensions.json'), '{ broken');
+      await getSuspensionStore().load();
+      storedGrant(['users:create']);
+      await createApiKey(appProvisionKeyName('shop'), 'none', undefined, ['users:create']);
+
+      const res = await putScopes([]);
+
+      expect(res.status).toBe(200);
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(false);
+      expect(ops_.restartApp).not.toHaveBeenCalled();
+    });
+
     it('keeps the key on an unchanged PUT for a real suspension too (nothing narrowed)', async () => {
       ops();
       await getSuspensionStore().suspend('shop', adminId);

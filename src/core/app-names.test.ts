@@ -64,8 +64,9 @@ describe('isNameTaken', () => {
     await getStateManager().registerApp('shop', '/y');
 
     const deps = { stateManager: getStateManager(), appConfigService: acs };
-    expect(caseVariantsOf('shop', deps).sort()).toEqual(['SHOP', 'Shop', 'ShOp'].sort());
-    expect(caseVariantsOf('fresh', deps)).toEqual([]);
+    expect(caseVariantsOf('shop', deps, 'all').sort()).toEqual(['SHOP', 'Shop', 'ShOp'].sort());
+    expect(caseVariantsOf('fresh', deps, 'all')).toEqual([]);
+    expect(caseVariantsOf('shop', deps, 'apps').sort()).toEqual(['SHOP', 'Shop'].sort());
   });
 
   it('is true for EVERY name while the suspension store is unreadable (fail closed)', async () => {

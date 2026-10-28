@@ -25,6 +25,58 @@ describe('AppStateManager', () => {
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
+  describe('revertTransientStarting', () => {
+    beforeEach(async () => {
+      await manager.initialize();
+      await manager.registerApp('app', '/tmp/app', 'nodejs');
+    });
+
+    it('does nothing unless the status is still starting', async () => {
+      await manager.setAppStatus('app', 'stopped', { error: 'Suspended by admin' });
+
+      const reverted = await manager.revertTransientStarting('app', { status: 'running', error: 'old' });
+
+      expect(reverted).toBe(false);
+      expect(manager.getApp('app')).toMatchObject({ status: 'stopped', error: 'Suspended by admin' });
+    });
+
+    it('restores status, error, parkedReason and missingSecrets, silently', async () => {
+      await manager.setAppStatus('app', 'starting');
+      const events: unknown[] = [];
+      const unsubscribe = eventBus.subscribe('app:updated', (p) => { events.push(p); });
+
+      const reverted = await manager.revertTransientStarting('app', {
+        status: 'needs-config',
+        error: 'was broken',
+        parkedReason: 'parked by DROP',
+        missingSecrets: ['API_KEY'],
+      });
+      unsubscribe();
+
+      expect(reverted).toBe(true);
+      expect(manager.getApp('app')).toMatchObject({
+        status: 'needs-config',
+        error: 'was broken',
+        parkedReason: 'parked by DROP',
+        missingSecrets: ['API_KEY'],
+      });
+      expect(events).toEqual([]);
+    });
+
+    it('clears fields the snapshot did not have', async () => {
+      await manager.setAppStatus('app', 'starting');
+      await manager.updateApp('app', { error: 'stale', parkedReason: 'x', missingSecrets: ['A'] });
+
+      await manager.revertTransientStarting('app', { status: 'running' });
+
+      const app = manager.getApp('app')!;
+      expect(app.status).toBe('running');
+      expect(app.error).toBeUndefined();
+      expect(app.parkedReason).toBeUndefined();
+      expect(app.missingSecrets).toBeUndefined();
+    });
+  });
+
   describe('registerApp preserves state across a re-register', () => {
     // registerApp runs for EVERY app on EVERY boot (syncStateWithConfigs), so
     // anything it drops is lost on restart. It used to be a literal naming ~12

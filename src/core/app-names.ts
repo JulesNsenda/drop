@@ -47,7 +47,7 @@ function recordedNames(
 export function caseVariantsOf(
   name: string,
   deps: { stateManager: AppStateManager; appConfigService?: AppConfigService },
-  scope: 'apps' | 'all' = 'all'
+  scope: 'apps' | 'all'
 ): string[] {
   const wanted = name.toLowerCase();
   return [...new Set(recordedNames(deps, scope))].filter((n) => n !== name && n.toLowerCase() === wanted);

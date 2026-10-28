@@ -44,7 +44,13 @@ import {
   isInstanceName,
   type InstanceSlot,
 } from '../managers/runtime/instance';
-import { AppStateManager, AppStatus, getStateManager, resetStateManager } from '../managers/app/state-manager';
+import {
+  AppStateManager,
+  AppStatus,
+  getStateManager,
+  resetStateManager,
+  type TransientStatusSnapshot,
+} from '../managers/app/state-manager';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfig, AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import type {
@@ -9681,7 +9687,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    *          caller is taking it down and writes 'stopped' when it is done);
    *        - live, the store refusing: 'running' with the error, because
    *          something IS serving and the app is not suspended;
-   *        - liveness unknown (the runtime could not be listed): 'errored';
+   *        - liveness unknown (the runtime could not be listed): 'errored' when
+   *          the store refused, 'stopped' for a suspension or a stop;
    *   6. except that a caller which does not close the episode never closes it
    *      by accident: while one is open, the deploy tracker closes it on
    *      'running' and 'errored', so neither is written then. Nothing live
@@ -11858,8 +11865,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     let refused = false;
     // What the app was before this attempt wrote its transient 'starting'.
     const entry = this.stateManager?.getApp(appName);
-    const entryStatus = entry?.status;
-    const entryError = entry?.error;
+    const entrySnapshot: TransientStatusSnapshot | undefined = entry && {
+      status: entry.status,
+      error: entry.error,
+      parkedReason: entry.parkedReason,
+      missingSecrets: entry.missingSecrets ? [...entry.missingSecrets] : undefined,
+    };
     try {
       await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
       await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
@@ -11938,11 +11949,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           };
           await restore('the held build', () => this.appConfigService?.updateConfig(appName, { pendingPromotion: pending }));
           await restore('the held flag', () => this.stateManager?.updateApp(appName, { awaitingPromotion: true }));
-          // Only the transient 'starting' is undone: anything else was written by what refused
-          // the start (a suspension that stopped the app), and is the truth. Quietly, since
-          // announcing 'running' would close the held build's episode.
-          if (entryStatus && this.stateManager?.getApp(appName)?.status === 'starting') {
-            await restore('the status', () => this.stateManager?.restoreStatus(appName, entryStatus, entryError));
+          // Only the transient 'starting' is undone (compare-and-set, and silent: announcing
+          // 'running' would close the held build's episode).
+          if (entrySnapshot) {
+            await restore('the status', () => this.stateManager?.revertTransientStarting(appName, entrySnapshot));
           }
         }
       } finally {

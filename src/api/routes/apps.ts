@@ -2035,9 +2035,9 @@ apps.put('/:name/capabilities', async c => {
     const stored = getAppConfigService().getConfig(name)?.grantedApiScopes ?? [];
     if (scopes.some(s => !stored.includes(s))) return appSuspendedResponse(c, suspended);
     // The key the app was last started with carries the old, wider scopes, and nothing
-    // restarts to re-mint it: a real suspension and a narrowing revoke it, before anything
-    // else can fail. A store-refusing app is not suspended, so an unchanged PUT keeps its key.
-    if (suspended.reason === 'record' && stored.some(s => !scopes.includes(s))) {
+    // restarts to re-mint it: a narrowing revokes it, whatever refused the start, before
+    // anything else can fail. An unchanged PUT keeps a working key.
+    if (stored.some(s => !scopes.includes(s))) {
       await deleteApiKeysByName(appProvisionKeyName(name));
     }
   }
