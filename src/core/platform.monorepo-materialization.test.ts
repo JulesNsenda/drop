@@ -31,6 +31,12 @@ import * as fs from 'fs/promises';
 import { DropPlatform, createPlatform } from './platform';
 import { getStateManager, resetStateManager, AppStateManager } from '../managers/app/state-manager';
 import { AppConfigService } from '../managers/app/app-config';
+import { getSuspensionStore } from '../managers/suspension';
+
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 
 describe('expandMonorepo re-materializing a live child', () => {
   let platform: DropPlatform;
@@ -215,6 +221,30 @@ describe('expandMonorepo re-materializing a live child', () => {
       // source — v2 refreshed the tree and merely skipped the build.
       expect(await fs.readFile(path.join(childPath(), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
       expect(await exists(path.join(childPath(), 'dist'))).toBe(true);
+    });
+  });
+
+  describe('a suspended child', () => {
+    it('is neither refreshed on disk nor built', async () => {
+      await seedRunningChild();
+      await getSuspensionStore().suspend(childName, 'admin-1');
+
+      await expand();
+
+      expect(handleAppUpdate).not.toHaveBeenCalled();
+      expect(handleBuildApp).not.toHaveBeenCalled();
+      // Source untouched: a lifted suspension must not leave new, UNBUILT source to serve.
+      expect(await fs.readFile(path.join(childPath(), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+      expect(await exists(path.join(childPath(), 'dist'))).toBe(true);
+    });
+
+    it('a first-ever child of a suspended name is not created or built either', async () => {
+      await getSuspensionStore().suspend(childName, 'admin-1');
+
+      await expand();
+
+      expect(handleBuildApp).not.toHaveBeenCalled();
+      expect(await exists(childPath())).toBe(false);
     });
   });
 

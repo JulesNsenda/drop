@@ -1307,6 +1307,26 @@ describe('MCP tool handlers', () => {
       expect(result.structuredContent).toEqual(expect.objectContaining({ refusal_code: 'APP_STOPPED' }));
     });
 
+    it('a suspended app\'s redeploy refusal says it is suspended: no "start it" hint, no restart_app, no dashboard', async () => {
+      setPlatformOps(
+        makeOps({
+          redeployApp: jest.fn().mockResolvedValue({
+            refused: { code: 'APP_SUSPENDED', message: "Application 'alice-app' is suspended by an administrator" },
+          }),
+        })
+      );
+
+      const result = await handleRedeployApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('suspended by an administrator');
+      expect(firstText(result)).toContain('do not retry');
+      expect(firstText(result)).not.toContain('restart_app');
+      expect(firstText(result)).not.toContain('dashboard');
+      expect(firstText(result)).not.toContain('start it');
+      expect(result.structuredContent).toEqual(expect.objectContaining({ refusal_code: 'APP_SUSPENDED' }));
+    });
+
     it('restart_app tells an agent the same thing in the stale-dependencies case', async () => {
       setPlatformOps(makeOps({ restartApp: jest.fn().mockRejectedValue(new StaleDependenciesError('alice-app')) }));
 

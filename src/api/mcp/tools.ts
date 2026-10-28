@@ -625,6 +625,7 @@ export async function handleDeployFiles(
     ) {
       return toolError(err.message);
     }
+    if (err instanceof AppSuspendedError) return toolError(suspendedFor(err, auth?.role === 'admin'));
     const refusal = deployRefusal(name, err);
     if (refusal) return refusal;
     if (err instanceof EphemeralQuotaError) {
@@ -754,6 +755,7 @@ export async function handleDeployFromGit(
       return /^[\w.-]{1,128}$/.test(derived) ? derived : '';
     }, err);
     if (refusal) return refusal;
+    if (err instanceof AppSuspendedError) return toolError(suspendedFor(err, auth?.role === 'admin'));
     if (err instanceof AppInProgressError) {
       return toolError(`Conflict: ${err.message}`);
     }
@@ -1208,6 +1210,10 @@ export async function handleRedeployApp(
       const { code, message, retryAfterSeconds } = result.refused;
       // The recorded git URL is tenant-controlled and rides in this one message.
       let text = code === 'INVALID_GIT_SOURCE' ? wrapUntrusted(`GIT SOURCE: ${target}`, message) : message;
+      if (code === 'APP_SUSPENDED') {
+        // Not the APP_STOPPED hint below: restart_app is refused too, and only an administrator lifts it.
+        text = `${message}. No agent action lifts it; do not retry.`;
+      }
       if (code === 'APP_STOPPED') {
         // An agent never rebuilds a stopped app, so do not send it round restart_app and back:
         // restart_app starts one whose dependencies are intact, and says so when they are not.

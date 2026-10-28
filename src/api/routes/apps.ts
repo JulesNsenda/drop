@@ -179,7 +179,7 @@ function sanitizeRepoUrl(repoUrl: string): string {
  * client can tell it from a busy app: retrying will not help until an admin acts.
  * Only an admin is told the suspension store is the reason (as in `suspendedDto`).
  */
-function appSuspendedResponse(c: Context, err: AppSuspendedError) {
+export function appSuspendedResponse(c: Context, err: AppSuspendedError) {
   const auth = (c.get as Function)('auth') as AuthContext | undefined;
   return c.json(error(err.code, auth?.role === 'admin' ? err.message : err.tenantMessage), 409);
 }
@@ -683,6 +683,9 @@ apps.post('/:name/source', async c => {
     }
     if (err instanceof UploadNotFoundError) {
       return c.json(error(ErrorCodes.NOT_FOUND, err.message), 404);
+    }
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
     }
     if (err instanceof UploadConflictError || err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
@@ -1339,6 +1342,8 @@ const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 400 | 404 | 409 |
   APP_SOURCE_MISSING: { status: 409, code: 'APP_SOURCE_MISSING' },
   APP_BUSY: { status: 409, code: 'APP_BUSY' },
   APP_STOPPED: { status: 409, code: 'APP_STOPPED' },
+  // Same status and code as the 409 appSuspendedResponse gives a start.
+  APP_SUSPENDED: { status: 409, code: 'APP_SUSPENDED' },
   INVALID_GIT_SOURCE: { status: 400, code: ErrorCodes.VALIDATION_ERROR },
   // Reached only by a caller that skipped the route's resolution to the container.
   REDEPLOY_VIA_CONTAINER: { status: 409, code: 'REDEPLOY_VIA_CONTAINER' },

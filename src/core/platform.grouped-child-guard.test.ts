@@ -28,6 +28,11 @@ import * as path from 'path';
 import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
 
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('grouped monorepo children are the container’s to build', () => {
   let platform: DropPlatform;
   let tempDir: string;

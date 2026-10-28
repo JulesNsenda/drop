@@ -40,6 +40,11 @@ const rootYamlFor = (services: string[], withType = true) =>
     .map((n) => `  ${n}:\n    path: ${n}\n${withType ? '    type: static\n' : ''}`)
     .join('');
 
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('monorepo children at boot', () => {
   let platform: DropPlatform;
   let tempDir: string;

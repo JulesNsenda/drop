@@ -187,6 +187,8 @@ export type RedeployRefusalCode =
   | 'APP_BUSY'
   | 'SERVICE_UNAVAILABLE'
   | 'APP_STOPPED'
+  // An administrator suspended the app: retrying cannot help, and it is never the "start it" hint.
+  | 'APP_SUSPENDED'
   // A git-backed app whose recorded repository URL no longer validates.
   | 'INVALID_GIT_SOURCE'
   // A service of a git-deployed group: its container holds the repository.
