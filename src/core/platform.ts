@@ -874,6 +874,11 @@ type UpdateRefused = { refused: UpdateRefusal; retryAfterSeconds?: number };
  */
 type ClaimedUpdate = UpdateRefused | { started: string; done: Promise<boolean> };
 
+/** Whether a runtime reading shows a process that is up or coming up (anything but absent, stopped or errored). */
+function isLiveRuntimeState(info: AppProcessInfo | null): boolean {
+  return !!info && info.status !== 'stopped' && info.status !== 'errored';
+}
+
 /** How long a redeploy waits for a builder slot before answering `accepted` (DROP_REDEPLOY_START_WAIT_MS). */
 const DEFAULT_REDEPLOY_START_WAIT_MS = 10_000;
 
@@ -8605,11 +8610,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // config-sourced port; releasing it in between would open a window for
       // a concurrent deploy to steal it.
       // Unconditional, as in doRestart: the STORED status says nothing
-      // reliable about the process. An 'errored' app can still have a live PM2
-      // process, and a crash-looping one is mid-relaunch ('launching' maps to
-      // 'starting'); skipping the removal here would hit
-      // ProcessManager.start's online-early-return - a silent no-op that
-      // records success while the old (broken) code keeps running.
+      // reliable about the process (an 'errored' or crash-looping app can
+      // still hold a live one). See replaceLiveProcess.
       this.logger.info(`Replacing ${appName}'s process (if any) with the new build...`, 'UPDATE');
       await this.replaceLiveProcess(appName);
 
@@ -10342,7 +10344,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       let deprovisionStarted = false;
       try {
         const runtimeStatus = await this.runtime.getStatus(appName);
-        wasLive = !!runtimeStatus && runtimeStatus.status !== 'stopped' && runtimeStatus.status !== 'errored';
+        wasLive = isLiveRuntimeState(runtimeStatus);
         if (wasLive) {
           this.stopHealthProber(appName);
           this.stopCrashLoopWatch(appName);
@@ -10535,8 +10537,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     let wasLive = false;
     let outcome: DetachServiceOutcome;
     try {
-      const liveState = await this.runtime!.getStatus(appName);
-      wasLive = !!liveState && liveState.status !== 'stopped' && liveState.status !== 'errored';
+      wasLive = isLiveRuntimeState(await this.runtime!.getStatus(appName));
       const revoked = await storage.revokeAppAccess(appName, this.incarnationOf(appName));
       outcome = revoked
         ? { detached: true, deprovisioned: true, drainPending: true }
