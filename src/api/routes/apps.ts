@@ -177,9 +177,11 @@ function sanitizeRepoUrl(repoUrl: string): string {
 /**
  * 409 for a start the suspension refused. `APP_SUSPENDED` is its own code so a
  * client can tell it from a busy app: retrying will not help until an admin acts.
+ * Only an admin is told the suspension store is the reason (as in `suspendedDto`).
  */
 function appSuspendedResponse(c: Context, err: AppSuspendedError) {
-  return c.json(error(err.code, err.message), 409);
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  return c.json(error(err.code, auth?.role === 'admin' ? err.message : err.tenantMessage), 409);
 }
 
 /**

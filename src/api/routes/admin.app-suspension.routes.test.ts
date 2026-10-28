@@ -213,15 +213,37 @@ describe('app suspension routes', () => {
       expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
     });
 
-    it('an unreadable store is reported as the store, not as an administrator', async () => {
+    it('an unreadable store is reported to an admin as the store, not as an administrator', async () => {
       ops({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('shop', 'store-unreadable')) });
 
-      const res = await post('/api/v1/apps/shop/restart', ownerToken);
+      const res = await post('/api/v1/apps/shop/restart', adminToken);
 
       expect(res.status).toBe(409);
       const body = (await res.json()) as { error: { message: string } };
       expect(body.error.message).toContain('suspension store is unreadable');
       expect(body.error.message).not.toContain('administrator');
+    });
+
+    it.each(['store-unreadable', 'not-loaded'] as const)(
+      'a %s store is not described to the owner: only the generic refusal',
+      async (reason) => {
+        ops({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('shop', reason)) });
+
+        const res = await post('/api/v1/apps/shop/restart', ownerToken);
+
+        expect(res.status).toBe(409);
+        const body = (await res.json()) as { error: { code: string; message: string } };
+        expect(body.error.code).toBe('APP_SUSPENDED');
+        expect(body.error.message).toBe("Starting 'shop' is refused right now; contact your administrator");
+      }
+    );
+
+    it('a real suspension is still described to the owner as one', async () => {
+      ops({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('shop', 'record')) });
+
+      const res = await post('/api/v1/apps/shop/restart', ownerToken);
+
+      expect(((await res.json()) as { error: { message: string } }).error.message).toContain('suspended by an administrator');
     });
   });
 

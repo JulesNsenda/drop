@@ -79,6 +79,18 @@ export class AppSuspendedError extends Error {
     );
     this.name = 'AppSuspendedError';
   }
+
+  /**
+   * What a caller who is not an administrator may be told. A `record` is an
+   * administrator's act and already shows on the app; the suspension store's own
+   * state (unreadable, not loaded) is the platform's, and is for admins and the
+   * server log only.
+   */
+  get tenantMessage(): string {
+    return this.reason === 'record'
+      ? this.message
+      : `Starting '${this.appName}' is refused right now; contact your administrator`;
+  }
 }
 
 /**
