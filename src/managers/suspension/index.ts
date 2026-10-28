@@ -4,4 +4,5 @@ export {
   getSuspensionStore,
   resetSuspensionStore,
   type SuspensionRecord,
+  type SuspensionRefusal,
 } from './suspension-store';
