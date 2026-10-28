@@ -27,6 +27,10 @@ import { createTestApiServer, teardownTestApiServer, type TestApiServer } from '
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { setPlatformOps, resetPlatformOps } from '../platform-ops';
 import { createPlatform, type DropPlatform } from '../../core/platform';
+import { loadEmptySuspensionStore } from '../../core/__testutils__/suspension';
+
+// An unloaded suspension store fails closed; this test never starts the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import { eventBus } from '../../core/event-bus';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getDeployTracker, resetDeployTracker } from '../../managers/deploy-tracker';

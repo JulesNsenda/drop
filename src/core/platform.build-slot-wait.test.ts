@@ -25,6 +25,10 @@ jest.mock('../utils/disk', () => ({
 }));
 
 import { DropPlatform, createPlatform } from './platform';
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import { BuilderService } from './builder';
 import { BuildContext, BuildStrategy } from './builder/builder.types';
 

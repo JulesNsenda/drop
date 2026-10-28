@@ -9,15 +9,25 @@
  * own uid can edit it. A name-keyed record survives all of that, so an app
  * deleted and recreated under a suspended name is still suspended.
  *
- * FAILS CLOSED. When the file exists but cannot be read or parsed, every app is
- * reported suspended and an error is logged: "refuse every start" is the safe
- * reading of a file nobody can trust, and "no suspensions" is the one reading
- * that would turn a corrupt byte into a mass un-suspend. While corrupt, writes
- * refuse too, so unreadable bytes are not overwritten by a view built from
- * nothing. Recovery is to repair or delete the file and restart.
+ * Names are matched case-insensitively (the key is the lower-cased name; the
+ * record keeps the name as it was given), so a suspension cannot be dodged by
+ * a differently-cased spelling of the same app.
  *
- * Reads are synchronous and answer from memory. Until `load()` has run the
- * store is empty (the platform loads it before anything can start an app).
+ * FAILS CLOSED, twice over:
+ *  - when the file exists but cannot be read or parsed, every app is reported
+ *    suspended and an error is logged: "refuse every start" is the safe
+ *    reading of a file nobody can trust, and "no suspensions" is the one
+ *    reading that would turn a corrupt byte into a mass un-suspend. While
+ *    corrupt, writes refuse too, so unreadable bytes are not overwritten by a
+ *    view built from nothing. Recovery is to repair or delete the file and
+ *    restart;
+ *  - until `load()` has run, every app is reported suspended too: an unloaded
+ *    store knows nothing, which is not the same as knowing there is nothing.
+ *
+ * Reads are synchronous and answer from memory. Every change is built as a new
+ * map, written, and only then assigned, inside one write queue: a failed write
+ * changes nothing (so the caller's error means "nothing happened"), and two
+ * overlapping changes cannot interleave their memory and disk steps.
  */
 
 import * as fs from 'fs/promises';
@@ -31,12 +41,14 @@ export interface SuspensionRecord {
   /** The administrator's user id, or a label when the caller has none. */
   by: string;
   reason?: string;
+  /** The app name as it was given (the file's key is lower-cased). */
+  app?: string;
 }
 
-/** Refused because the suspension file is unreadable; see the module doc. */
+/** Refused because the suspension store cannot be trusted; see the module doc. */
 export class SuspensionStoreCorruptError extends Error {
   constructor() {
-    super('Suspension store is corrupt; refusing every change until the file is repaired and the platform restarted');
+    super('Suspension store is unreadable or not loaded; refusing every change until the file is repaired and the platform restarted');
     this.name = 'SuspensionStoreCorruptError';
   }
 }
@@ -55,16 +67,23 @@ function isValidRecord(raw: unknown): raw is SuspensionRecord {
   return (
     typeof r.at === 'string' &&
     typeof r.by === 'string' &&
-    (r.reason === undefined || typeof r.reason === 'string')
+    (r.reason === undefined || typeof r.reason === 'string') &&
+    (r.app === undefined || typeof r.app === 'string')
   );
+}
+
+function keyOf(appName: string): string {
+  // String(): a start spec built by a test double may lack a name; that cannot match a record.
+  return String(appName).toLowerCase();
 }
 
 export class SuspensionStore {
   private readonly filePath: string;
   /** A Map, not an object: app names are tenant-chosen (`constructor`, `__proto__`). */
   private records: Map<string, SuspensionRecord> = new Map();
+  private loaded = false;
   private corrupt = false;
-  /** Serialises writes; a rejected write does not block the next. */
+  /** Serialises changes; a rejected one does not block the next. */
   private chain: Promise<unknown> = Promise.resolve();
 
   constructor(filePath?: string) {
@@ -80,6 +99,7 @@ export class SuspensionStore {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         this.records = new Map();
         this.corrupt = false;
+        this.loaded = true;
         return;
       }
       this.markCorrupt(err);
@@ -93,10 +113,11 @@ export class SuspensionStore {
         // One malformed row is as untrustworthy as the file: dropping it would
         // un-suspend that app.
         if (!isValidRecord(record)) throw new Error(`malformed record for '${name}'`);
-        records.set(name, record);
+        records.set(keyOf(name), record);
       }
       this.records = records;
       this.corrupt = false;
+      this.loaded = true;
     } catch (err) {
       this.markCorrupt(err);
     }
@@ -105,6 +126,7 @@ export class SuspensionStore {
   private markCorrupt(err: unknown): void {
     this.records = new Map();
     this.corrupt = true;
+    this.loaded = true;
     getLogger().error(
       `${path.basename(this.filePath)} is unreadable (${err instanceof Error ? err.message : String(err)}); ` +
         'treating EVERY app as suspended until it is repaired or deleted and the platform restarted',
@@ -117,57 +139,62 @@ export class SuspensionStore {
     return this.corrupt;
   }
 
-  /** Whether starts and builds of the app must be refused. True for every app while corrupt. */
-  isSuspended(appName: string): boolean {
-    return this.corrupt || this.records.has(appName);
+  /** Whether the store cannot answer: never loaded, or unreadable. Every app then reads as suspended. */
+  isUnavailable(): boolean {
+    return !this.loaded || this.corrupt;
   }
 
-  /** The app's record, or undefined (also undefined while corrupt: there is nothing to report). */
+  /** Whether starts and builds of the app must be refused. True for every app while unavailable. */
+  isSuspended(appName: string): boolean {
+    return this.isUnavailable() || this.records.has(keyOf(appName));
+  }
+
+  /** The app's record, or undefined (also undefined while unavailable: there is nothing to report). */
   get(appName: string): SuspensionRecord | undefined {
-    return this.records.get(appName);
+    return this.records.get(keyOf(appName));
   }
 
   /** Every recorded suspension, by name. */
   list(): Array<{ name: string } & SuspensionRecord> {
-    return [...this.records.entries()].map(([name, record]) => ({ name, ...record }));
+    return [...this.records.entries()].map(([key, record]) => ({ name: record.app ?? key, ...record }));
   }
 
-  /**
-   * Record a suspension. Memory first, then disk: a failed write leaves the app
-   * suspended in this process (the safe direction) and throws, so the caller
-   * answers an error rather than success.
-   */
-  async suspend(appName: string, by: string, reason?: string): Promise<SuspensionRecord> {
-    if (this.corrupt) throw new SuspensionStoreCorruptError();
-    const record: SuspensionRecord = { at: new Date().toISOString(), by, ...(reason ? { reason } : {}) };
-    this.records.set(appName, record);
-    await this.persist();
-    return record;
+  /** Record a suspension. A failed write changes nothing and throws. */
+  suspend(appName: string, by: string, reason?: string): Promise<SuspensionRecord> {
+    return this.change((next) => {
+      const record: SuspensionRecord = { at: new Date().toISOString(), by, ...(reason ? { reason } : {}), app: appName };
+      next.set(keyOf(appName), record);
+      return record;
+    });
   }
 
-  /**
-   * Lift a suspension. Disk first, then memory: if the write fails the app
-   * stays suspended. Returns whether a record existed.
-   */
+  /** Lift a suspension. A failed write changes nothing and throws. Resolves whether a record existed. */
   async unsuspend(appName: string): Promise<boolean> {
-    if (this.corrupt) throw new SuspensionStoreCorruptError();
-    if (!this.records.has(appName)) return false;
-    await this.persist((next) => next.delete(appName));
-    this.records.delete(appName);
-    return true;
+    return this.change((next) => next.delete(keyOf(appName)), (lifted) => lifted);
   }
 
-  /** Write the current records, optionally after applying `mutate` to the copy that is written. */
-  private persist(mutate?: (next: Map<string, SuspensionRecord>) => void): Promise<void> {
+  /**
+   * One change, queued: copy the records, apply it to the copy, write the copy,
+   * and only then make it the live view. `shouldWrite` lets a no-op (unsuspending
+   * a name with no record) skip the write.
+   */
+  private change<T>(
+    apply: (next: Map<string, SuspensionRecord>) => T,
+    shouldWrite: (result: T) => boolean = () => true
+  ): Promise<T> {
     const run = this.chain
       .catch(() => undefined)
       .then(async () => {
+        if (this.isUnavailable()) throw new SuspensionStoreCorruptError();
         const next = new Map(this.records);
-        mutate?.(next);
+        const result = apply(next);
+        if (!shouldWrite(result)) return result;
         const file: Record<string, SuspensionRecord> = Object.create(null);
-        for (const [name, record] of next) file[name] = record;
+        for (const [key, record] of next) file[key] = record;
         await fs.mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
         await writeJsonAtomic(this.filePath, file, { mode: 0o600 });
+        this.records = next;
+        return result;
       });
     this.chain = run;
     return run;

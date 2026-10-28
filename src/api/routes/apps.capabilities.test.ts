@@ -23,6 +23,11 @@ import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import * as activity from '../../managers/activity';
 import type { AppProcessInfo } from '../../managers/runtime';
 import { ErrorCodes } from '../types';
+import { loadEmptySuspensionStore } from '../../core/__testutils__/suspension';
+
+// The route refuses a suspended app before writing the grant, and an unloaded
+// suspension store fails closed: this suite has no platform to load it.
+beforeEach(loadEmptySuspensionStore);
 
 const RUNNING_PROCESS: AppProcessInfo = {
   name: 'test-app',

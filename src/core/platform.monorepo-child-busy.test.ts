@@ -13,6 +13,10 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs/promises';
 import { DropPlatform, createPlatform } from './platform';
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import { getStateManager, resetStateManager, AppStateManager } from '../managers/app/state-manager';
 import { AppConfigService } from '../managers/app/app-config';
 import * as treeSync from '../utils/tree-sync';

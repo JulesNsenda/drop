@@ -99,7 +99,7 @@ describe('SuspensionStore', () => {
     expect(store.isSuspended('anything')).toBe(true);
   });
 
-  it('keeps the app suspended in memory when the write fails, and keeps it suspended on a failed unsuspend', async () => {
+  it('a failed write changes nothing: a failed suspend suspends nothing, a failed unsuspend lifts nothing', async () => {
     const store = new SuspensionStore(file);
     await store.load();
     await store.suspend('shop', 'admin-1');
@@ -111,7 +111,54 @@ describe('SuspensionStore', () => {
     expect(store.isSuspended('shop')).toBe(true);
 
     await expect(store.suspend('other', 'admin-1')).rejects.toBeDefined();
-    expect(store.isSuspended('other')).toBe(true);
+    expect(store.isSuspended('other')).toBe(false);
+  });
+
+  it('serialises overlapping changes: an unsuspend then a suspend of the same app ends suspended, in memory and on disk', async () => {
+    const store = new SuspensionStore(file);
+    await store.load();
+    await store.suspend('shop', 'admin-1');
+
+    // Neither awaited before the other starts.
+    const lifted = store.unsuspend('shop');
+    const again = store.suspend('shop', 'admin-2');
+    await Promise.all([lifted, again]);
+
+    expect(store.isSuspended('shop')).toBe(true);
+    expect(store.get('shop')?.by).toBe('admin-2');
+    const reloaded = new SuspensionStore(file);
+    await reloaded.load();
+    expect(reloaded.get('shop')?.by).toBe('admin-2');
+  });
+
+  it('matches names case-insensitively and keeps the name as given', async () => {
+    const store = new SuspensionStore(file);
+    await store.load();
+    await store.suspend('Shop', 'admin-1');
+
+    expect(store.isSuspended('shop')).toBe(true);
+    expect(store.isSuspended('SHOP')).toBe(true);
+    expect(store.get('shop')?.app).toBe('Shop');
+    expect(store.list()[0].name).toBe('Shop');
+
+    const reloaded = new SuspensionStore(file);
+    await reloaded.load();
+    expect(reloaded.isSuspended('sHoP')).toBe(true);
+
+    expect(await store.unsuspend('sHOP')).toBe(true);
+    expect(store.isSuspended('Shop')).toBe(false);
+  });
+
+  it('fails closed until it has been loaded, and refuses changes meanwhile', async () => {
+    const store = new SuspensionStore(file);
+    expect(store.isCorrupt()).toBe(false);
+    expect(store.isUnavailable()).toBe(true);
+    expect(store.isSuspended('anything')).toBe(true);
+    await expect(store.suspend('shop', 'admin-1')).rejects.toBeInstanceOf(SuspensionStoreCorruptError);
+
+    await store.load();
+    expect(store.isUnavailable()).toBe(false);
+    expect(store.isSuspended('anything')).toBe(false);
   });
 
   it('singleton binds on first use and resets', async () => {
