@@ -31,7 +31,7 @@ import { AuthContext } from '../middleware/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, resetAppConfigService } from '../../managers/app/app-config';
 import { setApiRuntimeConfig } from '../runtime-config';
-import { setPlatformOps, resetPlatformOps, PlatformOps, AppInProgressError, StaleDependenciesError } from '../platform-ops';
+import { setPlatformOps, resetPlatformOps, PlatformOps, AppInProgressError, AppSuspendedError, StaleDependenciesError } from '../platform-ops';
 import * as activityModule from '../../managers/activity';
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import { resetUploadPreflightState } from '../upload-preflight';
@@ -1314,6 +1314,19 @@ describe('MCP tool handlers', () => {
 
       expect(result.isError).toBe(true);
       expect(firstText(result)).toContain('a person has to start or redeploy it from the dashboard');
+    });
+
+    it('restart_app says a suspended app is suspended by an administrator, not stopped', async () => {
+      setPlatformOps(makeOps({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('alice-app')) }));
+
+      const result = await handleRestartApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('suspended by an administrator');
+      expect(firstText(result)).toContain('do not retry');
+      // Not the stopped-app advice: nothing an agent or its owner does lifts this.
+      expect(firstText(result)).not.toContain('dashboard');
+      expect(firstText(result)).not.toContain('restart_app starts it');
     });
 
     it('waits for a started redeploy by its deploy id, not the newest episode, and stamps the id on the answer', async () => {

@@ -20,11 +20,13 @@ import {
   getPlatformOps,
   AppInProgressError,
   AppNeedsConfigError,
+  AppSuspendedError,
   needsConfigAction,
   needsConfigDetail,
   StaleDependenciesError,
   type AttachableServiceId,
 } from '../platform-ops';
+import { getSuspensionStore } from '../../managers/suspension';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
@@ -172,6 +174,21 @@ function sanitizeRepoUrl(repoUrl: string): string {
   }
 }
 
+/**
+ * 409 for a start the suspension refused. `APP_SUSPENDED` is its own code so a
+ * client can tell it from a busy app: retrying will not help until an admin acts.
+ */
+function appSuspendedResponse(c: Context, err: AppSuspendedError) {
+  return c.json(error(err.code, err.message), 409);
+}
+
+/** Everyone learns THAT an app is suspended and since when; who and why is for admins. */
+function suspendedDto(appName: string, isAdmin: boolean): AppDto['suspended'] {
+  const record = getSuspensionStore().get(appName);
+  if (!record) return undefined;
+  return isAdmin ? { at: record.at, by: record.by, reason: record.reason } : { at: record.at };
+}
+
 // Helper to convert AppState to AppDto (role-aware)
 function toAppDto(app: AppState, isAdmin = false): AppDto {
   return {
@@ -213,6 +230,7 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     groupGitBacked:
       !app.gitSource && app.group && isGroupGitBacked(app.group) ? true : undefined,
     mcp: mcpDtoFor(app),
+    suspended: suspendedDto(app.name, isAdmin),
   };
 }
 
@@ -1123,6 +1141,9 @@ apps.post('/:name/start', async c => {
     });
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1224,6 +1245,9 @@ apps.post('/:name/promote', async c => {
     });
     return c.json(success({ app: name, promoted: true }));
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1266,6 +1290,9 @@ apps.post('/:name/restart', async c => {
     });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1430,6 +1457,9 @@ apps.post('/:name/rollback', async c => {
         409
       );
     }
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1504,6 +1534,9 @@ apps.post('/:name/services/:id', async c => {
       success({ message: `${serviceId} attached to '${name}'`, envVarNames: result.envVarNames })
     );
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1994,6 +2027,9 @@ apps.put('/:name/capabilities', async c => {
   try {
     await ops.restartApp(name);
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }

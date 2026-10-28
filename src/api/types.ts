@@ -73,6 +73,11 @@ export interface AppDto {
    */
   groupGitBacked?: boolean;
   /**
+   * Present while an administrator has suspended the app: it cannot be started
+   * until they lift it. `by` and `reason` are for admins only.
+   */
+  suspended?: { at: string; by?: string; reason?: string };
+  /**
    * This app speaks MCP (Step 11). `url` is DROP-composed from the app's own
    * hostname and an allowlisted path — never a raw tenant string. `auth` is
    * `'none'` today, meaning the endpoint is PUBLIC unless the app authenticates
