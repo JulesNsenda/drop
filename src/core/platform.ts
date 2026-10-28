@@ -8604,16 +8604,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // buildFreshStartSpec's allocatePort() call below re-claims the same
       // config-sourced port; releasing it in between would open a window for
       // a concurrent deploy to steal it.
-      // Also stop when the app is 'errored': the hot-reload catch block below
-      // can mark an app errored while its PM2 process is still alive (the
-      // failure happened after start), and skipping stop() here would hit
-      // ProcessManager.start's online-early-return - a silent no-op that
-      // leaves the old (broken) code running.
-      if (wasRunning || appState.status === 'errored') {
+      // Unconditional, and a delete rather than a stop, as in doRestart: the
+      // STORED status says nothing reliable about the process. An 'errored'
+      // app can still have a live PM2 process, and a crash-looping one is
+      // mid-relaunch ('launching' maps to 'starting'); skipping the removal
+      // here would hit ProcessManager.start's online-early-return - a silent
+      // no-op that records success while the old (broken) code keeps running.
+      // Deleting an absent process is a no-op.
+      if (appState.status !== 'stopped') {
         this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
-        this.stopHealthProber(appName);
-        await this.runtime!.stop(appName);
       }
+      this.stopHealthProber(appName);
+      await this.runtime!.delete(appName);
 
       this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);

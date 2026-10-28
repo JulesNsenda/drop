@@ -425,7 +425,7 @@ describe('Platform integration (P2-1)', () => {
     await getStateManager().setAppStatus('site', 'errored', { error: 'simulated post-start failure' });
     (platform as unknown as { appDeployTimes: Map<string, number> }).appDeployTimes.clear();
 
-    const stopSpy = jest.spyOn(fakeRuntime, 'stop');
+    const stopSpy = jest.spyOn(fakeRuntime, 'delete');
     const startsBefore = fakeRuntime.startCount;
     const pidBefore = fakeRuntime.pidOf('site');
 

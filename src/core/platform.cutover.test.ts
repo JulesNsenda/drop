@@ -403,7 +403,7 @@ describe('zero-downtime cutover (#298 step 5)', () => {
 
     await redeploy('worker', appPath, 'v2');
 
-    expect(log).toEqual(['stop worker', expect.stringMatching(/^start worker:/)]);
+    expect(log).toEqual(['delete worker', expect.stringMatching(/^start worker:/)]);
     expect(fakeRuntime.getLiveInstance('worker')).toBe('a');
   }, 30000);
 
@@ -429,7 +429,7 @@ describe('zero-downtime cutover (#298 step 5)', () => {
 
     await redeploy('plain', appPath, 'v2');
 
-    expect(log).toEqual(['stop plain', expect.stringMatching(/^start plain:/)]);
+    expect(log).toEqual(['delete plain', expect.stringMatching(/^start plain:/)]);
   }, 30000);
 
   it('restarts the LIVE slot after a cutover', async () => {

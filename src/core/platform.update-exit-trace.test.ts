@@ -115,6 +115,7 @@ describe('handleAppUpdate exit trace', () => {
     p().runtime = {
       type: 'pm2',
       stop: jest.fn(async () => log('runtime.stop')),
+      delete: jest.fn(async () => log('runtime.delete')),
       start: jest.fn(async () => {
         log('runtime.start');
         if (startThrows) throw startThrows;
@@ -516,7 +517,7 @@ describe('handleAppUpdate exit trace', () => {
         'discard', // prepareDeployTarget clears any stale target first
         'builder.build:ID1',
         'slot.release',
-        'runtime.stop',
+        'runtime.delete',
         'status:starting',
         'runtime.start',
         'discard',
@@ -544,7 +545,7 @@ describe('handleAppUpdate exit trace', () => {
         'discard', // prepareDeployTarget clears any stale target first
         'builder.build:ID1',
         'slot.release',
-        'runtime.stop',
+        'runtime.delete',
         'status:starting',
         'discard',
         'status:needs-config',
@@ -570,7 +571,7 @@ describe('handleAppUpdate exit trace', () => {
         'discard', // prepareDeployTarget clears any stale target first
         'builder.build:ID1',
         'slot.release',
-        'runtime.stop',
+        'runtime.delete',
         'status:starting',
         'runtime.start',
         'status:running',
@@ -594,9 +595,24 @@ describe('handleAppUpdate exit trace', () => {
         'app:started:PID 4242, port 3005 (hot-reloaded)',
       ]);
       expect(p().runtime.stop).not.toHaveBeenCalled();
+      // delete of an absent process is a safe no-op, and the redeploy still lands.
+      expect(p().runtime.delete).toHaveBeenCalledTimes(1);
       expect(p().runtime.start).toHaveBeenCalledTimes(1);
       expect(r.trace[r.trace.length - 1]).toBe(`inprogress.delete:${appName}`);
       expectReleased();
+    });
+
+    it('a crash-looping app whose stored status is not running is still removed before the start', async () => {
+      // PM2 'launching' maps to 'starting': neither 'running' nor 'errored', so
+      // the old stored-status gate skipped the removal and ProcessManager.start
+      // no-opped on the live process while success was recorded.
+      appState = { ...appState, status: 'starting' };
+      const r = await update();
+      expect(r.result).toBe(true);
+      const t = r.trace;
+      expect(t).toContain('runtime.delete');
+      expect(t.indexOf('runtime.delete')).toBeLessThan(t.indexOf('runtime.start'));
+      expect(p().runtime.stop).not.toHaveBeenCalled();
     });
 
     it('a build held for promotion releases the keys without charging the window', async () => {
