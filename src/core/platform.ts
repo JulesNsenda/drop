@@ -155,6 +155,7 @@ import {
   AppInProgressError,
   AppManifestInvalidError,
   AppNeedsConfigError,
+  AppSuspendedError,
   needsConfigAction,
   StaleDependenciesError,
   setPlatformOps,
@@ -166,6 +167,7 @@ import {
   type DetachServiceRestartOutcome,
   type RedeployRefusal,
   type RedeployStart,
+  type SuspendAppResult,
 } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
@@ -222,6 +224,7 @@ import {
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAccessLog, resetAccessLog } from '../managers/access-log/access-log';
 import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
+import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
 import { sessionCookieName as appSessionCookieName } from '../api/app-access/names';
 import {
   assessAccessGate,
@@ -1325,6 +1328,15 @@ export class DropPlatform {
         ),
       }).load();
 
+      // App suspensions: loaded before anything can start an app, and bound to
+      // THIS platform's root (reset first, as for the guest stores above). An
+      // unreadable file does not throw here: the store reports every app as
+      // suspended instead, so a start is refused rather than let through.
+      resetSuspensionStore();
+      await getSuspensionStore(
+        path.join(this.config.dropRoot, 'data', 'drop-svc', 'suspensions.json')
+      ).load();
+
       // Object storage (#301): bind its stores to THIS platform's root before
       // anything can reach them — same reasoning as the guest stores above.
       // Left to their defaults they resolve DROP_ROOT from the environment,
@@ -1670,6 +1682,9 @@ export class DropPlatform {
     // `touchLastSeen`, is explicitly best-effort). Nothing is held in memory
     // that a restart would lose, so this is a reset, not a flush-then-reset.
     resetAppGuests();
+
+    // Every write is awaited by its caller before it acknowledges anything.
+    resetSuspensionStore();
 
     // Stop API server
     if (this.apiServer) {
@@ -2555,6 +2570,8 @@ backup:
     // platform-ops seam — a direct import would be circular (platform → api → routes).
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
+      suspendApp: (name, by, reason) => this.suspendApp(name, by, reason),
+      unsuspendApp: (name) => this.unsuspendApp(name),
       isAppInProgress: (name) => this.isBusy(name),
       tryReserveApp: (name) => this.tryReserveApp(name),
       redeployApp: (name, actor, options) => this.redeployApp(name, actor, options),
@@ -5789,7 +5806,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
      * environment, or drop.yaml") sends the caller to look at something that is
      * not wrong.
      */
-    code?: 'GUARDRAIL_TRIPPED' | 'QUOTA_EXCEEDED' | 'DEPLOY_REFUSED',
+    code?: 'GUARDRAIL_TRIPPED' | 'QUOTA_EXCEEDED' | 'DEPLOY_REFUSED' | 'DEPLOY_STOPPED',
     /** What started the deploy, so a pre-build failure's episode carries it like a built one does. */
     trigger?: DeployTriggerTag,
     /**
@@ -6124,7 +6141,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         buildOutputDir
       );
       await this.noteRuntimeLogStart(appName);
-      const status = await this.runtime.start(spec);
+      const status = await this.startInstance(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
@@ -6232,6 +6249,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // affect deploy_files.
       this.armPostDeployWatches(appName, port, spec.healthCheckPath);
     } catch (error) {
+      // A suspension is not a failure of the app or of this deploy's caller:
+      // closed by the one closer, uncharged, and the app left stopped.
+      if (error instanceof AppSuspendedError) {
+        await this.settleSuspendedDeploy(appName);
+        return;
+      }
       // Secret preflight park (PRD-051): not a failure — the app declared
       // required secrets that aren't set. Record them and stop, so the operator
       // gets an actionable `needs-config` instead of a crash-loop. The
@@ -8635,7 +8658,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         buildResult.outputPath ?? undefined
       );
       await this.noteRuntimeLogStart(appName);
-      const status = await this.runtime!.start(spec);
+      const status = await this.startInstance(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
 
@@ -8667,6 +8690,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch (error) {
       releaseSlot();
       await this.discardDeployTarget(appName);
+      // Checked first: a suspension must not fall through to the 'errored'
+      // write and the breaker charge below, which would undo the stop.
+      if (error instanceof AppSuspendedError) {
+        await this.settleSuspendedDeploy(appName, progress);
+        return false;
+      }
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
       // drop.yaml added a required `secrets:` entry. Park in `needs-config`
       // (not `errored`) so the operator gets the actionable missing list. The
@@ -8820,6 +8849,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * api/platform-ops.ts): on a stopped app it degenerates to a fresh start.
    */
   async restartApp(appName: string): Promise<AppProcessInfo> {
+    // Before the busy check, so a suspension is never reported as a busy app.
+    this.assertStartable(appName);
     // Synchronous check-and-insert, no await between the check and the add,
     // so two concurrent restarts of the same app can't both pass the guard.
     // (handleAppUpdate awaits before its claim, so it re-checks again on the
@@ -8961,7 +8992,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await runtime.delete(newRef).catch(() => undefined);
       }
       await this.noteRuntimeLogStart(appName);
-      await runtime.start(spec);
+      await this.startInstance(spec);
       started = true;
 
       const ready = await this.awaitStrictReadiness(newRef, newPort, spec.healthCheckPath);
@@ -8991,6 +9022,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       if (started) await runtime.delete(newRef).catch(() => undefined);
       if (this.usedPorts.get(newPort) === appName) this.usedPorts.delete(newPort);
+      // A suspension is not a failed cutover: the caller settles it, rather than
+      // failCutover writing 'errored' and putting 'running' and the prober back.
+      if (error instanceof AppSuspendedError) throw error;
       return { ok: false, error, healthCheckPath: spec?.healthCheckPath };
     }
 
@@ -9034,6 +9068,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     error: unknown,
     healthCheckPath: string | undefined
   ): Promise<void> {
+    // Backstop: cutoverTo re-throws a suspension, so it should never arrive here.
+    if (error instanceof AppSuspendedError) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     const exited = error instanceof CutoverError && error.exited;
     this.logger.warn(`Zero-downtime deploy of ${appName} failed; previous version still serving: ${reason}`, 'CUTOVER');
@@ -9510,6 +9546,143 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Throws AppSuspendedError when an administrator has suspended the app.
+   * Synchronous (the store answers from memory), so it can sit directly in
+   * front of a runtime call with nothing awaited between the two.
+   */
+  private assertStartable(appName: string): void {
+    if (getSuspensionStore().isSuspended(appName)) {
+      throw new AppSuspendedError(appName);
+    }
+  }
+
+  /**
+   * THE choke point for starting an app on the runtime: every start goes
+   * through here, so none can skip the suspension check. A test pins
+   * `runtime.start(` / `runtime.restart(` to this method and `restartInstance`.
+   * The instance a cutover starts in the idle slot is checked by its APP name.
+   */
+  private async startInstance(spec: AppStartSpec): Promise<AppProcessInfo> {
+    this.assertStartable(spec.name);
+    return this.runtime!.start(spec);
+  }
+
+  /**
+   * The restart twin of `startInstance`: `pm2.restart` and `container.restart`
+   * both start a STOPPED process, so a restart is a start.
+   */
+  private async restartInstance(appName: string): Promise<AppProcessInfo> {
+    this.assertStartable(appName);
+    return this.runtime!.restart(appName);
+  }
+
+  /**
+   * Close a deploy the suspension cut short. ONE closer for every catch that
+   * can see an AppSuspendedError, because each of those catches otherwise
+   * writes 'errored' and charges the breaker, which would undo the stop and
+   * punish the caller for an administrator's act:
+   *
+   *   1. the guardrail keys are released, UNCHARGED;
+   *   2. the episode is closed once, as DEPLOY_STOPPED, and only when one is
+   *      open (a plain restart has none, and must not show up as a deploy).
+   *      failDeployEpisode is not idempotent, so `progress.episodeClosed` is
+   *      set first and closure is read from the tracker;
+   *   3. the deploy target is discarded and the runtime-log window closed;
+   *   4. 'stopped' is written, with the suspension text.
+   *
+   * It never arms the prober or the crash-loop watch.
+   */
+  private async settleSuspendedDeploy(appName: string, progress?: UpdateProgress): Promise<void> {
+    const message = 'Suspended by admin';
+    this.logger.warn(`Deploy of ${appName} stopped: the app is suspended`, 'SUSPENSION');
+    this.releaseGuardrailKeys(appName);
+    if (!progress?.episodeClosed && this.deployEpisodeOpen(appName)) {
+      if (progress) progress.episodeClosed = true;
+      this.failDeployEpisode(appName, new Error(message), undefined, 'DEPLOY_STOPPED');
+    }
+    await this.discardDeployTarget(appName);
+    await this.noteRuntimeLogEnd(appName);
+    await this.stateManager?.setAppStatus(appName, 'stopped', { error: message });
+  }
+
+  /**
+   * Suspend an app (admin). Order matters:
+   *
+   *   1. the record is written FIRST, so every start path refuses from here on;
+   *      a failed write throws and nothing else has been touched;
+   *   2. the prober and crash-loop watch stop, or one could restart what the
+   *      next step removes;
+   *   3. BOTH runtime slots are deleted by explicit reference (the bare name
+   *      only ever means the live slot), then verified through the seam;
+   *   4. routes and the app's minted DROP_API_KEY are removed;
+   *   5. 'stopped' is written.
+   *
+   * Anything still live afterwards comes back as `stopErrors`: the suspension
+   * holds regardless, but the caller is never told a bare success.
+   */
+  async suspendApp(appName: string, by: string, reason?: string): Promise<SuspendAppResult> {
+    const runtime = this.runtime;
+    const state = this.stateManager;
+    if (!runtime || !state) throw new Error('Platform is not fully initialized');
+
+    // Its services are the runtime apps; the container itself runs nothing.
+    const current = state.getApp(appName);
+    if (current?.isGroupContainer) {
+      return {
+        refused: 'group-container',
+        services: state
+          .getAllApps()
+          .filter((a) => a.group === current.group && !a.isGroupContainer)
+          .map((a) => a.name),
+      };
+    }
+
+    const record = await getSuspensionStore().suspend(appName, by, reason);
+
+    this.stopHealthProber(appName);
+    this.stopCrashLoopWatch(appName);
+
+    const stopErrors: string[] = [];
+    for (const slot of ['a', 'b'] as const) {
+      const ref = instanceRef(appName, slot);
+      try {
+        await runtime.delete(ref);
+        if (await runtime.getStatus(ref)) stopErrors.push(`${ref}: still present after delete`);
+      } catch (err) {
+        stopErrors.push(`${ref}: ${err instanceof Error ? err.message : 'delete failed'}`);
+      }
+    }
+
+    try {
+      await this.router?.removeRoutesForApp(appName);
+    } catch (err) {
+      stopErrors.push(`routes: ${err instanceof Error ? err.message : 'removal failed'}`);
+    }
+    try {
+      await deleteApiKeysByName(`app:${appName}:provision`);
+    } catch (err) {
+      stopErrors.push(`api key: ${err instanceof Error ? err.message : 'revoke failed'}`);
+    }
+
+    await state.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
+
+    return { suspended: true, at: record.at, ...(stopErrors.length > 0 ? { stopErrors } : {}) };
+  }
+
+  /**
+   * Lift a suspension. The app is left 'stopped' explicitly (never a leftover
+   * 'errored' or 'crash-looping'), so its owner starts it deliberately. A name
+   * with a record but no app state (the app was deleted) just loses the record.
+   */
+  async unsuspendApp(appName: string): Promise<boolean> {
+    const lifted = await getSuspensionStore().unsuspend(appName);
+    if (lifted && this.stateManager?.getApp(appName)) {
+      await this.stateManager.setAppStatus(appName, 'stopped', { error: undefined });
+    }
+    return lifted;
+  }
+
+  /**
    * The body of restartApp, extracted so `attachService` (DROP-151 Phase 2)
    * can hold the `appsInProgress` guard across provisioning AND the restart
    * that follows it, instead of releasing and re-acquiring the guard between
@@ -9523,6 +9696,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!this.runtime || !this.detector || !this.stateManager || !this.appConfigService) {
       throw new Error('Platform is not fully initialized');
     }
+    // Before anything is deleted or read: attach and rollback reach here too.
+    this.assertStartable(appName);
 
     // Resolve the app. Out-of-tree (admin-deployed) apps have state but no
     // appconf, so fall back through both before the webapps-dir default.
@@ -9566,7 +9741,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // the store will discard it — so that a start site is never the one
       // that was forgotten if restarts later become addressable.
       await this.noteRuntimeLogStart(appName);
-      const status = await this.runtime.start(spec);
+      const status = await this.startInstance(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (restarted)`);
 
@@ -9597,6 +9772,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       return status;
     } catch (error) {
+      // A suspension that landed after the entry check: settled, then re-thrown
+      // so the caller/route reports it. Not an 'errored' app.
+      if (error instanceof AppSuspendedError) {
+        await this.settleSuspendedDeploy(appName);
+        throw error;
+      }
       // Secret preflight park (PRD-051): re-park in `needs-config` rather than
       // `errored` (e.g. a "retry" that still has some required secrets unset),
       // then re-throw so the caller/route reports which are missing.
@@ -11069,7 +11250,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           if (failures >= 3 && this.runtime) {
             failures = 0;
             this.logger.appEvent('error', appName, 'health check failed — restarting');
-            this.runtime.restart(appName).catch(() => undefined);
+            // A suspended app is left down quietly (restartInstance would throw).
+            if (getSuspensionStore().isSuspended(appName)) {
+              this.stopHealthProber(appName);
+              return;
+            }
+            this.restartInstance(appName).catch(() => undefined);
           }
         }
       } catch {
@@ -11501,6 +11687,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
       }
       await this.handleStartApp(appName, pending.outputDirectory);
+    } catch (err) {
+      // cutoverTo re-throws a suspension without touching the deploy target.
+      if (err instanceof AppSuspendedError) await this.discardDeployTarget(appName);
+      throw err;
     } finally {
       this.appsInProgress.delete(appName);
     }

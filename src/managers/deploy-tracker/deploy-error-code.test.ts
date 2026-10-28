@@ -113,6 +113,12 @@ describe('refusal codes', () => {
     ).toBe('DEPLOY_REFUSED');
   });
 
+  it('names a deploy cut short by a stop or suspension with its own code, not PREBUILD_FAILED', () => {
+    expect(
+      deriveErrorCode({ phase: 'build', stage: 'pre-build', builderCode: 'DEPLOY_STOPPED' })
+    ).toBe('DEPLOY_STOPPED');
+  });
+
   it('names a quota refusal the same way', () => {
     expect(
       deriveErrorCode({ phase: 'build', stage: 'pre-build', builderCode: 'QUOTA_EXCEEDED' })

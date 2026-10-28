@@ -34,6 +34,8 @@ export class FakeRuntime implements AppRuntime {
   private pidSeq = 1000;
   /** Total start() calls — lets a test assert a reload ran exactly once. */
   startCount = 0;
+  /** Total restart() calls — a restart starts a stopped process, so it counts like a start. */
+  restartCount = 0;
 
   /** Clear all tracked apps — call between test cases, NOT between platform instances within a case. */
   reset(): void {
@@ -41,6 +43,7 @@ export class FakeRuntime implements AppRuntime {
     this.live = new LiveInstances();
     this.pidSeq = 1000;
     this.startCount = 0;
+    this.restartCount = 0;
   }
 
   /** Test helper: names the runtime currently reports as running. */
@@ -105,6 +108,7 @@ export class FakeRuntime implements AppRuntime {
   }
 
   async restart(name: string): Promise<AppProcessInfo> {
+    this.restartCount += 1;
     const a = this.apps.get(this.live.resolve(name));
     if (!a) {
       throw new Error(`FakeRuntime: cannot restart unknown app '${name}'`);
