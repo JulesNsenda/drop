@@ -9,10 +9,14 @@
  * is added. (A helper that was correct in isolation while a caller bypassed it
  * is the recurring defect class here - see CLAUDE.md, "Security helpers have callers".)
  *
- * The scan is deliberately simple: for every non-test source file outside the
- * two adapter directories it looks for `.start(` / `.restart(` (also `?.start(`
- * and `.start?.(`) on a receiver that IS the runtime: `runtime`, `this.runtime`,
- * `getAppRuntime()`, or a local name assigned from one of those.
+ * The scan is deliberately simple: for every non-test source file except the
+ * adapters themselves it looks for `.start(` / `.restart(` (also `?.start(` and
+ * `.start?.(`) on a receiver that IS the runtime: `runtime`, `this.runtime`,
+ * `processManager`, a getter (`getAppRuntime(...)`, `getRuntime()`,
+ * `getProcessManager()`), or a local name assigned from one of those.
+ *
+ * The adapters are exempted BY FILE, not by directory, so a new file next to
+ * them is scanned like any other.
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -21,7 +25,11 @@ const SRC = path.resolve(__dirname, '..');
 const PLATFORM = path.join(SRC, 'core', 'platform.ts');
 
 /** The adapters implement start/restart; everything else must go through the platform. */
-const ADAPTER_DIRS = [path.join(SRC, 'managers', 'runtime'), path.join(SRC, 'managers', 'process')];
+const ADAPTER_FILES = [
+  path.join(SRC, 'managers', 'runtime', 'pm2-runtime.ts'),
+  path.join(SRC, 'managers', 'runtime', 'container-manager.ts'),
+];
+const ADAPTER_DIRS = [path.join(SRC, 'managers', 'process')];
 const SKIPPED_DIRS = new Set(['node_modules', 'dashboard', '__testutils__', '__mocks__']);
 
 function sourceFiles(dir: string): string[] {
@@ -31,7 +39,12 @@ function sourceFiles(dir: string): string[] {
     if (entry.isDirectory()) {
       if (SKIPPED_DIRS.has(entry.name) || ADAPTER_DIRS.includes(full)) continue;
       found.push(...sourceFiles(full));
-    } else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts') && !entry.name.endsWith('.d.ts')) {
+    } else if (
+      entry.name.endsWith('.ts') &&
+      !entry.name.endsWith('.test.ts') &&
+      !entry.name.endsWith('.d.ts') &&
+      !ADAPTER_FILES.includes(full)
+    ) {
       found.push(full);
     }
   }
@@ -51,19 +64,23 @@ function codeOf(text: string): string {
     .join('\n');
 }
 
-/** Names that hold the runtime: `runtime`, plus any local assigned from `this.runtime` or `getAppRuntime()`. */
+/** A call that returns the runtime or the process manager behind it, with any arguments. */
+const GETTER = '(?:getAppRuntime|getRuntime|getProcessManager)\\([^)]*\\)';
+
+/** Names that hold the runtime: `runtime`, `processManager`, plus any local assigned from `this.runtime` or a getter. */
 function receiversIn(code: string): string[] {
-  const aliases = [...code.matchAll(/\b(?:const|let|var)\s+(\w+)\s*(?::[^=\n]+)?=\s*(?:this\.runtime|getAppRuntime\(\))/g)].map(
-    (m) => m[1]
-  );
-  return ['runtime', ...aliases];
+  const alias = new RegExp(`\\b(?:const|let|var)\\s+(\\w+)\\s*(?::[^=\\n]+)?=\\s*(?:this\\.runtime|${GETTER})`, 'g');
+  return ['runtime', 'processManager', ...[...code.matchAll(alias)].map((m) => m[1])];
 }
 
 /** Every direct start/restart on the runtime in `text`, as 0-based line numbers. */
 function runtimeStartCalls(text: string): number[] {
   const code = codeOf(text);
   const receivers = receiversIn(code).join('|');
-  const call = new RegExp(`(?:\\b(?:${receivers})\\s*[!?]?|getAppRuntime\\(\\)\\s*)\\s*\\.\\s*(?:start|restart)\\s*(?:\\?\\.)?\\s*\\(`, 'g');
+  const call = new RegExp(
+    `(?:\\b(?:${receivers})\\s*[!?]?|${GETTER})\\s*\\.\\s*(?:start|restart)\\s*(?:\\?\\.)?\\s*\\(`,
+    'g'
+  );
   return [...code.matchAll(call)].map((m) => code.slice(0, m.index).split('\n').length - 1);
 }
 
@@ -91,6 +108,11 @@ describe('the suspension start choke point', () => {
     expect(hits('await this.runtime.start?.(spec);')).toBe(1);
     expect(hits('await this.runtime\n  .start(spec);')).toBe(1);
     expect(hits('await getAppRuntime().restart(name);')).toBe(1);
+    expect(hits("await getAppRuntime('pm2').start(spec);")).toBe(1);
+    expect(hits('await getRuntime().start(spec);')).toBe(1);
+    expect(hits('await getProcessManager().restart(name);')).toBe(1);
+    expect(hits('const pm = getProcessManager();\nawait pm.start(cfg);')).toBe(1);
+    expect(hits('await this.processManager.start(cfg);')).toBe(1);
     expect(hits('const pm = getAppRuntime();\nawait pm.start(spec);')).toBe(1);
     expect(hits('const rt = this.runtime;\nawait rt.restart(name);')).toBe(1);
     expect(hits('await this.startInstance(spec);')).toBe(0);

@@ -402,6 +402,9 @@ describe('zero-downtime cutover (#298 step 5)', () => {
       await original(app);
       // A real suspension: record written, both instances taken down.
       await platform!.suspendApp('site', 'admin-1');
+      // What the suspension itself deleted is not what is under test: from here
+      // on NOTHING may be started or deleted.
+      log.length = 0;
     });
     const episodesBefore = getDeployTracker().getEpisodes('site').length;
     log.length = 0;
@@ -411,7 +414,7 @@ describe('zero-downtime cutover (#298 step 5)', () => {
 
     // Refused at the start choke point: the new instance was never started, so
     // there is no new slot to leave behind, and traffic never moved.
-    expect(log.filter((entry) => entry.startsWith('start'))).toEqual([]);
+    expect(log).toEqual([]);
     expect(setUpstream).not.toHaveBeenCalled();
     expect(fakeRuntime.getLiveInstance('site')).toBe('a');
     expect(cfg('site')?.runtimeSlot).toBeUndefined();
