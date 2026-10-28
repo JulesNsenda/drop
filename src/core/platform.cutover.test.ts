@@ -394,7 +394,7 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     expect(routeUpstreams('site')).toEqual([`localhost:${oldPort}`]);
   }, 30000);
 
-  it('falls back to stop/start for an app that does not listen on its port (a worker)', async () => {
+  it('falls back to delete/start for an app that does not listen on its port (a worker)', async () => {
     nextBehaviour = 'silent';
     platform = makePlatform();
     await platform.start();

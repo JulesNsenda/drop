@@ -547,6 +547,7 @@ describe('ContainerManager', () => {
       await mgr.stop('my-app');
 
       expect(container.stop).toHaveBeenCalledTimes(1);
+      expect(container.stop).toHaveBeenCalledWith({ t: 10 });
     });
 
     it('does not throw when container is not found (404)', async () => {
@@ -588,6 +589,7 @@ describe('ContainerManager', () => {
       await mgr.delete('my-app');
 
       expect(container.stop).toHaveBeenCalledTimes(1);
+      expect(container.stop).toHaveBeenCalledWith({ t: 10 });
       expect(container.remove).toHaveBeenCalledTimes(1);
     });
 

@@ -26,6 +26,7 @@ import {
 const PM2_STATE_MAP: Record<ProcessStatusValue, AppRuntimeState> = {
   online: 'running',
   launching: 'starting',
+  'waiting restart': 'starting',
   stopping: 'stopping',
   stopped: 'stopped',
   errored: 'errored',

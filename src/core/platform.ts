@@ -8996,6 +8996,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // finish, then remove it.
     this.cutovers.delete(appName);
     await new Promise((resolve) => setTimeout(resolve, this.cutoverDrainMs()));
+    // Not replaceLiveProcess: that is app-addressed and fails on survival; this
+    // is slot-addressed and best-effort, traffic having already switched.
     this.stopHealthProber(appName);
     await runtime.delete(oldRef).catch((err) =>
       this.logger.warn(`Could not remove ${oldInstance} after cutover`, 'CUTOVER', err)
@@ -9494,6 +9496,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * start over a surviving process hits the online early-return - a silent
    * no-op that records success - so the removal is verified through the seam
    * rather than trusted. Deleting an absent process is a no-op.
+   * Best-effort under PM2: ProcessManager.getStatus swallows RPC errors, so a
+   * PM2 that cannot be reached reads as absent.
    */
   private async replaceLiveProcess(appName: string): Promise<void> {
     this.stopHealthProber(appName);
@@ -10338,7 +10342,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       let deprovisionStarted = false;
       try {
         const runtimeStatus = await this.runtime.getStatus(appName);
-        wasLive = runtimeStatus?.status === 'running' || runtimeStatus?.status === 'starting';
+        wasLive = !!runtimeStatus && runtimeStatus.status !== 'stopped' && runtimeStatus.status !== 'errored';
         if (wasLive) {
           this.stopHealthProber(appName);
           this.stopCrashLoopWatch(appName);
@@ -10531,8 +10535,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     let wasLive = false;
     let outcome: DetachServiceOutcome;
     try {
-      const liveStatus = (await this.runtime!.getStatus(appName))?.status;
-      wasLive = liveStatus === 'running' || liveStatus === 'starting';
+      const liveState = await this.runtime!.getStatus(appName);
+      wasLive = !!liveState && liveState.status !== 'stopped' && liveState.status !== 'errored';
       const revoked = await storage.revokeAppAccess(appName, this.incarnationOf(appName));
       outcome = revoked
         ? { detached: true, deprovisioned: true, drainPending: true }

@@ -62,6 +62,7 @@ describe('Pm2Runtime', () => {
     const cases: Array<[ProcessStatus['status'], string]> = [
       ['online', 'running'],
       ['launching', 'starting'],
+      ['waiting restart', 'starting'],
       ['stopping', 'stopping'],
       ['stopped', 'stopped'],
       ['errored', 'errored'],

@@ -161,6 +161,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     guard also covers `AWS_REGION`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`,
     `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3`.
 
+### Changed
+
+- **An in-place redeploy under PM2 no longer emits `app:stopping` / `app:stopped`.**
+  It now replaces the old process the way a restart and the Docker runtime
+  already do, so a tenant webhook subscribed to `app:stopped` no longer fires
+  on a redeploy. A restart or in-place redeploy now also fails visibly if the
+  old process is still present after it was removed, instead of recording a
+  success over the survivor. Detaching a service counts any runtime state
+  other than stopped or errored as live, so a crash-looping app is stopped
+  before its data is removed and restarted afterwards.
+
 ### Fixed
 
 - **Object storage now uses the platform's own root (#301).** Its credential

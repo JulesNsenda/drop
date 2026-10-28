@@ -199,7 +199,7 @@ describe('promoteApp', () => {
   });
 });
 
-describe('the redeploy path holds BEFORE the stop', () => {
+describe('the redeploy path holds BEFORE the old process is removed', () => {
   // The branch SEC-9 found broken. Withholding the Caddy route only ever gated
   // a FIRST deploy: on a redeploy the route already exists and the new process
   // takes the same port, so unapproved code was live the instant it started.

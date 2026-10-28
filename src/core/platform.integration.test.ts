@@ -413,7 +413,7 @@ describe('Platform integration (P2-1)', () => {
   // succeeded, e.g. a post-start failure) — a redeploy must still stop the old
   // process and swap in the new build, not silently no-op because
   // wasRunning was false.
-  it('stops and restarts an errored-but-alive app on update', async () => {
+  it('replaces and restarts an errored-but-alive app on update', async () => {
     platform = makePlatform();
     await platform.start();
     const appPath = await createStaticApp('site');
