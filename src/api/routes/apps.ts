@@ -646,7 +646,7 @@ apps.post('/:name/source', async c => {
     if (err instanceof UploadNotFoundError) {
       return c.json(error(ErrorCodes.NOT_FOUND, err.message), 404);
     }
-    if (err instanceof UploadConflictError) {
+    if (err instanceof UploadConflictError || err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof InsufficientDiskSpaceError) {

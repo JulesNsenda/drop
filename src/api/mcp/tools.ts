@@ -607,6 +607,7 @@ export async function handleDeployFiles(
       err instanceof UploadValidationError ||
       err instanceof UploadNotFoundError ||
       err instanceof UploadConflictError ||
+      err instanceof AppInProgressError ||
       err instanceof InsufficientDiskSpaceError
     ) {
       return toolError(err.message);

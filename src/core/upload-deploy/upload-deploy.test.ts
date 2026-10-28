@@ -40,6 +40,8 @@ import type { AppDetectedPayload } from '../event-bus';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in src/core/git-deploy/git-deploy.test.ts.
 import type { AppUpdatePayload } from '../event-bus/event-bus.types';
+import { setPlatformOps, resetPlatformOps, AppInProgressError } from '../../api/platform-ops';
+import { makePlatformOpsStub } from '../../api/__testutils__/platform-ops';
 
 describe('UploadDeployService', () => {
   let tempDir: string;
@@ -962,6 +964,104 @@ describe('UploadDeployService', () => {
       expect(config?.agentCreated).toBeUndefined();
       expect(config?.ephemeral).toBeUndefined();
       expect(config?.expiresAt).toBeUndefined();
+    });
+  });
+
+  describe('the app claim around the write (redeploys)', () => {
+    afterEach(() => resetPlatformOps());
+
+    async function deployed(name: string): Promise<void> {
+      const v1 = await buildArchive(`${name}-v1`, { 'index.js': 'v1' });
+      await service.deploy({ appName: name, archivePath: v1 });
+    }
+
+    it('holds the claim across the write, then gives it back before publishing', async () => {
+      await deployed('claimed');
+      const release = jest.fn();
+      // The platform refuses a claim while an upload is marked in flight, as its
+      // busy check does: the upload must not refuse itself.
+      const tryReserveApp = jest.fn((n: string) => (service.isUploading(n) ? null : release));
+      setPlatformOps(makePlatformOpsStub({ tryReserveApp }));
+      let releasedDuringLand = -1;
+      const land = jest.spyOn(service as never, 'landFiles' as never);
+      land.mockImplementationOnce((async () => {
+        releasedDuringLand = release.mock.calls.length;
+      }) as never);
+      let releasedAtPublish = -1;
+      const unsubscribe = eventBus.subscribe('app:update', (payload) => {
+        if (payload.name === 'claimed') releasedAtPublish = release.mock.calls.length;
+      });
+
+      try {
+        const v2 = await buildArchive('claimed-v2', { 'index.js': 'v2' });
+        await service.deploy({ appName: 'claimed', archivePath: v2 });
+      } finally {
+        unsubscribe();
+      }
+
+      expect(tryReserveApp).toHaveBeenCalledWith('claimed');
+      expect(releasedDuringLand).toBe(0);
+      expect(releasedAtPublish).toBe(1);
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(service.isUploading('claimed')).toBe(false);
+    });
+
+    it('refuses with AppInProgressError while the app is building or claimed, and writes nothing', async () => {
+      await deployed('building');
+      const tryReserveApp = jest.fn().mockReturnValue(null);
+      setPlatformOps(makePlatformOpsStub({ tryReserveApp }));
+
+      const v2 = await buildArchive('building-v2', { 'index.js': 'v2' });
+      await expect(service.deploy({ appName: 'building', archivePath: v2 })).rejects.toBeInstanceOf(
+        AppInProgressError
+      );
+
+      expect(fssync.readFileSync(path.join(appsDir, 'building', 'index.js'), 'utf8')).toBe('v1');
+      expect(service.isUploading('building')).toBe(false);
+      expect(isReserved('building')).toBe(false);
+    });
+
+    it('refuses when a build container is alive, releases the claim, and writes nothing', async () => {
+      await deployed('containered');
+      const release = jest.fn();
+      setPlatformOps(
+        makePlatformOpsStub({
+          tryReserveApp: jest.fn().mockReturnValue(release),
+          hasLiveBuildContainer: jest.fn().mockResolvedValue(true),
+        })
+      );
+
+      const v2 = await buildArchive('containered-v2', { 'index.js': 'v2' });
+      await expect(
+        service.deploy({ appName: 'containered', archivePath: v2 })
+      ).rejects.toBeInstanceOf(AppInProgressError);
+
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(fssync.readFileSync(path.join(appsDir, 'containered', 'index.js'), 'utf8')).toBe('v1');
+      expect(service.isUploading('containered')).toBe(false);
+    });
+
+    it('releases the claim when the write fails', async () => {
+      await deployed('failing');
+      const release = jest.fn();
+      setPlatformOps(makePlatformOpsStub({ tryReserveApp: jest.fn().mockReturnValue(release) }));
+      jest.spyOn(service as never, 'landFiles' as never).mockRejectedValueOnce(new Error('land failed') as never);
+
+      const v2 = await buildArchive('failing-v2', { 'index.js': 'v2' });
+      await expect(service.deploy({ appName: 'failing', archivePath: v2 })).rejects.toThrow('land failed');
+
+      expect(release).toHaveBeenCalledTimes(1);
+    });
+
+    it('takes no claim for the first upload of a new app', async () => {
+      const tryReserveApp = jest.fn().mockReturnValue(() => undefined);
+      setPlatformOps(makePlatformOpsStub({ tryReserveApp }));
+
+      const archivePath = await buildArchive('brand-new', { 'index.js': 'x' });
+      const result = await service.deploy({ appName: 'brand-new', archivePath });
+
+      expect(result.isNew).toBe(true);
+      expect(tryReserveApp).not.toHaveBeenCalled();
     });
   });
 });

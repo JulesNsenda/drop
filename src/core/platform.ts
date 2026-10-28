@@ -1771,7 +1771,11 @@ export class DropPlatform {
    * delete the holder's entry when it finished).
    */
   private isBusy(name: string): boolean {
-    return this.appsInProgress.has(name) || this.gitReserved.has(name);
+    return (
+      this.appsInProgress.has(name) ||
+      this.gitReserved.has(name) ||
+      this.uploadDeployService?.isUploading(name) === true
+    );
   }
 
   /**
@@ -5441,8 +5445,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // A git deploy is writing this folder. Building now would read a half-
     // written tree (and let a build container write beside the land), so the
-    // build is deferred and retried, never dropped.
-    if (this.gitReserved.has(appName) || this.gitDeployService?.isCloning(appName)) {
+    // build is deferred and retried, never dropped. An upload writing the folder
+    // is the same: it clears its mark before publishing, and the drain retries.
+    if (
+      this.gitReserved.has(appName) ||
+      this.gitDeployService?.isCloning(appName) ||
+      this.uploadDeployService?.isUploading(appName)
+    ) {
       this.logger.debug(`Deferring ${appName} - a git deploy is landing its files`, 'BUILD');
       this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
       this.scheduleBuildDrain();
@@ -5946,8 +5955,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.appsInProgress.size >= this.config.maxConcurrentBuilds) {
         break;
       }
-      // A git deploy is still landing its files: keep it queued.
-      if (this.gitReserved.has(appName) || this.gitDeployService?.isCloning(appName)) continue;
+      // A git deploy or an upload is still landing its files: keep it queued.
+      if (
+        this.gitReserved.has(appName) ||
+        this.gitDeployService?.isCloning(appName) ||
+        this.uploadDeployService?.isUploading(appName)
+      ) {
+        continue;
+      }
       // Started some other way (or already running) since it was queued — drop it.
       if (this.appsInProgress.has(appName) ||
           this.stateManager?.getApp(appName)?.status === 'running') {
