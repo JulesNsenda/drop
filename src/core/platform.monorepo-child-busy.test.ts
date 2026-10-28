@@ -16,6 +16,7 @@ import { DropPlatform, createPlatform } from './platform';
 import { getStateManager, resetStateManager, AppStateManager } from '../managers/app/state-manager';
 import { AppConfigService } from '../managers/app/app-config';
 import * as treeSync from '../utils/tree-sync';
+import { AppInProgressError } from '../api/platform-ops';
 
 jest.mock('../utils/tree-sync', () => {
   const actual = jest.requireActual('../utils/tree-sync');
@@ -159,5 +160,62 @@ describe('expandMonorepo: a child is busy while it is copied', () => {
     expect(handleAppUpdate).not.toHaveBeenCalled();
     expect(handleBuildApp).not.toHaveBeenCalled();
     expect(p().materializing.has(childName)).toBe(false);
+  });
+
+  it('defers a handleBuildApp for the child while it is copied', async () => {
+    await seedRunningChild();
+    let queued: boolean | undefined;
+    (treeSync.syncTree as jest.Mock).mockImplementation(async (...args: unknown[]) => {
+      await DropPlatform.prototype['handleBuildApp'].call(platform, childPath(), childName, 'static');
+      queued = p().pendingBuilds.has(childName);
+      return realSyncTree(...args);
+    });
+
+    await expand();
+
+    expect(queued).toBe(true);
+    expect(detect).not.toHaveBeenCalled();
+  });
+
+  it('keeps a pending child build queued during the copy, and starts it afterwards', async () => {
+    await seedRunningChild();
+    await stateManager.updateApp(childName, { status: 'pending' });
+    p().pendingBuilds.set(childName, { appPath: childPath(), appType: 'static' });
+    const startedDuringCopy: number[] = [];
+    (treeSync.syncTree as jest.Mock).mockImplementation(async (...args: unknown[]) => {
+      await p().drainPendingBuilds();
+      startedDuringCopy.push(handleBuildApp.mock.calls.length);
+      return realSyncTree(...args);
+    });
+
+    await expand();
+    expect(startedDuringCopy).toEqual([0]);
+    expect(p().pendingBuilds.has(childName)).toBe(true);
+
+    await p().drainPendingBuilds();
+    expect(handleBuildApp).toHaveBeenCalledWith(childPath(), childName, 'static', undefined);
+    expect(p().pendingBuilds.has(childName)).toBe(false);
+  });
+
+  it('skips a child already claimed (a rollback) and does not copy into it', async () => {
+    await seedRunningChild();
+    p().appsInProgress.add(childName);
+
+    await expand();
+
+    expect(treeSync.syncTree).not.toHaveBeenCalled();
+    expect(p().materializing.has(childName)).toBe(false);
+    expect(handleAppUpdate).not.toHaveBeenCalled();
+    expect(p().appsInProgress.has(childName)).toBe(true);
+  });
+
+  it('refuses a rollback of a child while its container is expanding', async () => {
+    await seedRunningChild();
+    await stateManager.registerApp(repoName, repoPath, 'static');
+    await stateManager.updateApp(repoName, { group: repoName, isGroupContainer: true });
+    p().appsInProgress.add(repoName);
+
+    await expect(platform.rollbackApp(childName)).rejects.toBeInstanceOf(AppInProgressError);
+    expect(p().appsInProgress.has(childName)).toBe(false);
   });
 });

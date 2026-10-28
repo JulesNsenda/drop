@@ -5097,6 +5097,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // container already running on the child (docker isolation) is writing it
         // too: skip the child rather than write beside it.
         if (!childCurrent) {
+          // Nothing awaited between this check and the add, so no claim can slip in
+          // between. Before the add: isBusy includes the marker itself.
+          if (this.isBusy(childName)) {
+            this.logger.warn(
+              `Skipping service '${svcName}': '${childName}' is busy (a deploy, rollback or upload holds it)`,
+              'MONOREPO'
+            );
+            continue;
+          }
           this.materializing.add(childName);
           try {
             if (await this.hasLiveBuildContainer(childName)) {
@@ -5111,6 +5120,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               preserve: DEFAULT_PRESERVE,
             });
           } finally {
+            // Released here, not at the end: isBusy refusals in handleBuildApp and the drain cover the rest.
             this.materializing.delete(childName);
           }
         }
@@ -5476,6 +5486,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // is the same: it clears its mark before publishing, and the drain retries.
     if (
       this.gitReserved.has(appName) ||
+      this.materializing.has(appName) ||
       this.gitDeployService?.isCloning(appName) ||
       this.uploadDeployService?.isUploading(appName)
     ) {
@@ -5985,6 +5996,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // A git deploy or an upload is still landing its files: keep it queued.
       if (
         this.gitReserved.has(appName) ||
+        this.materializing.has(appName) ||
         this.gitDeployService?.isCloning(appName) ||
         this.uploadDeployService?.isUploading(appName)
       ) {
@@ -9355,7 +9367,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * touched — see NOT_RESTORED.
    */
   async rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
-    if (this.isBusy(appName)) {
+    if (this.isBusy(appName) || this.isGroupBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
