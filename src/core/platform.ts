@@ -6892,7 +6892,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * `PlatformOps.reconfigureRoute` for why this exists.
    */
   private async reconfigureRoute(appName: string): Promise<void> {
-    if (this.isBusy(appName)) {
+    // Not isBusy: an upload writes the folder, never a route, and refusing here
+    // would leave a route that was meant to be withdrawn live.
+    if (this.appsInProgress.has(appName) || this.gitReserved.has(appName)) {
       // A deploy in flight will write the route itself when it starts the app;
       // racing it here could emit a block for a port that is about to change.
       throw new AppInProgressError(appName);

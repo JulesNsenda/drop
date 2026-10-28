@@ -1041,6 +1041,23 @@ describe('UploadDeployService', () => {
       expect(service.isUploading('containered')).toBe(false);
     });
 
+    it('refuses a monorepo child while its container is busy, claiming nothing', async () => {
+      await deployed('child');
+      const tryReserveApp = jest.fn().mockReturnValue(() => undefined);
+      setPlatformOps(
+        makePlatformOpsStub({ tryReserveApp, isGroupBusy: jest.fn().mockReturnValue(true) })
+      );
+
+      const v2 = await buildArchive('child-v2', { 'index.js': 'v2' });
+      await expect(service.deploy({ appName: 'child', archivePath: v2 })).rejects.toBeInstanceOf(
+        AppInProgressError
+      );
+
+      expect(tryReserveApp).not.toHaveBeenCalled();
+      expect(fssync.readFileSync(path.join(appsDir, 'child', 'index.js'), 'utf8')).toBe('v1');
+      expect(service.isUploading('child')).toBe(false);
+    });
+
     it('releases the claim when the write fails', async () => {
       await deployed('failing');
       const release = jest.fn();

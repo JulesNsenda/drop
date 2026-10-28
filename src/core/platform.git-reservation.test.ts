@@ -138,6 +138,28 @@ describe('git deploy folder reservation', () => {
       expect(busy('web')).toBe(false);
     });
 
+    it('does not stop a route being re-emitted (uploads write no routes)', async () => {
+      const internals = platform as unknown as {
+        reconfigureRoute(n: string): Promise<void>;
+        handleConfigureRoute: unknown;
+        appConfigService: unknown;
+      };
+      const configure = jest.fn().mockResolvedValue(undefined);
+      internals.handleConfigureRoute = configure;
+      internals.appConfigService = { getConfig: () => ({ port: 3001 }) };
+
+      await expect(internals.reconfigureRoute('web')).resolves.toBeUndefined();
+
+      expect(configure).toHaveBeenCalledWith('web', 3001, { routeOnly: true });
+      expect(p.appsInProgress.has('web')).toBe(false);
+    });
+
+    it('still refuses a route re-emit while a deploy holds the slot', async () => {
+      const internals = platform as unknown as { reconfigureRoute(n: string): Promise<void> };
+      p.appsInProgress.add('web');
+      await expect(internals.reconfigureRoute('web')).rejects.toThrow(/operation in progress/);
+    });
+
     it('defers a build that arrives meanwhile instead of starting or dropping it', async () => {
       jest.spyOn(p, 'scheduleBuildDrain').mockImplementation(() => undefined);
 

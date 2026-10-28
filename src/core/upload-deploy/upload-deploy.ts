@@ -407,6 +407,9 @@ export class UploadDeployService {
   private async claimFolder(appName: string): Promise<(() => void) | undefined> {
     const ops = getPlatformOps();
     if (!ops) return undefined;
+    // A monorepo child is not written while its container re-expands (and the
+    // reverse), the same rule git deploy applies.
+    if (ops.isGroupBusy(appName)) throw new AppInProgressError(appName);
     // The platform counts an upload in flight as busy, which would refuse this
     // call's own claim. Unmark for the one synchronous step that takes it.
     this.activeUploads.delete(appName);
