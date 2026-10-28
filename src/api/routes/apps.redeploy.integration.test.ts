@@ -129,6 +129,8 @@ describe('POST /apps/:name/redeploy, followed', () => {
     p().runtime = {
       type: 'pm2',
       stop: jest.fn().mockResolvedValue(undefined),
+      delete: jest.fn().mockResolvedValue(undefined),
+      getStatus: jest.fn().mockResolvedValue(null),
       start: jest.fn().mockResolvedValue({ pid: 4242 }),
     };
     p().detector = { detect: jest.fn().mockResolvedValue({ type: 'rust', framework: null, suggestedConfig: {} }) };

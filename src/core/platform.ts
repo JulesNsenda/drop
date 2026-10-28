@@ -8604,18 +8604,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // buildFreshStartSpec's allocatePort() call below re-claims the same
       // config-sourced port; releasing it in between would open a window for
       // a concurrent deploy to steal it.
-      // Unconditional, and a delete rather than a stop, as in doRestart: the
-      // STORED status says nothing reliable about the process. An 'errored'
-      // app can still have a live PM2 process, and a crash-looping one is
-      // mid-relaunch ('launching' maps to 'starting'); skipping the removal
-      // here would hit ProcessManager.start's online-early-return - a silent
-      // no-op that records success while the old (broken) code keeps running.
-      // Deleting an absent process is a no-op.
-      if (appState.status !== 'stopped') {
-        this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
-      }
-      this.stopHealthProber(appName);
-      await this.runtime!.delete(appName);
+      // Unconditional, as in doRestart: the STORED status says nothing
+      // reliable about the process. An 'errored' app can still have a live PM2
+      // process, and a crash-looping one is mid-relaunch ('launching' maps to
+      // 'starting'); skipping the removal here would hit
+      // ProcessManager.start's online-early-return - a silent no-op that
+      // records success while the old (broken) code keeps running.
+      this.logger.info(`Replacing ${appName}'s process (if any) with the new build...`, 'UPDATE');
+      await this.replaceLiveProcess(appName);
 
       this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
@@ -9493,6 +9489,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * Removes whatever process the runtime holds for `appName` so the start that
+   * follows registers fresh. ProcessManager.delete swallows its errors, and a
+   * start over a surviving process hits the online early-return - a silent
+   * no-op that records success - so the removal is verified through the seam
+   * rather than trusted. Deleting an absent process is a no-op.
+   */
+  private async replaceLiveProcess(appName: string): Promise<void> {
+    this.stopHealthProber(appName);
+    await this.runtime!.delete(appName);
+    if (await this.runtime!.getStatus(appName)) {
+      throw new Error(`The previous instance of ${appName} is still present after delete`);
+    }
+  }
+
+  /**
    * The body of restartApp, extracted so `attachService` (DROP-151 Phase 2)
    * can hold the `appsInProgress` guard across provisioning AND the restart
    * that follows it, instead of releasing and re-acquiring the guard between
@@ -9537,12 +9548,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     await this.assertDependenciesCurrent(appName, appPath);
 
     try {
-      this.stopHealthProber(appName);
       // Delete, not stop: PM2's env update on a bare restart/start is a
       // merge, so a removed secret would keep being injected; delete forces
       // a fresh registration (and, on docker, a fresh container) so the
       // spec built below is what actually ends up running.
-      await this.runtime.delete(appName);
+      await this.replaceLiveProcess(appName);
 
       const detection = await this.detector.detect(appPath, { silent: true });
       const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
@@ -10328,7 +10338,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       let deprovisionStarted = false;
       try {
         const runtimeStatus = await this.runtime.getStatus(appName);
-        wasLive = runtimeStatus?.status === 'running';
+        wasLive = runtimeStatus?.status === 'running' || runtimeStatus?.status === 'starting';
         if (wasLive) {
           this.stopHealthProber(appName);
           this.stopCrashLoopWatch(appName);
@@ -10521,7 +10531,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     let wasLive = false;
     let outcome: DetachServiceOutcome;
     try {
-      wasLive = (await this.runtime!.getStatus(appName))?.status === 'running';
+      const liveStatus = (await this.runtime!.getStatus(appName))?.status;
+      wasLive = liveStatus === 'running' || liveStatus === 'starting';
       const revoked = await storage.revokeAppAccess(appName, this.incarnationOf(appName));
       outcome = revoked
         ? { detached: true, deprovisioned: true, drainPending: true }

@@ -116,6 +116,7 @@ describe('handleAppUpdate exit trace', () => {
       type: 'pm2',
       stop: jest.fn(async () => log('runtime.stop')),
       delete: jest.fn(async () => log('runtime.delete')),
+      getStatus: jest.fn(async () => null),
       start: jest.fn(async () => {
         log('runtime.start');
         if (startThrows) throw startThrows;
@@ -506,7 +507,7 @@ describe('handleAppUpdate exit trace', () => {
       expect(r.result).toBe(false);
       expect(r.logs).toEqual([
         'info:UPDATE:Hot-reload triggered for <app>: file change',
-        'info:UPDATE:Stopping <app> to swap in new build...',
+        "info:UPDATE:Replacing <app>'s process (if any) with the new build...",
         'app:built:rebuilt in 12ms',
         'app:error:port in use',
       ]);
@@ -534,7 +535,7 @@ describe('handleAppUpdate exit trace', () => {
       expect(r.result).toBe(false);
       expect(r.logs).toEqual([
         'info:UPDATE:Hot-reload triggered for <app>: file change',
-        'info:UPDATE:Stopping <app> to swap in new build...',
+        "info:UPDATE:Replacing <app>'s process (if any) with the new build...",
         'app:built:rebuilt in 12ms',
         'warn:SECURITY:<app> parked in needs-config on hot-reload — set required secret(s): API_KEY, then restart',
       ]);
@@ -560,7 +561,7 @@ describe('handleAppUpdate exit trace', () => {
       expect(r.result).toBe(true);
       expect(r.logs).toEqual([
         'info:UPDATE:Hot-reload triggered for <app>: file change',
-        'info:UPDATE:Stopping <app> to swap in new build...',
+        "info:UPDATE:Replacing <app>'s process (if any) with the new build...",
         'app:built:rebuilt in 12ms',
         'app:started:PID 4242, port 3005 (hot-reloaded)',
       ]);
@@ -583,7 +584,7 @@ describe('handleAppUpdate exit trace', () => {
       expectReleased();
     });
 
-    it('success on an app stopped at entry that needs its tree rebuilt does not stop or re-stop it', async () => {
+    it('success on an app stopped at entry that needs its tree rebuilt still redeploys: the delete of its absent process is a safe no-op', async () => {
       appState = { ...appState, status: 'stopped' };
       jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
       const r = await update();
@@ -591,6 +592,7 @@ describe('handleAppUpdate exit trace', () => {
       expect(r.logs).toEqual([
         'info:UPDATE:Redeploying stopped <app> to rebuild dependencies for the current Node runtime',
         'info:UPDATE:Hot-reload triggered for <app>: file change',
+        "info:UPDATE:Replacing <app>'s process (if any) with the new build...",
         'app:built:rebuilt in 12ms',
         'app:started:PID 4242, port 3005 (hot-reloaded)',
       ]);
@@ -613,6 +615,18 @@ describe('handleAppUpdate exit trace', () => {
       expect(t).toContain('runtime.delete');
       expect(t.indexOf('runtime.delete')).toBeLessThan(t.indexOf('runtime.start'));
       expect(p().runtime.stop).not.toHaveBeenCalled();
+    });
+
+    it('an old process that survives delete fails the swap visibly and never starts the new one', async () => {
+      // ProcessManager.delete swallows its errors; start over a survivor would
+      // no-op and record success.
+      p().runtime.getStatus.mockResolvedValue({ status: 'running' });
+      const r = await update();
+      expect(r.result).toBe(false);
+      expect(r.trace).toContain('runtime.delete');
+      expect(r.trace).not.toContain('runtime.start');
+      expect(appState.status).toBe('errored');
+      expect(appState.error).toMatch(/still present after delete/);
     });
 
     it('a build held for promotion releases the keys without charging the window', async () => {
@@ -965,7 +979,7 @@ describe('handleAppUpdate exit trace', () => {
       expect(r.result).toBe(true);
       expect(r.logs).toEqual([
         'info:UPDATE:Hot-reload triggered for <app>: monorepo re-expansion',
-        'info:UPDATE:Stopping <app> to swap in new build...',
+        "info:UPDATE:Replacing <app>'s process (if any) with the new build...",
         'app:built:rebuilt in 12ms',
         'app:started:PID 4242, port 3005 (hot-reloaded)',
       ]);

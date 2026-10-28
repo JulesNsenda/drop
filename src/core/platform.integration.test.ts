@@ -425,7 +425,7 @@ describe('Platform integration (P2-1)', () => {
     await getStateManager().setAppStatus('site', 'errored', { error: 'simulated post-start failure' });
     (platform as unknown as { appDeployTimes: Map<string, number> }).appDeployTimes.clear();
 
-    const stopSpy = jest.spyOn(fakeRuntime, 'delete');
+    const deleteSpy = jest.spyOn(fakeRuntime, 'delete');
     const startsBefore = fakeRuntime.startCount;
     const pidBefore = fakeRuntime.pidOf('site');
 
@@ -440,11 +440,11 @@ describe('Platform integration (P2-1)', () => {
       await waitFor(
         () => fakeRuntime.runningNames().includes('site') && fakeRuntime.pidOf('site') !== pidBefore
       );
-      expect(stopSpy).toHaveBeenCalledWith('site');
+      expect(deleteSpy).toHaveBeenCalledWith('site');
       expect(fakeRuntime.startCount).toBe(startsBefore + 1);
       expect(getStateManager().getApp('site')?.status).toBe('running');
     } finally {
-      stopSpy.mockRestore();
+      deleteSpy.mockRestore();
     }
   }, 20000);
 

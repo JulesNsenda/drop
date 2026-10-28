@@ -230,7 +230,8 @@ describe('the redeploy path holds BEFORE the stop', () => {
       stop,
       delete: del,
       start: jest.fn().mockResolvedValue({ pid: 1 }),
-      getStatus: jest.fn().mockResolvedValue({ status: 'running', restarts: 0 }),
+      // Live until the swap deletes it, as a real runtime would report.
+      getStatus: jest.fn(async () => (del.mock.calls.length ? null : { status: 'running', restarts: 0 })),
       type: 'pm2',
     };
     (platform as any).detector = {

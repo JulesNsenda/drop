@@ -55,6 +55,9 @@ const NAME_PREFIX = 'drop-';
 /** Docker label applied to every DROP-managed container. */
 const MANAGED_LABEL = 'drop.managed';
 
+/** SIGTERM grace before Docker SIGKILLs. Shared by stop, restart and delete so a redeploy drains as long as a stop does. */
+const STOP_GRACE_SECONDS = 10;
+
 function containerName(appName: string): string {
   return `${NAME_PREFIX}${appName}`;
 }
@@ -429,7 +432,7 @@ export class ContainerManager implements AppRuntime {
     this.stopLogTailer(instance);
     const container = this.docker.getContainer(containerName(instance));
     try {
-      await container.stop({ t: 10 });
+      await container.stop({ t: STOP_GRACE_SECONDS });
     } catch (err: unknown) {
       if (!this.isNotFoundOrNotRunning(err)) throw err;
     }
@@ -439,7 +442,7 @@ export class ContainerManager implements AppRuntime {
     const instance = this.live.resolve(name);
     this.stopLogTailer(instance);
     const container = this.docker.getContainer(containerName(instance));
-    await container.restart({ t: 10 });
+    await container.restart({ t: STOP_GRACE_SECONDS });
     return {
       ...this.inspectToInfo(appNameOfInstance(instance), await container.inspect()),
       instance,
@@ -451,7 +454,7 @@ export class ContainerManager implements AppRuntime {
     this.stopLogTailer(instance);
     const container = this.docker.getContainer(containerName(instance));
     try {
-      await container.stop({ t: 5 });
+      await container.stop({ t: STOP_GRACE_SECONDS });
     } catch {
       // Already stopped — proceed to remove.
     }

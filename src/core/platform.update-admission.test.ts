@@ -108,6 +108,7 @@ describe('handleAppUpdate admission and failure bookkeeping', () => {
       type: 'pm2',
       stop: jest.fn().mockResolvedValue(undefined),
       delete: jest.fn().mockResolvedValue(undefined),
+      getStatus: jest.fn().mockResolvedValue(null),
       start: jest.fn().mockResolvedValue({ pid: 4242 }),
     };
     p().toolchainBackfilled = true;
