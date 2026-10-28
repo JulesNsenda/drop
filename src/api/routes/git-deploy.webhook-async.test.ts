@@ -15,6 +15,7 @@ import { ApiServer } from './../server';
 import * as activity from '../../managers/activity';
 import * as gitDeployModule from '../../core/git-deploy';
 import { getLogger } from '../../utils/logger';
+import { AppInProgressError } from '../platform-ops';
 
 describe('git webhook answers before the clone', () => {
   let tempDir: string;
@@ -46,6 +47,7 @@ describe('git webhook answers before the clone', () => {
   const flush = () => new Promise((resolve) => setImmediate(resolve));
 
   let redeploy: jest.Mock;
+  let queueRedeploy: jest.Mock;
   let logSpy: jest.SpyInstance;
   let errorSpy: jest.SpyInstance;
 
@@ -55,9 +57,11 @@ describe('git webhook answers before the clone', () => {
     jest.spyOn(console, 'warn').mockImplementation();
 
     redeploy = jest.fn().mockResolvedValue(undefined);
+    queueRedeploy = jest.fn();
     jest.spyOn(gitDeployModule, 'getGitDeployService').mockReturnValue({
       findAppsForWebhook: () => ['myapp'],
       redeploy,
+      queueRedeploy,
     } as unknown as ReturnType<typeof gitDeployModule.getGitDeployService>);
     logSpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
     errorSpy = jest.spyOn(getLogger(), 'error').mockImplementation();
@@ -90,7 +94,7 @@ describe('git webhook answers before the clone', () => {
     const body = (await res.json()) as { data: { message: string; results: unknown[] } };
     expect(body.data.message).toBe('Triggered redeploy for 1 app(s)');
     expect(body.data.results).toEqual([{ app: 'myapp', status: 'redeploying' }]);
-    expect(redeploy).toHaveBeenCalledWith('myapp', { automation: 'webhook' });
+    expect(redeploy).toHaveBeenCalledWith('myapp', { automation: 'webhook' }, null);
     // The clone has not finished, so nothing is recorded yet.
     expect(logSpy).not.toHaveBeenCalled();
 
@@ -102,15 +106,16 @@ describe('git webhook answers before the clone', () => {
     expect(errorSpy).not.toHaveBeenCalled();
   });
 
-  it('still hands a busy app to the redeploy, which queues it (no failure logged by the route)', async () => {
-    // The busy-app queue lives behind redeploy(): it publishes app:update and the
-    // platform's appsInProgress dedup parks it. The route's job is to still call
-    // redeploy for the app and report it as redeploying.
+  it('queues a busy app instead of failing it, and logs no error', async () => {
+    redeploy.mockRejectedValueOnce(new AppInProgressError('myapp'));
+
     const res = await postWebhook();
     await flush();
 
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledTimes(1);
+    expect(queueRedeploy).toHaveBeenCalledWith('myapp', { automation: 'webhook' });
+    expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'redeploy', appName: 'myapp' });
+    expect(logSpy.mock.calls[0][1].detail).toContain('queued, app busy');
     expect(errorSpy).not.toHaveBeenCalled();
   });
 

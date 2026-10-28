@@ -10,7 +10,7 @@ import { success, error, ErrorCodes } from '../types';
 import { ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
-import { AppInProgressError } from '../platform-ops';
+import { AppInProgressError, getPlatformOps } from '../platform-ops';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getUserById, isAuthEnabled } from '../middleware/auth';
@@ -384,6 +384,18 @@ gitDeploy.post('/webhook', async (c) => {
   // redeploy goes to the log and the activity trail instead of the response.
   const results: Array<{ app: string; status: string; error?: string }> = [];
   for (const appName of matchingApps) {
+    // Busy now: queue it and say so, as the awaited version did. A redeploy that
+    // becomes busy a moment later is still queued by runWebhookRedeploy.
+    if (getPlatformOps()?.isAppInProgress(appName)) {
+      service.queueRedeploy(appName, { automation: 'webhook' });
+      await logActivityFor(undefined, {
+        action: 'redeploy',
+        appName,
+        detail: `webhook (queued, app busy): ${branch}`,
+      });
+      results.push({ app: appName, status: 'queued' });
+      continue;
+    }
     void runWebhookRedeploy(service, appName, branch);
     results.push({ app: appName, status: 'redeploying' });
   }
