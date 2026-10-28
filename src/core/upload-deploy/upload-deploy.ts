@@ -29,7 +29,8 @@ import { isNewNameRefused } from '../app-names';
 import { resolveGitBackedName } from '../git-backed';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
-import { getPlatformOps, AppInProgressError } from '../../api/platform-ops';
+import { getPlatformOps, AppInProgressError, AppSuspendedError } from '../../api/platform-ops';
+import { getSuspensionStore } from '../../managers/suspension';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { syncTree, DEFAULT_PRESERVE } from '../../utils/tree-sync';
@@ -171,6 +172,12 @@ export class UploadDeployService {
           }; redeploy it from git instead of uploading`
         );
       }
+      // A suspended app is refused HERE: before admitDeploy (which charges the
+      // quota) and before anything is extracted or landed. After the ownership
+      // checks above, so a caller who may not know the app is answered as for
+      // an unknown one. A recreated name stays suspended (the store is name-keyed).
+      const suspension = getSuspensionStore().refusalFor(appName);
+      if (suspension) throw new AppSuspendedError(appName, suspension);
       await admitDeploy(appName, !existingApp, { principalId, actorUserId: userId });
 
       // Ephemeral quota, checked here for the same reason the guardrail is:

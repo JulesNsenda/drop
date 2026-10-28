@@ -16,6 +16,7 @@ import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { resetRateLimits } from '../middleware/rate-limit';
 import * as gitDeployModule from '../../core/git-deploy';
+import { AppSuspendedError } from '../platform-ops';
 
 describe('git redeploy route authorization', () => {
   let tempDir: string;
@@ -327,6 +328,30 @@ describe('git redeploy route authorization', () => {
           expect.anything()
         );
       });
+    });
+  });
+
+  describe('a suspended app', () => {
+    it('POST /git/redeploy answers 409 APP_SUSPENDED', async () => {
+      redeploy.mockRejectedValueOnce(new AppSuspendedError('alice-app'));
+
+      const res = await app.request('/api/v1/git/redeploy/alice-app', { method: 'POST', headers: bearer(aliceToken) });
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
+    });
+
+    it('POST /git/deploy answers 409 APP_SUSPENDED for a suspended name', async () => {
+      deploy.mockRejectedValueOnce(new AppSuspendedError('fresh-app'));
+
+      const res = await app.request('/api/v1/git/deploy', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoUrl: 'https://github.com/acme/app' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
     });
   });
 

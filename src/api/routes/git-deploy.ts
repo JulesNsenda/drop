@@ -10,7 +10,8 @@ import { success, error, ErrorCodes } from '../types';
 import { ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
-import { AppInProgressError, getPlatformOps } from '../platform-ops';
+import { AppInProgressError, AppSuspendedError, getPlatformOps } from '../platform-ops';
+import { appSuspendedResponse } from './apps';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getUserById, isAuthEnabled } from '../middleware/auth';
@@ -129,6 +130,9 @@ gitDeploy.post('/deploy', async (c) => {
       c.header('Retry-After', String(err.retryAfterSeconds));
       return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
     }
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -245,6 +249,9 @@ gitDeploy.post('/redeploy/:name', async (c) => {
       c.header('Retry-After', String(err.retryAfterSeconds));
       return c.json(error(ErrorCodes.RATE_LIMITED, err.message), 429);
     }
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError) {
       return c.json(
         error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying — retry once it settles`),
@@ -297,6 +304,11 @@ async function runWebhookRedeploy(
         appName,
         detail: `webhook (queued, app busy): ${branch}`,
       }).catch(() => undefined);
+      return;
+    }
+    // Suspended after the push was matched: nothing was pulled, and it is not queued.
+    if (err instanceof AppSuspendedError) {
+      logger.info(`Webhook redeploy of ${appName} refused: app is suspended`, 'GIT-DEPLOY');
       return;
     }
     logger.error(

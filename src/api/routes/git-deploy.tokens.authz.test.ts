@@ -30,6 +30,11 @@ import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 
 jest.setTimeout(30000);
 
+import { loadEmptySuspensionStore } from '../../core/__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('git token routes authorization', () => {
   let tempDir: string;
   let server: ApiServer;

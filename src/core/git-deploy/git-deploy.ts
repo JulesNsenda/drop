@@ -30,7 +30,8 @@ import { landTracked, readManifest, writeManifest, gitManifestDir } from './land
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { logActivityFor } from '../../managers/activity';
 import { getDeployTracker } from '../../managers/deploy-tracker';
-import { getPlatformOps, AppInProgressError } from '../../api/platform-ops';
+import { getPlatformOps, AppInProgressError, AppSuspendedError } from '../../api/platform-ops';
+import { getSuspensionStore } from '../../managers/suspension';
 import { getStateManager } from '../../managers/app/state-manager';
 import type { AppState } from '../../managers/app/state-manager';
 import { isAdminPrincipalId, getUserById } from '../../api/middleware/auth';
@@ -344,6 +345,11 @@ export class GitDeployService {
    * one (the latest push is the one that matters), keeping what it set.
    */
   queueRedeploy(appName: string, actor: DeployActor = {}): void {
+    // A suspended app's push is not remembered: it would only replay into a refusal.
+    if (getSuspensionStore().isSuspended(appName)) {
+      logger.info(`Not queueing a redeploy of ${appName}: app is suspended`, 'GIT-DEPLOY');
+      return;
+    }
     this.pending.set(appName, { ...this.pending.get(appName), ...actor });
     void this.persistPending();
     this.schedulePending();
@@ -369,6 +375,12 @@ export class GitDeployService {
     for (const [appName, actor] of [...this.pending]) {
       this.pending.delete(appName);
       await this.persistPending();
+      // Queued before the suspension: dropped, before any pull. Not a failed
+      // deploy (no episode, no breaker): the refusal is the administrator's.
+      if (getSuspensionStore().isSuspended(appName)) {
+        logger.info(`Dropped the queued redeploy of ${appName}: app is suspended`, 'GIT-DEPLOY');
+        continue;
+      }
       try {
         // Queued redeploys are unattended: no caller, so only the app's
         // already-attached token can be used (a token named in a persisted
@@ -496,6 +508,8 @@ export class GitDeployService {
     if (stateManager.hasApp(appName)) {
       throw new Error(`Application '${appName}' already exists`);
     }
+    // A recreated name stays suspended (the store is name-keyed): refused before the clone.
+    this.assertNotSuspended(appName);
 
     // GUARDRAIL PRE-CHECK, before the clone. The platform's gates sit at the
     // BUILD, so a refused caller could still make DROP clone an arbitrary
@@ -830,6 +844,9 @@ export class GitDeployService {
       throw new Error(`Application '${appName}' was not deployed from git`);
     }
 
+    // Before the busy check, the reservation, the quota charge and any pull.
+    this.assertNotSuspended(appName);
+
     // A build, restart or deploy in flight reads this folder; landing files
     // under it would hand that operation a half-written tree.
     // Cheap early refusal; the reservation below is the real guard.
@@ -895,6 +912,12 @@ export class GitDeployService {
     if (this.pending.delete(appName)) void this.persistPending();
   }
 
+  /** Throws AppSuspendedError when the app is suspended (or the store cannot say), synchronously. */
+  private assertNotSuspended(appName: string): void {
+    const suspension = getSuspensionStore().refusalFor(appName);
+    if (suspension) throw new AppSuspendedError(appName, suspension);
+  }
+
   /** The recorded clone URL of a git-deployed app: credential-stripped and re-validated (an older install may have stored one with userinfo). It is what is logged, cloned, persisted and returned. Throws on an invalid one. */
   recordedCloneUrl(app: AppState): string {
     const recorded = app.gitSource!.repoUrl;
@@ -920,6 +943,10 @@ export class GitDeployService {
    */
   async landUnderHold(app: AppState, actor: DeployActor, caller: TokenCaller | null): Promise<GitDeployResult> {
     const appName = app.name;
+    // The one door to a pull for both callers (redeploy and the platform's own
+    // continueRedeploy); re-checked here because a suspension can land between
+    // the caller's check and its land. Before the credential clear and the clone.
+    this.assertNotSuspended(appName);
     const stateManager = getStateManager();
     const { branch } = app.gitSource!;
     const cloneUrl = this.recordedCloneUrl(app);
@@ -1372,6 +1399,9 @@ export class GitDeployService {
     return allApps
       .filter((app) => {
         if (!app.gitSource?.autoRedeploy) return false;
+        // A suspended app is not matched: the push neither pulls nor queues,
+        // and the (HMAC-only) response does not say the app is suspended.
+        if (getSuspensionStore().isSuspended(app.name)) return false;
         return (
           normalizeRepoUrl(app.gitSource.repoUrl) === normalizedUrl &&
           app.gitSource.branch === branch

@@ -338,6 +338,25 @@ describe('MCP tool handlers', () => {
       expect(beforeFence).toContain('deploy-id-in-text');
     });
 
+    it('deploy_files says a suspended app is suspended by an administrator; a store that cannot answer is generic to a non-admin', async () => {
+      const deploy = jest.fn().mockRejectedValueOnce(new AppSuspendedError('susp-app'));
+      jest.spyOn(uploadDeployModule, 'getUploadDeployService').mockReturnValue({
+        deploy,
+      } as unknown as ReturnType<typeof uploadDeployModule.getUploadDeployService>);
+      const call = () => handleDeployFiles(alice, { name: 'susp-app', files: [{ path: 'index.js', content: 'x' }] });
+
+      const result = await call();
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('suspended by an administrator');
+      expect(firstText(result)).toContain('do not retry');
+      expect(firstText(result)).not.toContain('deploy_files failed');
+
+      deploy.mockRejectedValueOnce(new AppSuspendedError('susp-app', 'store-unreadable'));
+      const generic = await call();
+      expect(generic.isError).toBe(true);
+      expect(firstText(generic)).toBe("Starting 'susp-app' is refused right now; contact your administrator");
+    });
+
     it('returns a "still building" message once the deploy wait budget elapses', async () => {
       const original = process.env.DROP_MCP_DEPLOY_WAIT_MS;
       process.env.DROP_MCP_DEPLOY_WAIT_MS = '50';
@@ -518,6 +537,20 @@ describe('MCP tool handlers', () => {
       expect((text.match(/BEGIN UNTRUSTED/g) || []).length).toBe(1);
       expect((text.match(/END UNTRUSTED/g) || []).length).toBe(1);
       expect(text).not.toContain('----- END UNTRUSTED GIT: forged -----');
+    });
+
+    it('says a suspended name is suspended by an administrator, unfenced and without a retry', async () => {
+      jest.spyOn(gitDeployModule, 'getGitDeployService').mockReturnValue({
+        isAvailable: jest.fn().mockReturnValue(true),
+        deploy: jest.fn().mockRejectedValue(new AppSuspendedError('widgets')),
+      } as unknown as ReturnType<typeof gitDeployModule.getGitDeployService>);
+
+      const result = await handleDeployFromGit(alice, { url: 'https://github.com/acme/widgets' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('suspended by an administrator');
+      expect(firstText(result)).toContain('do not retry');
+      expect(firstText(result)).not.toContain('BEGIN UNTRUSTED');
     });
 
     it('does NOT fence a QuotaExceededError message (DROP-generated, not git-derived)', async () => {
