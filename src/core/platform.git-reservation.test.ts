@@ -121,6 +121,72 @@ describe('git deploy folder reservation', () => {
     p.handleBuildApp = original;
   });
 
+  describe('an upload writing the folder', () => {
+    let uploading: boolean;
+    beforeEach(() => {
+      uploading = true;
+      (platform as unknown as { uploadDeployService: unknown }).uploadDeployService = {
+        isUploading: (n: string) => n === 'web' && uploading,
+      };
+    });
+
+    it('counts as busy for the ops predicate', () => {
+      const busy = (p as unknown as { isBusy(n: string): boolean }).isBusy.bind(p);
+      expect(busy('web')).toBe(true);
+      expect(busy('other')).toBe(false);
+      uploading = false;
+      expect(busy('web')).toBe(false);
+    });
+
+    it('does not stop a route being re-emitted (uploads write no routes)', async () => {
+      const internals = platform as unknown as {
+        reconfigureRoute(n: string): Promise<void>;
+        handleConfigureRoute: unknown;
+        appConfigService: unknown;
+      };
+      const configure = jest.fn().mockResolvedValue(undefined);
+      internals.handleConfigureRoute = configure;
+      internals.appConfigService = { getConfig: () => ({ port: 3001 }) };
+
+      await expect(internals.reconfigureRoute('web')).resolves.toBeUndefined();
+
+      expect(configure).toHaveBeenCalledWith('web', 3001, { routeOnly: true });
+      expect(p.appsInProgress.has('web')).toBe(false);
+    });
+
+    it('still refuses a route re-emit while a deploy holds the slot', async () => {
+      const internals = platform as unknown as { reconfigureRoute(n: string): Promise<void> };
+      p.appsInProgress.add('web');
+      await expect(internals.reconfigureRoute('web')).rejects.toThrow(/operation in progress/);
+    });
+
+    it('defers a build that arrives meanwhile instead of starting or dropping it', async () => {
+      jest.spyOn(p, 'scheduleBuildDrain').mockImplementation(() => undefined);
+
+      await p.handleBuildApp('/apps/web', 'web', 'static');
+
+      expect(p.pendingBuilds.has('web')).toBe(true);
+      expect(p.appsInProgress.has('web')).toBe(false);
+    });
+
+    it('keeps a deferred build queued while the upload is in flight, and runs it after', async () => {
+      jest.spyOn(p, 'scheduleBuildDrain').mockImplementation(() => undefined);
+      const dispatched = jest.fn().mockResolvedValue(undefined);
+      const original = p.handleBuildApp.bind(p);
+      p.pendingBuilds.set('web', { appPath: '/apps/web', appType: 'static' });
+      p.handleBuildApp = dispatched;
+
+      await p.drainPendingBuilds();
+      expect(dispatched).not.toHaveBeenCalled();
+      expect(p.pendingBuilds.has('web')).toBe(true);
+
+      uploading = false;
+      await p.drainPendingBuilds();
+      expect(dispatched).toHaveBeenCalledWith('/apps/web', 'web', 'static', undefined);
+      p.handleBuildApp = original;
+    });
+  });
+
   describe('chained redeploys (A\'s update arrives after A released, B takes the slot)', () => {
     it('A\'s update never builds beside B\'s land and never releases B\'s reservation', async () => {
       const internals = platform as unknown as Internals & {

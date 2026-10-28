@@ -331,7 +331,9 @@ describe('handleAppUpdate exit trace', () => {
     });
 
     it('an upload began during the wait', async () => {
-      p().uploadDeployService = { isUploading: jest.fn().mockReturnValueOnce(false).mockReturnValue(true) };
+      let uploading = false;
+      p().uploadDeployService = { isUploading: jest.fn(() => uploading) };
+      reserveEffect = () => (uploading = true);
       const r = await update();
       expect(r.result).toBe(false);
       expect(r.logs).toEqual([
