@@ -1061,6 +1061,13 @@ export class DropPlatform {
   /** Apps whose folder a git deploy is writing (a subset of appsInProgress). */
   private gitReserved: Set<string> = new Set();
   /**
+   * Monorepo children whose files `expandMonorepo` is copying right now. Held for
+   * the copy only, never across the expansion's own build dispatch (that would make
+   * handleAppUpdate drop the child's own build). Not in `appsInProgress`: that set
+   * holds the CONTAINER for the whole expansion.
+   */
+  private materializing: Set<string> = new Set();
+  /**
    * Who holds each reserved app's slot (tryReserveApp, reserveForUpdate): one
    * owner token per live reservation. A reservation's release acts only while
    * the map still names it, so a stale release can never free a later owner's
@@ -1760,7 +1767,7 @@ export class DropPlatform {
    * rule can be tested without standing up `initializeServices()`.
    */
   private isDeployLocked(name: string): boolean {
-    return this.isQuiesced() || this.appsInProgress.has(name);
+    return this.isQuiesced() || this.appsInProgress.has(name) || this.materializing.has(name);
   }
 
   /**
@@ -1774,6 +1781,7 @@ export class DropPlatform {
     return (
       this.appsInProgress.has(name) ||
       this.gitReserved.has(name) ||
+      this.materializing.has(name) ||
       this.uploadDeployService?.isUploading(name) === true
     );
   }
@@ -5081,11 +5089,30 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // rebuild — `StaticBuildStrategy.preBuild` treats a surviving
         // `dist/index.html` as "already built" and skips the build entirely,
         // which is the trap that got v2 of this change rejected.
+        //
+        // The child is busy (`materializing`) while its files are written, so the
+        // watcher cannot start a build on a half-copied tree (a pause of more than
+        // the debounce, e.g. one large file, is enough). Released before this
+        // expansion's own dispatch below, which would otherwise be refused. A build
+        // container already running on the child (docker isolation) is writing it
+        // too: skip the child rather than write beside it.
         if (!childCurrent) {
-          await syncTree(srcDir, childPath, {
-            exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
-            preserve: DEFAULT_PRESERVE,
-          });
+          this.materializing.add(childName);
+          try {
+            if (await this.hasLiveBuildContainer(childName)) {
+              this.logger.warn(
+                `Skipping service '${svcName}': '${childName}' still has a build running`,
+                'MONOREPO'
+              );
+              continue;
+            }
+            await syncTree(srcDir, childPath, {
+              exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
+              preserve: DEFAULT_PRESERVE,
+            });
+          } finally {
+            this.materializing.delete(childName);
+          }
         }
 
         // Resolve type: honor an explicit override, else detect from the
