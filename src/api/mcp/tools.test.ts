@@ -34,6 +34,7 @@ import { setApiRuntimeConfig } from '../runtime-config';
 import { setPlatformOps, resetPlatformOps, PlatformOps, AppInProgressError, AppSuspendedError, StaleDependenciesError } from '../platform-ops';
 import * as activityModule from '../../managers/activity';
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
+import { getSuspensionStore } from '../../managers/suspension';
 import { resetUploadPreflightState } from '../upload-preflight';
 import * as diskUtils from '../../utils/disk';
 import * as runtimeConfigModule from '../runtime-config';
@@ -79,6 +80,11 @@ const alice: AuthContext = {
   authMethod: 'apikey',
 };
 const bob: AuthContext = { userId: 'bob-id', username: 'bob', role: 'user', authMethod: 'apikey' };
+
+import { loadEmptySuspensionStore } from '../../core/__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 
 describe('MCP tool handlers', () => {
   let tempDir: string;
@@ -130,6 +136,27 @@ describe('MCP tool handlers', () => {
 
       expect(result.isError).toBe(true);
       expect(firstText(result)).toBe("Application 'alice-app' not found");
+      expect(deployMock).not.toHaveBeenCalled();
+    });
+
+    it('deploy_files says a suspended app is suspended, not "start or remove it"', async () => {
+      await getStateManager().setAppStatus('alice-app', 'stopped');
+      await getSuspensionStore().suspend('alice-app', 'admin-1');
+      const deployMock = jest.fn();
+      jest
+        .spyOn(uploadDeployModule, 'getUploadDeployService')
+        .mockReturnValue({ deploy: deployMock } as unknown as ReturnType<
+          typeof uploadDeployModule.getUploadDeployService
+        >);
+
+      const result = await handleDeployFiles(alice, {
+        name: 'alice-app',
+        files: [{ path: 'index.js', content: 'x' }],
+      });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toContain('suspended by an administrator');
+      expect(firstText(result)).not.toContain('start or remove');
       expect(deployMock).not.toHaveBeenCalled();
     });
 
@@ -1363,7 +1390,11 @@ describe('MCP tool handlers', () => {
     it('a redeploy refused because the suspension store cannot answer stays generic and is not called final', async () => {
       const message = "Starting 'alice-app' is refused right now; contact your administrator";
       setPlatformOps(
-        makeOps({ redeployApp: jest.fn().mockResolvedValue({ refused: { code: 'APP_SUSPENDED', message } }) })
+        makeOps({
+          redeployApp: jest
+            .fn()
+            .mockResolvedValue({ refused: { code: 'APP_SUSPENDED', message, suspension: 'store-unreadable' } }),
+        })
       );
 
       const result = await handleRedeployApp(alice, { name: 'alice-app' });

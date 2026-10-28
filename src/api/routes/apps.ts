@@ -75,6 +75,7 @@ import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
 import type { RedeployRefusal, RedeployRefusalCode } from '../platform-ops';
+import { appSuspendedResponse } from './suspension-response';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 import {
   MAX_ACCESS_ALLOW_ENTRIES,
@@ -172,16 +173,6 @@ function sanitizeRepoUrl(repoUrl: string): string {
   } catch {
     return repoUrl;
   }
-}
-
-/**
- * 409 for a start the suspension refused. `APP_SUSPENDED` is its own code so a
- * client can tell it from a busy app: retrying will not help until an admin acts.
- * Only an admin is told the suspension store is the reason (as in `suspendedDto`).
- */
-export function appSuspendedResponse(c: Context, err: AppSuspendedError) {
-  const auth = (c.get as Function)('auth') as AuthContext | undefined;
-  return c.json(error(err.code, auth?.role === 'admin' ? err.message : err.tenantMessage), 409);
 }
 
 /**
@@ -613,6 +604,7 @@ apps.post('/:name/source', async c => {
   // (apps.source.test.ts is the regression gate).
   const preflight = await runUploadPreflight(auth, name);
   if (!preflight.ok) {
+    if (preflight.error instanceof AppSuspendedError) return appSuspendedResponse(c, preflight.error);
     throw preflight.error;
   }
 
@@ -1342,7 +1334,7 @@ const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 400 | 404 | 409 |
   APP_SOURCE_MISSING: { status: 409, code: 'APP_SOURCE_MISSING' },
   APP_BUSY: { status: 409, code: 'APP_BUSY' },
   APP_STOPPED: { status: 409, code: 'APP_STOPPED' },
-  // Same status and code as the 409 appSuspendedResponse gives a start.
+  // Rendered by appSuspendedResponse (see redeployRefusalResponse); the entry keeps the Record total.
   APP_SUSPENDED: { status: 409, code: 'APP_SUSPENDED' },
   INVALID_GIT_SOURCE: { status: 400, code: ErrorCodes.VALIDATION_ERROR },
   // Reached only by a caller that skipped the route's resolution to the container.
@@ -1352,7 +1344,10 @@ const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 400 | 404 | 409 |
   INSUFFICIENT_DISK: { status: 507, code: 'INSUFFICIENT_DISK' },
 };
 
-function redeployRefusalResponse(c: Context, refusal: RedeployRefusal) {
+function redeployRefusalResponse(c: Context, refusal: RedeployRefusal, appName: string) {
+  if (refusal.code === 'APP_SUSPENDED') {
+    return appSuspendedResponse(c, new AppSuspendedError(appName, refusal.suspension ?? 'record'));
+  }
   const { status, code } = REDEPLOY_REFUSALS[refusal.code];
   if (refusal.retryAfterSeconds !== undefined) c.header('Retry-After', String(refusal.retryAfterSeconds));
   return c.json(
@@ -1394,7 +1389,7 @@ apps.post('/:name/redeploy', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
   const { target, acceptedAt, result, detail } = outcome;
-  if ('refused' in result) return redeployRefusalResponse(c, result.refused);
+  if ('refused' in result) return redeployRefusalResponse(c, result.refused, target);
 
   await logActivityFor(auth, { action: 'redeploy', appName: target, detail });
   // A scope-only caller (role 'none') cannot read /deploys at all (its floor is

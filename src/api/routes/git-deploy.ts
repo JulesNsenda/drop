@@ -11,7 +11,7 @@ import { ValidationError } from '../middleware/error';
 import { AuthContext } from '../middleware/auth';
 import { getGitDeployService } from '../../core/git-deploy';
 import { AppInProgressError, AppSuspendedError, getPlatformOps } from '../platform-ops';
-import { appSuspendedResponse } from './apps';
+import { appSuspendedResponse } from './suspension-response';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getSettingsManager } from '../../managers/settings/settings-manager';
 import { getUserById, isAuthEnabled } from '../middleware/auth';

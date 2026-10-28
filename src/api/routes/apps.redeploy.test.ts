@@ -26,6 +26,7 @@ describe('POST /apps/:name/redeploy', () => {
   let t: TestApiServer;
   let ownerId: string;
   let ownerToken: string;
+  let adminToken: string;
   let strangerToken: string;
   let readonlyToken: string;
   let logSpy: jest.SpyInstance;
@@ -45,7 +46,9 @@ describe('POST /apps/:name/redeploy', () => {
     ownerId = owner.id;
     await createUser({ username: 'stranger', role: 'user', credential: { password: 'password123' } });
     await createUser({ username: 'viewer', role: 'readonly', credential: { password: 'password123' } });
+    await createUser({ username: 'sysadmin', role: 'admin', credential: { password: 'password123' } });
     ownerToken = await getTestToken('owner', 'password123');
+    adminToken = await getTestToken('sysadmin', 'password123');
     strangerToken = await getTestToken('stranger', 'password123');
     readonlyToken = await getTestToken('viewer', 'password123');
 
@@ -298,7 +301,6 @@ describe('POST /apps/:name/redeploy', () => {
       ['APP_SOURCE_MISSING', 409, 'APP_SOURCE_MISSING'],
       ['APP_BUSY', 409, 'APP_BUSY'],
       ['APP_STOPPED', 409, 'APP_STOPPED'],
-      ['APP_SUSPENDED', 409, 'APP_SUSPENDED'],
       ['SERVICE_UNAVAILABLE', 503, 'SERVICE_UNAVAILABLE'],
       ['RATE_LIMITED', 429, 'RATE_LIMITED'],
       ['INSUFFICIENT_DISK', 507, 'INSUFFICIENT_DISK'],
@@ -311,6 +313,24 @@ describe('POST /apps/:name/redeploy', () => {
       const json = await body(res);
       expect(json.error).toMatchObject({ code: apiCode, message: `refused: ${code}` });
       expect(logSpy).not.toHaveBeenCalled();
+    });
+
+    it('renders an APP_SUSPENDED refusal by reason and role: the specific text for an admin, the generic one for a tenant', async () => {
+      refuse({ code: 'APP_SUSPENDED', message: 'x', suspension: 'store-unreadable' });
+      const tenant = await redeploy('site', bearer(ownerToken));
+      expect(tenant.status).toBe(409);
+      expect((await body(tenant)).error).toMatchObject({
+        code: 'APP_SUSPENDED',
+        message: "Starting 'site' is refused right now; contact your administrator",
+      });
+
+      refuse({ code: 'APP_SUSPENDED', message: 'x', suspension: 'store-unreadable' });
+      const admin = await redeploy('site', bearer(adminToken));
+      expect((await body(admin)).error.message).toContain('suspension store is unreadable');
+
+      refuse({ code: 'APP_SUSPENDED', message: 'x' });
+      const record = await redeploy('site', bearer(ownerToken));
+      expect((await body(record)).error.message).toBe("Application 'site' is suspended by an administrator");
     });
 
     it('carries the retry hint as Retry-After and in the body', async () => {

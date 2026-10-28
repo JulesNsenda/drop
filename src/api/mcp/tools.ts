@@ -573,6 +573,9 @@ export async function handleDeployFiles(
     // Shared preflight — same policy as POST /apps/:name/source (PRD-040 §5).
     const preflight = await runUploadPreflight(auth, name);
     if (!preflight.ok) {
+      if (preflight.error instanceof AppSuspendedError) {
+        return toolError(suspendedFor(preflight.error, auth?.role === 'admin'));
+      }
       return toolError(preflight.error.message);
     }
     release = preflight.release;
@@ -1207,15 +1210,13 @@ export async function handleRedeployApp(
 
     const { target, acceptedAt, result } = outcome;
     if ('refused' in result) {
-      const { code, message, retryAfterSeconds } = result.refused;
+      const { code, message, retryAfterSeconds, suspension } = result.refused;
       // The recorded git URL is tenant-controlled and rides in this one message.
       let text = code === 'INVALID_GIT_SOURCE' ? wrapUntrusted(`GIT SOURCE: ${target}`, message) : message;
       if (code === 'APP_SUSPENDED') {
         // Not the APP_STOPPED hint below: restart_app is refused too, and only an administrator lifts it.
-        // The refusal's message is the tenant-safe one; only a real suspension is final.
-        text = message.endsWith('suspended by an administrator')
-          ? `${message}. No agent action lifts it; do not retry.`
-          : message;
+        // Rendered as every other suspended refusal is, by reason and by role.
+        text = suspendedFor(new AppSuspendedError(target, suspension ?? 'record'), auth?.role === 'admin');
       }
       if (code === 'APP_STOPPED') {
         // An agent never rebuilds a stopped app, so do not send it round restart_app and back:
