@@ -181,7 +181,7 @@ import {
   validateDomainFormat,
   isLocalhostDomain,
 } from '../utils/domain-validator';
-import { createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
+import { appProvisionKeyName, createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
 import { isNameTaken } from './app-names';
 import { resetDeployReservations } from './deploy-reservations';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
@@ -881,11 +881,6 @@ type ClaimedUpdate = UpdateRefused | { started: string; done: Promise<boolean> }
 /** Whether a runtime reading shows a process that is up or coming up (anything but absent, stopped or errored). */
 function isLiveRuntimeState(info: AppProcessInfo | null): boolean {
   return !!info && info.status !== 'stopped' && info.status !== 'errored';
-}
-
-/** The name of an app's minted provisioning key (its DROP_API_KEY): minted, and revoked, under this name. */
-function appProvisionKeyName(appName: string): string {
-  return `app:${appName}:provision`;
 }
 
 /** How long a redeploy waits for a builder slot before answering `accepted` (DROP_REDEPLOY_START_WAIT_MS). */

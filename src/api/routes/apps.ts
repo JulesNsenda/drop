@@ -12,7 +12,7 @@ import { Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, listUsers, getUserById } from '../middleware/auth';
+import { AuthContext, listUsers, getUserById, deleteApiKeysByName, appProvisionKeyName } from '../middleware/auth';
 import { canAccess, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
@@ -2053,7 +2053,11 @@ apps.put('/:name/capabilities', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
-  if (!suspended) {
+  if (suspended) {
+    // The key the app was last started with still carries the old, wider scopes:
+    // narrowing is the only way to take it back, and nothing restarts to re-mint.
+    await deleteApiKeysByName(appProvisionKeyName(name));
+  } else {
     try {
       await ops.restartApp(name);
     } catch (err) {

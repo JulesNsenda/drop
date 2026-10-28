@@ -10,7 +10,7 @@
  */
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { createUser, createApiKey } from '../middleware/auth';
+import { createUser, createApiKey, listApiKeys, appProvisionKeyName } from '../middleware/auth';
 import * as appConfigModule from '../../managers/app/app-config';
 import { getTestToken } from '../__testutils__/auth';
 import { createTestApiServer, teardownTestApiServer, type TestApiServer } from '../__testutils__/api-server';
@@ -266,6 +266,19 @@ describe('app suspension routes', () => {
       expect(res.status).toBe(200);
       expect(updateSystemConfig).toHaveBeenCalledWith('shop', { grantedApiScopes: [] });
       expect(ops_.restartApp).not.toHaveBeenCalled();
+    });
+
+    it('revokes the app\'s minted DROP_API_KEY when it narrows the grant, since no restart will re-mint it', async () => {
+      ops();
+      await getSuspensionStore().suspend('shop', adminId);
+      storedGrant(['users:create']);
+      await createApiKey(appProvisionKeyName('shop'), 'none', undefined, ['users:create']);
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(true);
+
+      const res = await putScopes([]);
+
+      expect(res.status).toBe(200);
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(false);
     });
 
     it('lets an unchanged grant through too (nothing widens), still without a restart', async () => {
