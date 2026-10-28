@@ -199,7 +199,7 @@ describe('promoteApp', () => {
   });
 });
 
-describe('the redeploy path holds BEFORE the stop', () => {
+describe('the redeploy path holds BEFORE the old process is removed', () => {
   // The branch SEC-9 found broken. Withholding the Caddy route only ever gated
   // a FIRST deploy: on a redeploy the route already exists and the new process
   // takes the same port, so unapproved code was live the instant it started.
@@ -211,6 +211,7 @@ describe('the redeploy path holds BEFORE the stop', () => {
   let tempDir: string;
   let appPath: string;
   let stop: jest.Mock;
+  let del: jest.Mock;
 
   beforeEach(async () => {
     tempDir = path.join(os.tmpdir(), `drop-promote3-${Date.now()}-${Math.random()}`);
@@ -224,10 +225,13 @@ describe('the redeploy path holds BEFORE the stop', () => {
     });
 
     stop = jest.fn().mockResolvedValue(undefined);
+    del = jest.fn().mockResolvedValue(undefined);
     (platform as any).runtime = {
       stop,
+      delete: del,
       start: jest.fn().mockResolvedValue({ pid: 1 }),
-      getStatus: jest.fn().mockResolvedValue({ status: 'running', restarts: 0 }),
+      // Live until the swap deletes it, as a real runtime would report.
+      getStatus: jest.fn(async () => (del.mock.calls.length ? null : { status: 'running', restarts: 0 })),
       type: 'pm2',
     };
     (platform as any).detector = {
@@ -270,6 +274,7 @@ describe('the redeploy path holds BEFORE the stop', () => {
     await (platform as any).handleAppUpdate('live', appPath, 'upload deploy', true, {});
 
     expect(stop).not.toHaveBeenCalled();
+    expect(del).not.toHaveBeenCalled();
   });
 
   it('DOES swap when the build is not held', async () => {
@@ -279,6 +284,6 @@ describe('the redeploy path holds BEFORE the stop', () => {
 
     await (platform as any).handleAppUpdate('live', appPath, 'upload deploy', true, {});
 
-    expect(stop).toHaveBeenCalledWith('live');
+    expect(del).toHaveBeenCalledWith('live');
   });
 });

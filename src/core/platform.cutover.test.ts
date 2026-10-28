@@ -394,7 +394,7 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     expect(routeUpstreams('site')).toEqual([`localhost:${oldPort}`]);
   }, 30000);
 
-  it('falls back to stop/start for an app that does not listen on its port (a worker)', async () => {
+  it('falls back to delete/start for an app that does not listen on its port (a worker)', async () => {
     nextBehaviour = 'silent';
     platform = makePlatform();
     await platform.start();
@@ -403,7 +403,7 @@ describe('zero-downtime cutover (#298 step 5)', () => {
 
     await redeploy('worker', appPath, 'v2');
 
-    expect(log).toEqual(['stop worker', expect.stringMatching(/^start worker:/)]);
+    expect(log).toEqual(['delete worker', expect.stringMatching(/^start worker:/)]);
     expect(fakeRuntime.getLiveInstance('worker')).toBe('a');
   }, 30000);
 
@@ -429,7 +429,7 @@ describe('zero-downtime cutover (#298 step 5)', () => {
 
     await redeploy('plain', appPath, 'v2');
 
-    expect(log).toEqual(['stop plain', expect.stringMatching(/^start plain:/)]);
+    expect(log).toEqual(['delete plain', expect.stringMatching(/^start plain:/)]);
   }, 30000);
 
   it('restarts the LIVE slot after a cutover', async () => {

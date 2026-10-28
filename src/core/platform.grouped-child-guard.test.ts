@@ -209,7 +209,11 @@ describe('grouped monorepo children are the container’s to build', () => {
     let inProgressAdd: jest.SpyInstance;
 
     beforeEach(() => {
-      (platform as any).runtime = { getStatus: jest.fn().mockResolvedValue(undefined) };
+      (platform as any).runtime = {
+        getStatus: jest.fn().mockResolvedValue(null),
+        delete: jest.fn(),
+        start: jest.fn().mockResolvedValue({ pid: 1 }),
+      };
       (platform as any).detector = { detect: jest.fn().mockResolvedValue({ type: 'static' }) };
       (platform as any).builder = { build: jest.fn().mockResolvedValue({ success: true }) };
       const inProgress = new Set<string>();

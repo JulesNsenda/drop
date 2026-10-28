@@ -18,6 +18,7 @@ export type ProcessStatusValue =
   | 'stopped'
   | 'errored'
   | 'launching'
+  | 'waiting restart'
   | 'one-launch-status';
 
 /**

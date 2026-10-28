@@ -223,6 +223,23 @@ describe('DropPlatform.restartApp', () => {
     expect(result.status).toBe('running');
   }, 20000);
 
+  it('fails visibly, without starting, when the old process survives delete', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+
+    // A delete that leaves the process in place (ProcessManager.delete swallows errors).
+    jest.spyOn(fakeRuntime, 'delete').mockResolvedValueOnce(undefined);
+    const startSpy = jest.spyOn(fakeRuntime, 'start');
+    startSpy.mockClear();
+
+    await expect(platform!.restartApp('site')).rejects.toThrow(/still present after delete/);
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(getStateManager().getApp('site')?.status).toBe('errored');
+  }, 20000);
+
   // ── Secret preflight (PRD-051) ──────────────────────────────────────────────
 
   it('parks an app in needs-config when a declared required secret is unset', async () => {

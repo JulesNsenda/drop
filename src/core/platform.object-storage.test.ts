@@ -393,6 +393,23 @@ describe('DropPlatform object storage (#301)', () => {
       expect(storage.deprovisionAppStorage).not.toHaveBeenCalled();
     });
 
+    it('restarts an app whose runtime reports a crash-looping "starting" process, though state says stopped', async () => {
+      stubAppConfigService(baseConfig({ services: { 'object-storage': 'attached' } }));
+      stubStateManager(baseState({ status: 'stopped' }));
+      const runtime = stubRuntime(true);
+      ((platform as any).runtime.getStatus as jest.Mock).mockResolvedValue({ status: 'starting' });
+      stubStorage({ allocated: [appName] });
+      const doRestart = jest.spyOn(platform as any, 'doRestart').mockResolvedValue(undefined);
+      jest.spyOn(platform as any, 'sweepRetiredObjectStorage').mockResolvedValue(undefined);
+
+      const result = await platform.detachService(appName, 'object-storage');
+      await flushImmediates();
+
+      expect(doRestart).toHaveBeenCalledWith(appName);
+      expect(result).toMatchObject({ restart: 'restarted' });
+      expect(runtime.stop).not.toHaveBeenCalled();
+    });
+
     it('acts on the bucket only as THIS app: the detach passes its incarnation to the provisioner', async () => {
       stubAppConfigService(baseConfig({ services: { 'object-storage': 'attached' } }));
       const state = baseState({ status: 'stopped' });
