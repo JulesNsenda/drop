@@ -68,6 +68,16 @@ describe('isNameTaken', () => {
     expect(caseVariantsOf('fresh', deps)).toEqual([]);
   });
 
+  it('is true for EVERY name while the suspension store is unreadable (fail closed)', async () => {
+    resetSuspensionStore();
+    const file = path.join(tempDir, 'suspensions.json');
+    await fs.writeFile(file, '{ broken');
+    jest.spyOn(console, 'error').mockImplementation();
+    await getSuspensionStore(file).load();
+
+    expect(check('fresh-app')).toBe(true);
+  });
+
   it('is false for a fresh name', () => {
     expect(check('fresh-app')).toBe(false);
   });

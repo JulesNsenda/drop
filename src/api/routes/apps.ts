@@ -2034,6 +2034,12 @@ apps.put('/:name/capabilities', async c => {
   if (suspended) {
     const stored = getAppConfigService().getConfig(name)?.grantedApiScopes ?? [];
     if (scopes.some(s => !stored.includes(s))) return appSuspendedResponse(c, suspended);
+    // The key the app was last started with carries the old, wider scopes, and nothing
+    // restarts to re-mint it: a real suspension and a narrowing revoke it, before anything
+    // else can fail. A store-refusing app is not suspended, so an unchanged PUT keeps its key.
+    if (suspended.reason === 'record' && stored.some(s => !scopes.includes(s))) {
+      await deleteApiKeysByName(appProvisionKeyName(name));
+    }
   }
 
   // grantedApiScopes is a SYSTEM_CONFIG_FIELD — updateConfig strips it, so
@@ -2055,11 +2061,7 @@ apps.put('/:name/capabilities', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
-  if (suspended) {
-    // The key the app was last started with still carries the old, wider scopes:
-    // narrowing is the only way to take it back, and nothing restarts to re-mint.
-    await deleteApiKeysByName(appProvisionKeyName(name));
-  } else {
+  if (!suspended) {
     try {
       await ops.restartApp(name);
     } catch (err) {

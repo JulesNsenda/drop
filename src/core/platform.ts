@@ -6306,16 +6306,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // the build:completed listener, which did not ask, swallows it.
       if (error instanceof AppSuspendedError) {
         callerOwnsTarget = intent.callerOwnsTarget;
-        // The refusal is what the caller must hear, even if closing it failed.
-        try {
-          await this.settleRefusedStart(
-            appName,
-            { kind: 'suspended', reason: error.reason },
-            { closeEpisode: intent.closeEpisode }
-          );
-        } catch (settleError) {
-          this.logger.error(`Could not settle the refused start of ${appName}`, 'SUSPENSION', settleError);
-        }
+        await this.settleRefusedStart(
+          appName,
+          { kind: 'suspended', reason: error.reason },
+          { closeEpisode: intent.closeEpisode }
+        );
         throw error;
       }
       // Secret preflight park (PRD-051): not a failure — the app declared
@@ -9575,11 +9570,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // cutoverTo re-threw a suspension: revoke the key the start re-minted and
         // leave the status true. The release is the previous one, not a deploy target.
         if (error instanceof AppSuspendedError) {
-          try {
-            await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason }, { closeEpisode: false });
-          } catch (settleError) {
-            this.logger.error(`Could not settle the refused rollback of ${appName}`, 'SUSPENSION', settleError);
-          }
+          await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason }, { closeEpisode: false });
         }
         throw error;
       }
@@ -9710,17 +9701,24 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const unreadable = cause.kind === 'suspended' && cause.reason !== 'record';
     const { shown, logged } = startRefusalText(appName, cause);
     this.logger.warn(`Deploy of ${appName} stopped: ${logged}`, 'SUSPENSION');
-    this.releaseGuardrailKeys(appName);
+    // Never throws: every step is attempted and logged, so a caller that must re-throw
+    // the refusal (a restart, a promotion) always gets to.
+    const attempt = async (what: string, step: () => unknown): Promise<void> => {
+      try {
+        await step();
+      } catch (err) {
+        this.logger.error(`Could not ${what} for ${appName} after a refused start`, 'SUSPENSION', err);
+      }
+    };
+    await attempt('release the guardrail keys', () => this.releaseGuardrailKeys(appName));
     if (opts.closeEpisode && !opts.progress?.episodeClosed && this.deployEpisodeOpen(appName)) {
       if (opts.progress) opts.progress.episodeClosed = true;
-      this.failDeployEpisode(appName, new Error(shown), undefined, 'DEPLOY_STOPPED');
+      await attempt('close the deploy episode', () =>
+        this.failDeployEpisode(appName, new Error(shown), undefined, 'DEPLOY_STOPPED')
+      );
     }
-    await this.noteRuntimeLogEnd(appName);
-    try {
-      await deleteApiKeysByName(appProvisionKeyName(appName));
-    } catch (err) {
-      this.logger.warn(`Could not revoke the provisioning key of ${appName}`, 'SECURITY', err);
-    }
+    await attempt('close the runtime-log window', () => this.noteRuntimeLogEnd(appName));
+    await attempt('revoke the provisioning key', () => deleteApiKeysByName(appProvisionKeyName(appName)));
     // A platform that is stopping owns its own shutdown of the state: no write.
     if (this.stopping) return;
     let live: boolean | null = null;
@@ -9736,20 +9734,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Not writing '${status}' for ${appName} after a refused start: it would close the open deploy episode`,
         'SUSPENSION'
       );
+    const write = (status: AppStatus, error: string): Promise<void> =>
+      attempt(`write '${status}'`, () => this.stateManager?.setAppStatus(appName, status, { error }));
     if (live === null) {
-      if (foreignEpisodeOpen) withheld('errored');
-      else {
-        await this.stateManager?.setAppStatus(appName, 'errored', {
-          error: 'runtime unreadable after a refused start',
-        });
-      }
+      // Liveness unknown: only the store refusing is an error; an administrator's
+      // suspension or a stop was taken on purpose, and nothing can be told to be up.
+      if (!unreadable) await write('stopped', shown);
+      else if (foreignEpisodeOpen) withheld('errored');
+      else await write('errored', 'runtime unreadable after a refused start');
     } else if (!live) {
-      await this.stateManager?.setAppStatus(appName, unreadable && !foreignEpisodeOpen ? 'errored' : 'stopped', {
-        error: shown,
-      });
+      await write(unreadable && !foreignEpisodeOpen ? 'errored' : 'stopped', shown);
     } else if (unreadable) {
       if (foreignEpisodeOpen) withheld('running');
-      else await this.stateManager?.setAppStatus(appName, 'running', { error: shown });
+      else await write('running', shown);
     } else {
       this.logger.warn(
         `${appName} is still live after a refused start; its status is left for the caller to write`,
@@ -9882,10 +9879,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /** Other existing apps whose name equals `appName` ignoring case (never `appName` itself). */
   private caseCollisionsOf(appName: string): string[] {
     if (!this.stateManager) return [];
-    return caseVariantsOf(appName, {
-      stateManager: this.stateManager,
-      appConfigService: this.appConfigService ?? undefined,
-    });
+    // App names only: a group or container name is tenant-authored and must not block a suspension.
+    return caseVariantsOf(
+      appName,
+      { stateManager: this.stateManager, appConfigService: this.appConfigService ?? undefined },
+      'apps'
+    );
   }
 
   /**
@@ -11857,6 +11856,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.appsInProgress.add(appName);
     // Set once a suspension refused the swap: the held build is then given back.
     let refused = false;
+    // What the app was before this attempt wrote its transient 'starting'.
+    const entry = this.stateManager?.getApp(appName);
+    const entryStatus = entry?.status;
+    const entryError = entry?.error;
     try {
       await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
       await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
@@ -11898,15 +11901,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             // leave the status true, but keep the held release (see the finally below).
             if (error instanceof AppSuspendedError) {
               refused = true;
-              try {
-                await this.settleRefusedStart(
-                  appName,
-                  { kind: 'suspended', reason: error.reason },
-                  { closeEpisode: false }
-                );
-              } catch (settleError) {
-                this.logger.error(`Could not settle the refused promotion of ${appName}`, 'SUSPENSION', settleError);
-              }
+              await this.settleRefusedStart(
+                appName,
+                { kind: 'suspended', reason: error.reason },
+                { closeEpisode: false }
+              );
             }
             throw error;
           }
@@ -11929,8 +11928,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // open. Keyed on the refusal, not on how the closer fared.
         if (refused) {
           this.deployTargets.delete(appName);
-          await this.appConfigService?.updateConfig(appName, { pendingPromotion: pending });
-          await this.stateManager?.updateApp(appName, { awaitingPromotion: true });
+          // Each write is log-and-continue: none may replace the AppSuspendedError.
+          const restore = async (what: string, step: () => unknown): Promise<void> => {
+            try {
+              await step();
+            } catch (restoreError) {
+              this.logger.error(`Could not restore ${what} of ${appName} after a refused promotion`, 'PROMOTE', restoreError);
+            }
+          };
+          await restore('the held build', () => this.appConfigService?.updateConfig(appName, { pendingPromotion: pending }));
+          await restore('the held flag', () => this.stateManager?.updateApp(appName, { awaitingPromotion: true }));
+          // Only the transient 'starting' is undone: anything else was written by what refused
+          // the start (a suspension that stopped the app), and is the truth. Quietly, since
+          // announcing 'running' would close the held build's episode.
+          if (entryStatus && this.stateManager?.getApp(appName)?.status === 'starting') {
+            await restore('the status', () => this.stateManager?.restoreStatus(appName, entryStatus, entryError));
+          }
         }
       } finally {
         this.appsInProgress.delete(appName);

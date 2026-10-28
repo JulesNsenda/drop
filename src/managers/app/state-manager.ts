@@ -410,6 +410,21 @@ export class AppStateManager {
     await this.updateApp(name, { lastOpenedAt: minute, recentOpeners });
   }
 
+  /**
+   * Put a status and error back WITHOUT announcing them: for a caller undoing its
+   * own transient write (a refused promotion's 'starting'). Announced, 'running' or
+   * 'errored' would close the deploy episode the caller deliberately left open.
+   */
+  async restoreStatus(name: string, status: AppStatus, error?: string): Promise<void> {
+    const app = this.apps.get(name);
+    if (!app) return;
+    app.status = status;
+    if (error === undefined) delete app.error;
+    else app.error = error;
+    app.updatedAt = new Date().toISOString();
+    this.scheduleSave();
+  }
+
   async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean; parkedReason?: string; awaitingPromotion?: boolean }): Promise<AppState | null> {
     const app = this.apps.get(name);
     if (!app) return null;

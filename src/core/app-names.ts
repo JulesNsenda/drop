@@ -19,28 +19,38 @@ import { getSuspensionStore } from '../managers/suspension';
  * Every name `isNameTaken` reads from state and configs (app, group, recorded
  * container), for the callers that need the names and not just the verdict.
  */
-function recordedNames(deps: { stateManager: AppStateManager; appConfigService?: AppConfigService }): string[] {
+function recordedNames(
+  deps: { stateManager: AppStateManager; appConfigService?: AppConfigService },
+  scope: 'apps' | 'all'
+): string[] {
   const names: string[] = [];
-  for (const app of deps.stateManager.getAllApps()) names.push(app.name, ...(app.group ? [app.group] : []));
+  for (const app of deps.stateManager.getAllApps()) {
+    names.push(app.name);
+    if (scope === 'all' && app.group) names.push(app.group);
+  }
   for (const config of deps.appConfigService?.getAllConfigs() ?? []) {
     names.push(config.name);
-    if (config.group) names.push(config.group);
-    if (config.groupContainer) names.push(config.groupContainer);
+    if (scope === 'all' && config.group) names.push(config.group);
+    if (scope === 'all' && config.groupContainer) names.push(config.groupContainer);
   }
   return names;
 }
 
 /**
  * Existing names that equal `name` ignoring case but are not spelled exactly
- * like it, from the same sources `isNameTaken` reads. The suspension store
- * matches ignoring case, so suspending or lifting `name` would act on these too.
+ * like it. The suspension store matches ignoring case, so suspending or lifting
+ * `name` would act on these too. `scope` 'apps' is the names the store's refusal
+ * acts on (state and config app names); 'all' adds the group and container names
+ * `isNameTaken` also guards. A tenant-authored group name must never block a
+ * suspension, so suspend and unsuspend ask for 'apps'.
  */
 export function caseVariantsOf(
   name: string,
-  deps: { stateManager: AppStateManager; appConfigService?: AppConfigService }
+  deps: { stateManager: AppStateManager; appConfigService?: AppConfigService },
+  scope: 'apps' | 'all' = 'all'
 ): string[] {
   const wanted = name.toLowerCase();
-  return [...new Set(recordedNames(deps))].filter((n) => n !== name && n.toLowerCase() === wanted);
+  return [...new Set(recordedNames(deps, scope))].filter((n) => n !== name && n.toLowerCase() === wanted);
 }
 
 /**
@@ -54,8 +64,8 @@ export function caseVariantsOf(
  * A name with a suspension record (matched ignoring case) is taken too, even
  * when no app holds it any more: the record outlives the app, and a variant
  * created later would strand the record, since suspend and unsuspend refuse a
- * name that collides in case with another app. (An unreadable or unloaded
- * suspension store lists nothing; it refuses every start anyway.)
+ * name that collides in case with another app. With the suspension store
+ * unreadable, every name is taken (fail closed).
  *
  * Fails CLOSED: with no config service the recorded names cannot be read, and
  * "nothing recorded" must not read as "free".
@@ -70,6 +80,9 @@ export function isNameTaken(
   deps: { stateManager: AppStateManager; appConfigService?: AppConfigService; ownGroup?: string }
 ): boolean {
   if (!deps.appConfigService) return true;
+  // An unreadable suspension store cannot say which names it holds. (An UNLOADED one is not
+  // treated the same: it is an early-boot state, and every test that never loads it would refuse.)
+  if (getSuspensionStore().refusalFor(name) === 'store-unreadable') return true;
   const wanted = name.toLowerCase();
   const same = (other: string | undefined): boolean => other?.toLowerCase() === wanted;
   const own = deps.ownGroup?.toLowerCase();
