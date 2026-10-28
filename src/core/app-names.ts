@@ -16,41 +16,22 @@ import type { AppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore } from '../managers/suspension';
 
 /**
- * Every name `isNameTaken` reads from state and configs (app, group, recorded
- * container), for the callers that need the names and not just the verdict.
- */
-function recordedNames(
-  deps: { stateManager: AppStateManager; appConfigService?: AppConfigService },
-  scope: 'apps' | 'all'
-): string[] {
-  const names: string[] = [];
-  for (const app of deps.stateManager.getAllApps()) {
-    names.push(app.name);
-    if (scope === 'all' && app.group) names.push(app.group);
-  }
-  for (const config of deps.appConfigService?.getAllConfigs() ?? []) {
-    names.push(config.name);
-    if (scope === 'all' && config.group) names.push(config.group);
-    if (scope === 'all' && config.groupContainer) names.push(config.groupContainer);
-  }
-  return names;
-}
-
-/**
- * Existing names that equal `name` ignoring case but are not spelled exactly
- * like it. The suspension store matches ignoring case, so suspending or lifting
- * `name` would act on these too. `scope` 'apps' is the names the store's refusal
- * acts on (state and config app names); 'all' adds the group and container names
- * `isNameTaken` also guards. A tenant-authored group name must never block a
- * suspension, so suspend and unsuspend ask for 'apps'.
+ * Existing APP names (state and config) that equal `name` ignoring case but are
+ * not spelled exactly like it. The suspension store matches ignoring case, so
+ * suspending or lifting `name` would act on these too. Group and container names
+ * are deliberately not read: they are tenant-authored, and must never block a
+ * suspension (`isNameTaken` guards those for the create path).
  */
 export function caseVariantsOf(
   name: string,
-  deps: { stateManager: AppStateManager; appConfigService?: AppConfigService },
-  scope: 'apps' | 'all'
+  deps: { stateManager: AppStateManager; appConfigService?: AppConfigService }
 ): string[] {
   const wanted = name.toLowerCase();
-  return [...new Set(recordedNames(deps, scope))].filter((n) => n !== name && n.toLowerCase() === wanted);
+  const names = [
+    ...deps.stateManager.getAllApps().map((app) => app.name),
+    ...(deps.appConfigService?.getAllConfigs() ?? []).map((config) => config.name),
+  ];
+  return [...new Set(names)].filter((n) => n !== name && n.toLowerCase() === wanted);
 }
 
 /**

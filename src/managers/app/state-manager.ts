@@ -418,6 +418,18 @@ export class AppStateManager {
     await this.updateApp(name, { lastOpenedAt: minute, recentOpeners });
   }
 
+  /** The fields `revertTransientStarting` puts back, as they are now (copied), or undefined for an unknown app. */
+  snapshotTransientStatus(name: string): TransientStatusSnapshot | undefined {
+    const app = this.apps.get(name);
+    if (!app) return undefined;
+    return {
+      status: app.status,
+      error: app.error,
+      parkedReason: app.parkedReason,
+      missingSecrets: app.missingSecrets ? [...app.missingSecrets] : undefined,
+    };
+  }
+
   /**
    * Undo a refused promotion's transient 'starting', compare-and-set: it does
    * nothing unless the status is STILL 'starting' (anything else was written by
@@ -437,7 +449,7 @@ export class AppStateManager {
     if (snapshot.parkedReason === undefined) delete app.parkedReason;
     else app.parkedReason = snapshot.parkedReason;
     if (snapshot.missingSecrets === undefined) delete app.missingSecrets;
-    else app.missingSecrets = snapshot.missingSecrets;
+    else app.missingSecrets = [...snapshot.missingSecrets];
     app.updatedAt = new Date().toISOString();
     this.scheduleSave();
     return true;

@@ -87,6 +87,7 @@ describe('holdForPromotion', () => {
     getConfig = jest.fn().mockReturnValue({ promotion: 'manual' });
     (platform as any).appConfigService = { getConfig, updateConfig };
     (platform as any).stateManager = {
+      snapshotTransientStatus: jest.fn(),
       getApp: jest.fn().mockReturnValue({ name: 'app', status: 'running', userId: 'u1' }),
       updateApp,
     };
@@ -161,6 +162,7 @@ describe('promoteApp', () => {
     });
     (platform as any).appConfigService = { getConfig, updateConfig };
     (platform as any).stateManager = {
+      snapshotTransientStatus: jest.fn(),
       getApp: jest.fn().mockReturnValue({ name: 'app', status: 'running', userId: 'u1' }),
       updateApp: jest.fn().mockResolvedValue(undefined),
     };
@@ -249,6 +251,7 @@ describe('the redeploy path holds BEFORE the old process is removed', () => {
       updateConfig: jest.fn().mockResolvedValue(undefined),
     };
     (platform as any).stateManager = {
+      snapshotTransientStatus: jest.fn(),
       getApp: jest.fn().mockReturnValue({
         name: 'live',
         path: appPath,

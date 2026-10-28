@@ -63,6 +63,20 @@ describe('AppStateManager', () => {
       expect(events).toEqual([]);
     });
 
+    it('round-trips with snapshotTransientStatus, copying missingSecrets', async () => {
+      await manager.setAppStatus('app', 'needs-config', { error: 'was broken', missingSecrets: ['API_KEY'] });
+      await manager.updateApp('app', { parkedReason: 'parked' });
+      const snapshot = manager.snapshotTransientStatus('app')!;
+      expect(manager.snapshotTransientStatus('missing')).toBeUndefined();
+
+      await manager.setAppStatus('app', 'starting');
+      expect(manager.getApp('app')?.status).toBe('starting');
+      expect(await manager.revertTransientStarting('app', snapshot)).toBe(true);
+
+      expect(manager.snapshotTransientStatus('app')).toEqual(snapshot);
+      expect(snapshot.missingSecrets).not.toBe(manager.getApp('app')?.missingSecrets);
+    });
+
     it('clears fields the snapshot did not have', async () => {
       await manager.setAppStatus('app', 'starting');
       await manager.updateApp('app', { error: 'stale', parkedReason: 'x', missingSecrets: ['A'] });

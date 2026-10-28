@@ -58,15 +58,15 @@ describe('isNameTaken', () => {
     expect(check('acme-web', 'acme')).toBe(false);
   });
 
-  it('lists the case variants of a name from state, configs and groups, never the name itself', async () => {
+  it('lists the case variants of a name from state and config app names, never the name itself or a group', async () => {
     await getStateManager().registerApp('Shop', '/x');
     await acs.upsertSystemConfig('SHOP', { type: 'static', group: 'shop', groupContainer: 'ShOp' });
     await getStateManager().registerApp('shop', '/y');
 
     const deps = { stateManager: getStateManager(), appConfigService: acs };
-    expect(caseVariantsOf('shop', deps, 'all').sort()).toEqual(['SHOP', 'Shop', 'ShOp'].sort());
-    expect(caseVariantsOf('fresh', deps, 'all')).toEqual([]);
-    expect(caseVariantsOf('shop', deps, 'apps').sort()).toEqual(['SHOP', 'Shop'].sort());
+    // App names only: the group 'shop' and the container 'ShOp' never collide.
+    expect(caseVariantsOf('shop', deps).sort()).toEqual(['SHOP', 'Shop'].sort());
+    expect(caseVariantsOf('fresh', deps)).toEqual([]);
   });
 
   it('is true for EVERY name while the suspension store is unreadable (fail closed)', async () => {

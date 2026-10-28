@@ -49,7 +49,6 @@ import {
   AppStatus,
   getStateManager,
   resetStateManager,
-  type TransientStatusSnapshot,
 } from '../managers/app/state-manager';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfig, AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
@@ -9886,12 +9885,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   /** Other existing apps whose name equals `appName` ignoring case (never `appName` itself). */
   private caseCollisionsOf(appName: string): string[] {
     if (!this.stateManager) return [];
-    // App names only: a group or container name is tenant-authored and must not block a suspension.
-    return caseVariantsOf(
-      appName,
-      { stateManager: this.stateManager, appConfigService: this.appConfigService ?? undefined },
-      'apps'
-    );
+    return caseVariantsOf(appName, {
+      stateManager: this.stateManager,
+      appConfigService: this.appConfigService ?? undefined,
+    });
   }
 
   /**
@@ -11864,13 +11861,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Set once a suspension refused the swap: the held build is then given back.
     let refused = false;
     // What the app was before this attempt wrote its transient 'starting'.
-    const entry = this.stateManager?.getApp(appName);
-    const entrySnapshot: TransientStatusSnapshot | undefined = entry && {
-      status: entry.status,
-      error: entry.error,
-      parkedReason: entry.parkedReason,
-      missingSecrets: entry.missingSecrets ? [...entry.missingSecrets] : undefined,
-    };
+    const entrySnapshot = this.stateManager?.snapshotTransientStatus(appName);
     try {
       await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
       await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
