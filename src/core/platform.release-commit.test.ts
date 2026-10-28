@@ -27,6 +27,11 @@ type Internals = {
   ): Promise<{ meta: { gitCommit?: string; kind?: string } }>;
 };
 
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('release rollback and the git commit', () => {
   let platform: DropPlatform;
   let p: Internals;

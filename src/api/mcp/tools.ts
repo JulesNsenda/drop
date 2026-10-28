@@ -1212,7 +1212,10 @@ export async function handleRedeployApp(
       let text = code === 'INVALID_GIT_SOURCE' ? wrapUntrusted(`GIT SOURCE: ${target}`, message) : message;
       if (code === 'APP_SUSPENDED') {
         // Not the APP_STOPPED hint below: restart_app is refused too, and only an administrator lifts it.
-        text = `${message}. No agent action lifts it; do not retry.`;
+        // The refusal's message is the tenant-safe one; only a real suspension is final.
+        text = message.endsWith('suspended by an administrator')
+          ? `${message}. No agent action lifts it; do not retry.`
+          : message;
       }
       if (code === 'APP_STOPPED') {
         // An agent never rebuilds a stopped app, so do not send it round restart_app and back:

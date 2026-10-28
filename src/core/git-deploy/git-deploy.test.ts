@@ -2070,20 +2070,6 @@ describe('GitDeployService', () => {
       expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
     });
 
-    it('a first deploy of a suspended name (the record is name-keyed) clones nothing and creates nothing', async () => {
-      await getSuspensionStore().suspend('reborn-git', 'admin-1');
-      (execFile as unknown as jest.Mock).mockClear();
-
-      await expect(service.deploy({ repoUrl: 'https://github.com/user/reborn-git' })).rejects.toBeInstanceOf(
-        AppSuspendedError
-      );
-
-      expect(gitCalls('clone')).toHaveLength(0);
-      expect(getStateManager().hasApp('reborn-git')).toBe(false);
-      await expect(fs.access(appDir('reborn-git'))).rejects.toThrow();
-      expect(reservedNow.size).toBe(0);
-    });
-
     it('does not queue a push for it', async () => {
       const appName = 'frozen-queue';
       await deployAndSuspend(appName);

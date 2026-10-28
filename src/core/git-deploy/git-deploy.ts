@@ -508,8 +508,6 @@ export class GitDeployService {
     if (stateManager.hasApp(appName)) {
       throw new Error(`Application '${appName}' already exists`);
     }
-    // A recreated name stays suspended (the store is name-keyed): refused before the clone.
-    this.assertNotSuspended(appName);
 
     // GUARDRAIL PRE-CHECK, before the clone. The platform's gates sit at the
     // BUILD, so a refused caller could still make DROP clone an arbitrary

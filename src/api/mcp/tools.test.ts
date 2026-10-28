@@ -1360,6 +1360,18 @@ describe('MCP tool handlers', () => {
       expect(result.structuredContent).toEqual(expect.objectContaining({ refusal_code: 'APP_SUSPENDED' }));
     });
 
+    it('a redeploy refused because the suspension store cannot answer stays generic and is not called final', async () => {
+      const message = "Starting 'alice-app' is refused right now; contact your administrator";
+      setPlatformOps(
+        makeOps({ redeployApp: jest.fn().mockResolvedValue({ refused: { code: 'APP_SUSPENDED', message } }) })
+      );
+
+      const result = await handleRedeployApp(alice, { name: 'alice-app' });
+
+      expect(result.isError).toBe(true);
+      expect(firstText(result)).toBe(message);
+    });
+
     it('restart_app tells an agent the same thing in the stale-dependencies case', async () => {
       setPlatformOps(makeOps({ restartApp: jest.fn().mockRejectedValue(new StaleDependenciesError('alice-app')) }));
 
