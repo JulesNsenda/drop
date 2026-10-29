@@ -115,10 +115,15 @@ export function refusalEpisodeCode(
   return stage.replaced && stage.live === false ? 'DEPLOY_STOPPED' : 'DEPLOY_REFUSED';
 }
 
+/** The code for a refusal that came BEFORE the old version was touched, with nobody having looked at the runtime. */
+export function preSwapEpisodeCode(reason: SuspensionRefusal): 'DEPLOY_STOPPED' | 'DEPLOY_REFUSED' {
+  return refusalEpisodeCode({ kind: 'suspended', reason }, { replaced: false, live: null });
+}
+
 export interface SuspensionPolicyDeps {
   store: Pick<SuspensionStore, 'refusalFor' | 'list'>;
   state: Pick<AppStateManager, 'getApp' | 'getAllApps'> | null;
-  configs: (Pick<AppConfigService, 'getConfig' | 'getAllConfigs'> & Partial<Pick<AppConfigService, 'getDomainOwners'>>) | null;
+  configs: Pick<AppConfigService, 'getConfig' | 'getAllConfigs' | 'getDomainOwners'> | null;
 }
 
 function defaultDeps(): SuspensionPolicyDeps {
@@ -135,14 +140,20 @@ type NameMatch = (x: string | undefined, y: string | undefined) => boolean;
 type Use = 'gate' | 'destructive';
 
 const exact: NameMatch = (x, y) => x !== undefined && x === y;
-const ignoringCase: NameMatch = (x, y) => x !== undefined && y !== undefined && x.toLowerCase() === y.toLowerCase();
+/**
+ * App, group and container names are compared ignoring case wherever they are
+ * claims on a name: hostnames are case-insensitive, so `EZS` and `ezs` collide
+ * even though the state maps key them apart.
+ */
+export const sameNameIgnoringCase: NameMatch = (x, y) =>
+  x !== undefined && y !== undefined && x.toLowerCase() === y.toLowerCase();
 
 /** How `container` compares group names for this use (see the module doc). */
 function sameNameFor(container: string, use: Use, deps: SuspensionPolicyDeps): NameMatch {
   const trusted = deps.state?.getApp(container)?.groupTrusted;
   if (trusted === true) return exact;
-  if (trusted === false) return ignoringCase;
-  return use === 'destructive' ? exact : ignoringCase;
+  if (trusted === false) return sameNameIgnoringCase;
+  return use === 'destructive' ? exact : sameNameIgnoringCase;
 }
 
 function isStateContainer(name: string, deps: SuspensionPolicyDeps): boolean {
@@ -229,6 +240,27 @@ function exactlyHeldByOtherTrusted(group: string | undefined, except: string, de
   );
 }
 
+/**
+ * The apps (state and config) whose group is `group` by `same`: members only,
+ * or with the containers of that group too.
+ */
+function membersOfGroup(
+  group: string,
+  same: NameMatch,
+  deps: SuspensionPolicyDeps,
+  includeContainers = false
+): Set<string> {
+  const found = new Set<string>();
+  for (const app of deps.state?.getAllApps() ?? []) {
+    if ((includeContainers || !app.isGroupContainer) && same(app.group, group)) found.add(app.name);
+  }
+  for (const config of deps.configs?.getAllConfigs() ?? []) {
+    const container = deps.state?.getApp(config.name)?.isGroupContainer;
+    if ((includeContainers || !container) && same(config.group, group)) found.add(config.name);
+  }
+  return found;
+}
+
 /** The members of container `container`, by the same attribution `refusalForApp`'s rule 2 uses. */
 function membersOf(container: string, use: Use, deps: SuspensionPolicyDeps): string[] {
   if (!isContainer(container, deps)) return [];
@@ -270,35 +302,49 @@ export function childrenOf(container: string, deps: SuspensionPolicyDeps = defau
  *  - `verdict`: a record held by a member of the group (a renamed service must
  *    not escape it), or a record that IS the group's name (the children would
  *    be served on that app's host);
- *  - `newGroupConflict`: the latter with no members yet, i.e. a naming conflict
- *    for a group that does not exist, not a suspension of the owner's own group.
+ *  - `hasMembers`: whether the group exists. With none, a verdict or a
+ *    `hostOwner` is a naming conflict for a group that does not exist, not a
+ *    suspension of the owner's own group;
+ *  - `hostOwner`: with `host` given and no members, another app that holds the
+ *    group's host `<group>.<suffix>` (first holder wins).
  */
 export function refusalForExpansion(
   repoName: string,
   group: string,
   trusted: boolean,
-  deps: SuspensionPolicyDeps = defaultDeps()
-): { verdict: SuspensionVerdict | null; newGroupConflict: boolean; hasMembers: boolean } {
-  const same = trusted ? exact : ignoringCase;
-  const members = new Set<string>();
-  for (const app of deps.state?.getAllApps() ?? []) {
-    if (!app.isGroupContainer && same(app.group, group)) members.add(app.name);
-  }
-  for (const config of deps.configs?.getAllConfigs() ?? []) {
-    if (!deps.state?.getApp(config.name)?.isGroupContainer && same(config.group, group)) members.add(config.name);
-  }
+  deps: SuspensionPolicyDeps = defaultDeps(),
+  host?: { suffix: string; owners?: Map<string, string> }
+): { verdict: SuspensionVerdict | null; hasMembers: boolean; hostOwner?: string } {
+  const members = membersOfGroup(group, trusted ? exact : sameNameIgnoringCase, deps);
   members.delete(repoName);
   const mine = [...members].filter((m) => !groupsOf(m, deps).every((g) => exactlyHeldByOtherTrusted(g, repoName, deps)));
+  const hasMembers = mine.length > 0;
   for (const member of mine) {
     if (deps.store.refusalFor(member) === 'record') {
-      return { verdict: { reason: 'record', via: member }, newGroupConflict: false, hasMembers: true };
+      return { verdict: { reason: 'record', via: member }, hasMembers };
     }
   }
-  const named = deps.store.list().find((r) => ignoringCase(r.name, group) && !ignoringCase(r.name, repoName));
-  if (named) {
-    return { verdict: { reason: 'record', via: named.name }, newGroupConflict: mine.length === 0, hasMembers: mine.length > 0 };
+  const named = deps.store.list().find((r) => sameNameIgnoringCase(r.name, group) && !sameNameIgnoringCase(r.name, repoName));
+  const verdict: SuspensionVerdict | null = named ? { reason: 'record', via: named.name } : null;
+  let hostOwner: string | undefined;
+  if (host && !hasMembers) {
+    // The OWNER map only, not the group claims: a case-variant of an existing group
+    // is the expansion guards' question, and they answer it by trust.
+    const owners = host.owners ?? deps.configs?.getDomainOwners(host.suffix);
+    const owner = owners?.get(`${group}.${host.suffix}`.toLowerCase());
+    if (owner !== undefined && owner !== repoName) hostOwner = owner;
   }
-  return { verdict: null, newGroupConflict: false, hasMembers: mine.length > 0 };
+  return { verdict, hasMembers, ...(hostOwner !== undefined ? { hostOwner } : {}) };
+}
+
+/**
+ * Host (lower-cased) to the apps allowed to use it. `covering` is the subset that
+ * came from a group or a suspension record: only those can make a wildcard
+ * `domains:` entry conflict. A host that is merely some app's persisted domain
+ * is an exact-match claim and never refuses or prunes a covering wildcard.
+ */
+export class HostClaims extends Map<string, Set<string>> {
+  readonly covering = new Set<string>();
 }
 
 /**
@@ -314,16 +360,6 @@ export function refusalForExpansion(
  * Record claims come from `store.list()`, which is empty while the store is
  * unreadable: a corrupt store claims nothing and so withdraws no route.
  */
-/**
- * Host (lower-cased) to the apps allowed to use it. `covering` is the subset that
- * came from a group or a suspension record: only those can make a wildcard
- * `domains:` entry conflict. A host that is merely some app's persisted domain
- * is an exact-match claim and never refuses or prunes a covering wildcard.
- */
-export class HostClaims extends Map<string, Set<string>> {
-  readonly covering = new Set<string>();
-}
-
 export function hostClaims(
   domainSuffix: string,
   deps: SuspensionPolicyDeps = defaultDeps(),
@@ -336,8 +372,13 @@ export function hostClaims(
     if (!into.has(host)) into.set(host, new Set());
     into.get(host)!.add(holder);
   };
-  for (const name of allNames(deps)) {
-    for (const group of groupsOf(name, deps)) put(groupHolders, group, name);
+  const names = allNames(deps);
+  const labels = new Map<string, string>();
+  for (const name of names) for (const group of groupsOf(name, deps)) labels.set(group.toLowerCase(), group);
+  for (const group of labels.values()) {
+    for (const holder of membersOfGroup(group, sameNameIgnoringCase, deps, true)) put(groupHolders, group, holder);
+  }
+  for (const name of names) {
     const stamp = deps.configs?.getConfig(name)?.groupContainer;
     if (stamp) for (const group of groupsOf(name, deps)) put(groupHolders, group, stamp);
   }
@@ -347,7 +388,7 @@ export function hostClaims(
   // default hostnames) folded in, so there is ONE map. FIRST HOLDER WINS for a
   // group host: a non-member that already owns it keeps it and the group yields;
   // a record's host is the record's whoever else listed it.
-  const ownerOf = owners ?? deps.configs?.getDomainOwners?.(domainSuffix) ?? new Map<string, string>();
+  const ownerOf = owners ?? deps.configs?.getDomainOwners(domainSuffix) ?? new Map<string, string>();
   const claims = new HostClaims();
   for (const host of [...groupHolders.keys(), ...recordHolders.keys()]) claims.covering.add(host);
   for (const host of new Set([...ownerOf.keys(), ...groupHolders.keys(), ...recordHolders.keys()])) {

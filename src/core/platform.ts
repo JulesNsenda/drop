@@ -238,6 +238,8 @@ import {
   claimedAgainst,
   refusalCauseOf,
   refusalEpisodeCode,
+  preSwapEpisodeCode,
+  sameNameIgnoringCase,
   StartRefused,
   type StartRefusalCause,
 } from './suspension-policy';
@@ -550,15 +552,6 @@ const BOOT_RECONCILE_CONCURRENCY = 4;
 
 /** Cap on reading a materialized monorepo child's own drop.yaml (see readChildDropYaml). */
 const MAX_CHILD_DROP_YAML_BYTES = 256 * 1024;
-
-/**
- * App, group and container names are compared ignoring case wherever they are
- * claims on a name: hostnames are case-insensitive, so `EZS` and `ezs` collide
- * even though the state maps key them apart.
- */
-function sameNameIgnoringCase(a: string | undefined, b: string | undefined): boolean {
-  return a !== undefined && b !== undefined && a.toLowerCase() === b.toLowerCase();
-}
 
 /**
  * Fingerprint of what a group child was materialized from: the container, the
@@ -4940,33 +4933,26 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // children would be served on that app's host): refused like a claimed name,
     // with the real cause in the log only. An EXISTING group that later comes to
     // match a record is the owner's own: refused as a suspension, naming it.
-    const expansion = refusalForExpansion(repoName, group, containerTrusted);
-    if (expansion.newGroupConflict) {
-      this.logger.error(
-        `Refusing monorepo group '${group}' for '${repoName}': the name is a suspension record (${expansion.verdict?.via}).`,
-        'MONOREPO'
-      );
+    // FIRST HOLDER WINS on the group's host too: a NEW group whose `<group>.<suffix>` another
+    // app already serves (through its `domains:`) is refused like a claimed name.
+    const hostSuffix = this.config.domainSuffix || 'localhost';
+    const expansion = refusalForExpansion(repoName, group, containerTrusted, undefined, {
+      suffix: hostSuffix,
+      owners: this.appConfigService?.getDomainOwners(hostSuffix),
+    });
+    const newGroupConflict = expansion.hasMembers
+      ? undefined
+      : expansion.verdict
+        ? `the name is a suspension record (${expansion.verdict.via})`
+        : expansion.hostOwner !== undefined
+          ? `its host is already held by '${expansion.hostOwner}'`
+          : undefined;
+    if (newGroupConflict) {
+      this.logger.error(`Refusing monorepo group '${group}' for '${repoName}': ${newGroupConflict}.`, 'MONOREPO');
       throw new Error(
         `Monorepo group '${group}' is already in use by another account. ` +
           'Choose a different `group:` in drop.yaml.'
       );
-    }
-    // FIRST HOLDER WINS on the group's host: a NEW group whose `<group>.<suffix>` another
-    // app already serves (through its `domains:`) is refused like a claimed name.
-    if (!expansion.hasMembers) {
-      const hostOwner = this.appConfigService
-        ?.getDomainOwners?.(this.config.domainSuffix || 'localhost')
-        .get(`${group}.${this.config.domainSuffix || 'localhost'}`.toLowerCase());
-      if (hostOwner !== undefined && hostOwner !== repoName) {
-        this.logger.error(
-          `Refusing monorepo group '${group}' for '${repoName}': its host is already held by '${hostOwner}'.`,
-          'MONOREPO'
-        );
-        throw new Error(
-          `Monorepo group '${group}' is already in use by another account. ` +
-            'Choose a different `group:` in drop.yaml.'
-        );
-      }
     }
     // A member's record freezes the group (a renamed service must not escape it).
     heldGroup = { group, trusted: containerTrusted };
@@ -6585,7 +6571,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // (first holder wins: a non-member already serving it keeps it) and a
       // suspension record's host. Consulted for `domains:`, the verified custom
       // domain and the group's own default route alike.
-      const claims = hostClaims(domainSuffix, undefined, this.appConfigService?.getDomainOwners?.(domainSuffix));
+      // Built on first use only: most apps have neither `domains:`, a group nor a verified domain.
+      let claimsMemo: ReturnType<typeof hostClaims> | undefined;
+      const claims = (): ReturnType<typeof hostClaims> =>
+        (claimsMemo ??= hostClaims(domainSuffix, undefined, this.appConfigService?.getDomainOwners(domainSuffix)));
 
       // Parse drop.yaml for custom domains
       const appPath = path.join(this.config.appsDirectory, appName);
@@ -6637,7 +6626,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // The group's host may already be someone else's (first holder wins): then the
       // group's default route is not added and the child keeps its own hostname.
       const groupHostYielded =
-        !!appConfig?.group && claimedAgainst(claims, `${appConfig.group}.${domainSuffix}`, appName);
+        !!appConfig?.group && claimedAgainst(claims(), `${appConfig.group}.${domainSuffix}`, appName);
       if (groupHostYielded && routeCfg && !hasCustomDomains) {
         this.logger.warn(
           `Not routing ${appName} on group host '${appConfig!.group}.${domainSuffix}': another app already holds it`,
@@ -6695,7 +6684,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             refusedHostnames.push(d);
             return false;
           }
-          if (claimedAgainst(claims, d, appName)) {
+          if (claimedAgainst(claims(), d, appName)) {
             this.logger.warn(
               `Refusing domain '${d}' for ${appName}: already claimed by another application, a monorepo group or a suspension`,
               'ROUTER'
@@ -6752,7 +6741,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               'ROUTER'
             );
             await this.dropCustomDomainRoute(appName, verifiedCustom.domain);
-          } else if (claimedAgainst(claims, verifiedCustom.domain, appName)) {
+          } else if (claimedAgainst(claims(), verifiedCustom.domain, appName)) {
             // Claimed since it was verified (by another app, a group or a suspension):
             // withdrawn the same way, route and verification.
             this.logger.warn(
@@ -8160,10 +8149,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           new Error(redeployRefusalOf(appName, refused).refused.message),
           crypto.randomUUID(),
           refused.refused === 'suspended'
-            ? refusalEpisodeCode(
-                { kind: 'suspended', reason: refused.suspension, via: refused.via },
-                { replaced: false, live: null }
-              )
+            ? preSwapEpisodeCode(refused.suspension)
             : 'DEPLOY_REFUSED',
           admitted.trigger,
           { newEpisode: true }
@@ -8373,10 +8359,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               appName,
               new Error(new AppSuspendedError(appName, expanded.suspended, expanded.via).tenantMessage),
               crypto.randomUUID(),
-              refusalEpisodeCode(
-                { kind: 'suspended', reason: expanded.suspended, via: expanded.via },
-                { replaced: false, live: null }
-              ),
+              preSwapEpisodeCode(expanded.suspended),
               undefined,
               { newEpisode: true }
             );
@@ -8460,7 +8443,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           appName,
           new Error(error.tenantMessage),
           crypto.randomUUID(),
-          refusalEpisodeCode({ kind: 'suspended', reason: error.reason, via: error.via }, { replaced: false, live: null }),
+          preSwapEpisodeCode(error.reason),
           'deploy',
           { newEpisode: true }
         );
@@ -9037,15 +9020,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.discardDeployTarget(appName);
       // Checked first: a suspension must not fall through to the 'errored'
       // write and the breaker charge below, which would undo the stop.
-      const refusal = refusalCauseOf(error);
-      if (refusal) {
-        await this.settleRefusedStart(appName, refusal.cause, {
-          progress,
-          closeEpisode: true,
-          replaced: progress.replaced === true || refusal.replaced,
-        });
-        return false;
-      }
+      if (await this.settleSwapRefusal(appName, error, { closeEpisode: true, progress })) return false;
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
       // drop.yaml added a required `secrets:` entry. Park in `needs-config`
       // (not `errored`) so the operator gets the actionable missing list. The
@@ -9412,13 +9387,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // running or arm watches that would restart what the suspension took away.
     // A record (or a stop) only: an unreadable store must not fail a deploy whose
     // new version is already serving.
-    if (ctx?.stop || refusalForApp(appName)?.reason === 'record') {
-      try {
-        this.gateBeforeSwap(appName, ctx);
-      } catch (error) {
-        if (error instanceof StartRefused) throw new StartRefused(error.appName, error.refusal, true);
-        throw error;
-      }
+    const late = refusalForApp(appName);
+    if (ctx?.stop) throw new StartRefused(appName, { kind: 'stopped' }, true);
+    if (late?.reason === 'record') {
+      throw new StartRefused(appName, { kind: 'suspended', reason: 'record', via: late.via }, true);
     }
     await this.stateManager?.setAppStatus(appName, 'running', { port: newPort, pid: info?.pid ?? undefined });
     this.appDeployTimes.set(appName, Date.now());
@@ -9885,22 +9857,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       } catch (error) {
         // cutoverTo re-threw a suspension: revoke the key the start re-minted and
         // leave the status true. The release is the previous one, not a deploy target.
-        const refusal = refusalCauseOf(error);
-        if (refusal) {
-          await this.settleRefusedStart(appName, refusal.cause, { closeEpisode: false, replaced: refusal.replaced });
-          if (refusal.replaced) {
-            // Refused AFTER traffic moved: the rollback is applied (the releases are
-            // rotated), so the state is not un-rotated and its commit is put right.
-            this.logger.warn(
-              `Rollback of ${appName} completed before the suspension landed; the previous release is serving`,
-              'ROLLBACK'
-            );
-            await this.restoreGitCommit(appName, release.gitCommit).catch(() => undefined);
-          }
-          // The API maps a suspension to 409 (AppSuspendedError); other causes pass as they are.
-          if (refusal.cause.kind === 'suspended') {
-            throw new AppSuspendedError(appName, refusal.cause.reason, refusal.cause.via);
-          }
+        const settled = await this.settleSwapRefusal(appName, error, {
+          closeEpisode: false,
+          label: { what: 'Rollback', tag: 'ROLLBACK' },
+        });
+        if (settled) {
+          // Refused AFTER traffic moved: the rollback is applied (the releases are
+          // rotated), so the state is not un-rotated and its commit is put right.
+          if (settled.replaced) await this.restoreGitCommit(appName, release.gitCommit).catch(() => undefined);
+          throw settled.toThrow;
         }
         throw error;
       }
@@ -9966,6 +9931,45 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // loaded), rather than attributing it to an administrator who never acted.
     const refusal = refusalForApp(appName);
     if (refusal) throw new AppSuspendedError(appName, refusal.reason, refusal.via);
+  }
+
+  /**
+   * Settle a refusal that reached the catch of a swap (buildAndSwap, a rollback, a
+   * promotion), or return null when `error` is not one. `replaced` is true when the
+   * refusal came after the swap happened (here or earlier, per `progress`): the new
+   * version is then serving, and `label` makes that visible in the log.
+   * `closeEpisode: 'if-replaced'` closes the episode only in that case (a promotion's
+   * held episode stays open for a refusal that undid nothing). `toThrow` is the
+   * API-shaped error: a suspension is an AppSuspendedError (409), anything else as is.
+   */
+  private async settleSwapRefusal(
+    appName: string,
+    error: unknown,
+    opts: {
+      closeEpisode: boolean | 'if-replaced';
+      progress?: UpdateProgress;
+      label?: { what: string; tag: string };
+    }
+  ): Promise<{ replaced: boolean; toThrow: unknown } | null> {
+    const refusal = refusalCauseOf(error);
+    if (!refusal) return null;
+    const replaced = opts.progress?.replaced === true || refusal.replaced;
+    await this.settleRefusedStart(appName, refusal.cause, {
+      progress: opts.progress,
+      closeEpisode: opts.closeEpisode === 'if-replaced' ? replaced : opts.closeEpisode,
+      replaced,
+    });
+    if (replaced && opts.label) {
+      this.logger.warn(
+        `${opts.label.what} of ${appName} completed before the suspension landed; the new release is serving`,
+        opts.label.tag
+      );
+    }
+    const toThrow =
+      refusal.cause.kind === 'suspended'
+        ? new AppSuspendedError(appName, refusal.cause.reason, refusal.cause.via)
+        : error;
+    return { replaced, toThrow };
   }
 
   /**
@@ -12214,11 +12218,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
-    // Set once a suspension refused the swap BEFORE it happened: the held build is then given back.
-    let refused = false;
-    // Set when the refusal came AFTER the swap (traffic had moved): the release is
-    // current, so the hold stays cleared and the held episode is closed.
-    let swapped = false;
+    // 'refused': a suspension refused the swap BEFORE it happened, so the held build is
+    // given back. 'swapped': the refusal came AFTER traffic moved, so the release is
+    // current, the hold stays cleared and the held episode is closed.
+    const promotion: { outcome: 'none' | 'refused' | 'swapped' } = { outcome: 'none' };
     // What the app was before this attempt wrote its transient 'starting'.
     const entrySnapshot = this.stateManager?.snapshotTransientStatus(appName);
     try {
@@ -12260,24 +12263,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           } catch (error) {
             // Not settled by handleStartApp on this branch: revoke the key and
             // leave the status true, but keep the held release (see the finally below).
-            const refusal = refusalCauseOf(error);
-            if (refusal) {
-              swapped = refusal.replaced;
-              refused = !swapped;
-              await this.settleRefusedStart(appName, refusal.cause, {
-                closeEpisode: swapped,
-                replaced: swapped,
-              });
-              if (swapped) {
-                this.logger.warn(
-                  `Promotion of ${appName} completed before the suspension landed; the promoted release is serving`,
-                  'PROMOTE'
-                );
-              }
-              // The API maps a suspension to 409 (AppSuspendedError); other causes pass as they are.
-              if (refusal.cause.kind === 'suspended') {
-                throw new AppSuspendedError(appName, refusal.cause.reason, refusal.cause.via);
-              }
+            const settled = await this.settleSwapRefusal(appName, error, {
+              closeEpisode: 'if-replaced',
+              label: { what: 'Promotion', tag: 'PROMOTE' },
+            });
+            if (settled) {
+              promotion.outcome = settled.replaced ? 'swapped' : 'refused';
+              throw settled.toThrow;
             }
             throw error;
           }
@@ -12291,16 +12283,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       await this.handleStartApp(appName, pending.outputDirectory, { closeEpisode: false, callerOwnsTarget: true });
     } catch (err) {
-      if (err instanceof AppSuspendedError && !swapped) refused = true;
+      if (err instanceof AppSuspendedError && promotion.outcome === 'none') promotion.outcome = 'refused';
       throw err;
     } finally {
       try {
         // The promoted release is current: its target is consumed, never restored.
-        if (swapped) this.deployTargets.delete(appName);
+        if (promotion.outcome === 'swapped') this.deployTargets.delete(appName);
         // A refused promotion gives the held build back exactly as it was: forget
         // (never discard) the target, restore the hold, and leave the held episode
         // open. Keyed on the refusal, not on how the closer fared.
-        if (refused) {
+        if (promotion.outcome === 'refused') {
           this.deployTargets.delete(appName);
           // Each write is log-and-continue: none may replace the AppSuspendedError.
           const restore = async (what: string, step: () => unknown): Promise<void> => {

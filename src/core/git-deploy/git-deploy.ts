@@ -31,7 +31,7 @@ import { writeJsonAtomic } from '../../utils/atomic-write';
 import { logActivityFor } from '../../managers/activity';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { getPlatformOps, AppInProgressError, AppSuspendedError } from '../../api/platform-ops';
-import { refusalForApp, refusalEpisodeCode } from '../suspension-policy';
+import { refusalForApp, preSwapEpisodeCode } from '../suspension-policy';
 import { getStateManager } from '../../managers/app/state-manager';
 import type { AppState } from '../../managers/app/state-manager';
 import { isAdminPrincipalId, getUserById } from '../../api/middleware/auth';
@@ -321,7 +321,7 @@ export class GitDeployService {
         error: suspended || !(err instanceof Error) ? new Error(message) : err,
         stage: 'pre-build',
         // The one rule for the code (nothing was looked at here, so a store that cannot answer stopped nothing).
-        ...(suspended ? { code: refusalEpisodeCode({ kind: 'suspended', reason: err.reason, via: err.via }, { replaced: false, live: null }) } : {}),
+        ...(suspended ? { code: preSwapEpisodeCode(err.reason) } : {}),
       });
     } catch {
       // Tracker not initialised (isolated tests): observability only.
@@ -1416,13 +1416,13 @@ export class GitDeployService {
     return allApps
       .filter((app) => {
         if (!app.gitSource?.autoRedeploy) return false;
+        if (normalizeRepoUrl(app.gitSource.repoUrl) !== normalizedUrl || app.gitSource.branch !== branch) {
+          return false;
+        }
         // A suspended app is not matched: the push neither pulls nor queues,
-        // and the (HMAC-only) response does not say the app is suspended.
-        if (refusalForApp(app.name)) return false;
-        return (
-          normalizeRepoUrl(app.gitSource.repoUrl) === normalizedUrl &&
-          app.gitSource.branch === branch
-        );
+        // and the (HMAC-only) response does not say the app is suspended. Asked
+        // last: the resolver is the dearest check.
+        return !refusalForApp(app.name);
       })
       .map((app) => app.name);
   }

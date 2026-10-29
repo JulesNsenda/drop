@@ -68,6 +68,7 @@ describe('suspension policy: refusalForApp', () => {
           const a = apps.find((x) => x.name === name);
           return a ? { name: a.name, group: a.cfgGroup ?? a.group, groupContainer: a.groupContainer } : undefined;
         },
+        getDomainOwners: () => new Map<string, string>(),
         getAllConfigs: () =>
           apps.map((a) => ({ name: a.name, group: a.cfgGroup ?? a.group, groupContainer: a.groupContainer })),
       } as unknown as SuspensionPolicyDeps['configs'],
@@ -220,7 +221,6 @@ describe('suspension policy: refusalForApp', () => {
       const apps = [{ name: 'site-api', group: 'site' }];
       expect(refusalForExpansion('site', 'site', true, depsOf(apps))).toEqual({
         verdict: { reason: 'record', via: 'site-api' },
-        newGroupConflict: false,
         hasMembers: true,
       });
       expect(refusalForExpansion('site-api', 'site', true, depsOf(apps)).verdict).toBeNull();
@@ -333,7 +333,6 @@ describe('suspension policy: refusalForApp', () => {
       await store.suspend('Shared', 'admin');
       expect(refusalForExpansion('site', 'shared', true, depsOf([]))).toEqual({
         verdict: { reason: 'record', via: 'Shared' },
-        newGroupConflict: true,
         hasMembers: false,
       });
     });
@@ -343,9 +342,19 @@ describe('suspension policy: refusalForApp', () => {
       const apps = [{ name: 'kid', group: 'shared' }];
       expect(refusalForExpansion('site', 'shared', true, depsOf(apps))).toEqual({
         verdict: { reason: 'record', via: 'shared' },
-        newGroupConflict: false,
         hasMembers: true,
       });
+    });
+
+    it('reports another app holding the group host, for a NEW group only', () => {
+      const host = { suffix: 'dropkit.sh', owners: new Map([['foo.dropkit.sh', 'tenant-a']]) };
+      expect(refusalForExpansion('site', 'foo', true, depsOf([{ name: 'tenant-a' }]), host)).toEqual({
+        verdict: null,
+        hasMembers: false,
+        hostOwner: 'tenant-a',
+      });
+      const existing = depsOf([{ name: 'tenant-a' }, { name: 'kid', group: 'foo' }]);
+      expect(refusalForExpansion('site', 'foo', true, existing, host)).toEqual({ verdict: null, hasMembers: true });
     });
 
     it("ignores the asking container's own name", async () => {
