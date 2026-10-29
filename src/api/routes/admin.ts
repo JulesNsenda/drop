@@ -29,6 +29,7 @@ import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } fro
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
 import { getPlatformOps } from '../platform-ops';
+import { refusalForApp } from '../../core/suspension-policy';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import {
   getObjectStorageProvisioner,
@@ -401,7 +402,13 @@ admin.post('/apps/:name/unsuspend', async (c) => {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, `Could not lift the suspension of '${appName}': ${message}`), 500);
   }
   if (!lifted) {
-    return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' is not suspended`), 404);
+    // A member of a suspended group has no record of its own: say whose it is.
+    const holder = refusalForApp(appName);
+    const detail =
+      holder?.reason === 'record' && holder.via !== undefined
+        ? `Application '${appName}' has no suspension of its own: it is suspended because '${holder.via}' is suspended. Lift that one.`
+        : `Application '${appName}' is not suspended`;
+    return c.json(error(ErrorCodes.NOT_FOUND, detail), 404);
   }
 
   await logActivityFor(authCtx, {

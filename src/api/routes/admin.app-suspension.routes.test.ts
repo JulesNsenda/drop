@@ -183,6 +183,22 @@ describe('app suspension routes', () => {
       expect(res.status).toBe(404);
     });
 
+    it("404s a child of a suspended container, naming the container whose suspension to lift", async () => {
+      const sm = getStateManager();
+      await sm.registerApp('shop-site', path.join(t.tempDir, 'shop-site'));
+      await sm.updateApp('shop-site', { isGroupContainer: true, group: 'shop-site' } as never);
+      await sm.updateApp('shop', { group: 'shop-site' } as never);
+      await getSuspensionStore().suspend('shop-site', 'admin-1');
+      ops({ unsuspendApp: jest.fn().mockResolvedValue({ unsuspended: false }) });
+
+      const res = await post('/api/v1/admin/apps/shop/unsuspend', adminToken);
+
+      expect(res.status).toBe(404);
+      const message = ((await res.json()) as { error: { message: string } }).error.message;
+      expect(message).toContain("'shop-site'");
+      expect(message).toContain('Lift that one');
+    });
+
     it('answers 500 when the record cannot be removed', async () => {
       ops({ unsuspendApp: jest.fn().mockRejectedValue(new Error('read-only')) });
       const res = await post('/api/v1/admin/apps/shop/unsuspend', adminToken);

@@ -171,6 +171,14 @@ export interface AppState {
    * expansion, so pre-existing phantoms self-heal on the next redeploy.
    */
   isGroupContainer?: boolean;
+  /**
+   * The trust `expandMonorepo` decided for this container (the operator's, or
+   * an enabled admin's: true; anyone else's: false), kept so a SYNCHRONOUS reader
+   * (the suspension resolver) can compare group names the way the expansion did:
+   * exactly when true, ignoring case when false. Absent on a legacy entry.
+   * Platform-written only; no route lets a client set it.
+   */
+  groupTrusted?: boolean;
 }
 
 export interface StateManagerConfig {

@@ -243,7 +243,7 @@ describe('app suspension (platform, Item 1)', () => {
       expect(result).toMatchObject({ suspended: true });
       expect((result as { stopErrors?: string[] }).stopErrors).toEqual(['site: still present after delete']);
       // The suspension holds regardless.
-      expect(getSuspensionStore().isSuspended('site')).toBe(true);
+      expect(getSuspensionStore().refusalFor('site') !== null).toBe(true);
     }, 20000);
 
     it('reports a delete that throws', async () => {
@@ -276,7 +276,7 @@ describe('app suspension (platform, Item 1)', () => {
       const result = await platform.suspendApp('mono', 'admin-1');
 
       expect(result).toEqual({ refused: 'group-container', services: ['mono-api', 'mono-web'] });
-      expect(getSuspensionStore().isSuspended('mono')).toBe(false);
+      expect(getSuspensionStore().refusalFor('mono') !== null).toBe(false);
     }, 20000);
 
     it('rejects, touching nothing, when the record cannot be written', async () => {
@@ -392,7 +392,7 @@ describe('app suspension (platform, Item 1)', () => {
       platform = makePlatform();
       await platform.start();
 
-      expect(getSuspensionStore().isSuspended('site')).toBe(true);
+      expect(getSuspensionStore().refusalFor('site') !== null).toBe(true);
       await expect(platform.restartApp('site')).rejects.toBeInstanceOf(AppSuspendedError);
     }, 30000);
 
@@ -436,7 +436,7 @@ describe('app suspension (platform, Item 1)', () => {
       const app = getStateManager().getApp('site')!;
       expect(app.status).toBe('stopped');
       expect(app.error).toBeUndefined();
-      expect(getSuspensionStore().isSuspended('site')).toBe(false);
+      expect(getSuspensionStore().refusalFor('site') !== null).toBe(false);
 
       const info = await platform.restartApp('site');
       expect(info.status).toBe('running');
@@ -449,7 +449,7 @@ describe('app suspension (platform, Item 1)', () => {
       await getSuspensionStore().suspend('ghost', 'admin-1');
 
       expect(await platform.unsuspendApp('ghost')).toEqual({ unsuspended: true });
-      expect(getSuspensionStore().isSuspended('ghost')).toBe(false);
+      expect(getSuspensionStore().refusalFor('ghost') !== null).toBe(false);
       expect(await platform.unsuspendApp('ghost')).toEqual({ unsuspended: false });
     }, 20000);
   });
@@ -886,7 +886,8 @@ describe('app suspension (platform, Item 1)', () => {
         await deployed();
         fakeRuntime.reset();
         jest.spyOn(internals(), 'noteRuntimeLogEnd').mockRejectedValue(new Error('disk gone'));
-        await expect(settle(new AppSuspendedError('site', 'record'))).resolves.toBeUndefined();
+        // The closer answers with the episode code it closed (or would have closed) with.
+        await expect(settle(new AppSuspendedError('site', 'record'))).resolves.toBe('DEPLOY_STOPPED');
         expect(getStateManager().getApp('site')?.status).toBe('stopped');
       });
 

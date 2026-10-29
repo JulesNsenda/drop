@@ -248,6 +248,101 @@ describe('expandMonorepo re-materializing a live child', () => {
     });
   });
 
+  describe("a suspended member freezes its group's container", () => {
+    const renamed = { services: { web2: { path: 'frontend', type: 'static' } } };
+    const renamedChild = `${repoName}-web2`;
+
+    it('a renamed service of a folder-dropped container is not created, built or copied', async () => {
+      await seedRunningChild();
+      await getSuspensionStore().suspend(childName, 'admin-1');
+
+      const result = await (platform as any).expandMonorepo(repoPath, repoName, renamed);
+
+      expect(result).toEqual({ suspended: 'record', via: childName });
+      expect(await exists(path.join(appsDir, renamedChild))).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+      expect(handleAppUpdate).not.toHaveBeenCalled();
+      expect(stateManager.getApp(renamedChild)).toBeUndefined();
+    });
+
+    it('the same for a REGISTERED container (a git-deployed one)', async () => {
+      await stateManager.registerApp(repoName, repoPath, 'unknown');
+      await stateManager.updateApp(repoName, { isGroupContainer: true, group: repoName });
+      await seedRunningChild();
+      await getSuspensionStore().suspend(childName, 'admin-1');
+
+      const result = await (platform as any).expandMonorepo(repoPath, repoName, renamed);
+
+      expect(result).toEqual({ suspended: 'record', via: childName });
+      expect(await exists(path.join(appsDir, renamedChild))).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it('a record on an unrelated app leaves the expansion alone', async () => {
+      await seedRunningChild();
+      await getSuspensionStore().suspend('stranger', 'admin-1');
+
+      await expect(expand()).resolves.toBeUndefined();
+
+      expect(handleAppUpdate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('a group named after a suspension record', () => {
+    const grouped = (group: string) => ({ group, services: { frontend: { path: 'frontend', type: 'static' } } });
+
+    it('a NEW group whose name is a record (even of a deleted app) is refused as a naming conflict, saying nothing of the suspension', async () => {
+      await getSuspensionStore().suspend('shared', 'admin-1');
+
+      const refusal = await (platform as any).expandMonorepo(repoPath, repoName, grouped('shared')).then(
+        () => undefined,
+        (err: Error) => err
+      );
+
+      expect(refusal?.message).toMatch(/already in use by another account/);
+      expect(refusal?.message).not.toMatch(/suspend/i);
+      expect(await exists(path.join(appsDir, 'shared-frontend'))).toBe(false);
+      expect(await exists(childPath())).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it('matches the record ignoring case', async () => {
+      await getSuspensionStore().suspend('Shared', 'admin-1');
+
+      await expect((platform as any).expandMonorepo(repoPath, repoName, grouped('shared'))).rejects.toThrow(
+        /already in use by another account/
+      );
+    });
+
+    it('an EXISTING group whose name later matches a record gets the same refusal (not a drop.yaml message), and nothing is touched', async () => {
+      await stateManager.registerApp(childName, childPath(), 'static');
+      await stateManager.updateApp(childName, { group: 'shared', status: 'running', port: 4001 });
+      await getSuspensionStore().suspend('shared', 'admin-1');
+
+      const result = await (platform as any).expandMonorepo(repoPath, repoName, grouped('shared'));
+
+      expect(result).toEqual({ suspended: 'record', via: 'shared' });
+      expect(handleAppUpdate).not.toHaveBeenCalled();
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it("a group named after the container's OWN record is the container's own suspension, with no via", async () => {
+      await getSuspensionStore().suspend(repoName, 'admin-1');
+
+      const result = await (platform as any).expandMonorepo(repoPath, repoName, grouped(repoName));
+
+      expect(result).toEqual({ suspended: 'record' });
+    });
+
+    it('an unrelated record does not block a new group', async () => {
+      await getSuspensionStore().suspend('stranger', 'admin-1');
+
+      await (platform as any).expandMonorepo(repoPath, repoName, grouped('fresh'));
+
+      expect(handleBuildApp).toHaveBeenCalled();
+    });
+  });
+
   describe('group ownership across repeated expansions (DROP-128)', () => {
     it('adopts unowned children and keeps re-expanding', async () => {
       // The dropkit.sh failure was self-perpetuating: the ownership guard

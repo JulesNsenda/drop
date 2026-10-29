@@ -20,6 +20,7 @@ import { DropPlatform, createPlatform } from './platform';
 import { getStateManager, resetStateManager, AppStateManager } from '../managers/app/state-manager';
 import { AppConfigService } from '../managers/app/app-config';
 import * as auth from '../api/middleware/auth';
+import { getSuspensionStore } from '../managers/suspension';
 
 const OWNER_ERR = /already in use by another account/;
 const PROV_ERR = /belongs to another container/;
@@ -159,6 +160,52 @@ describe('monorepo group provenance (groupContainer)', () => {
       expect(acs.getConfig('ezs-web')?.groupContainer).toBe('ezs');
       // And the refused container was never tagged into the group either.
       expect(stateManager.getApp('evil')?.isGroupContainer).toBeUndefined();
+    });
+
+    it("a foreign container naming a group with a SUSPENDED member is refused by the existing guards, which say nothing of the suspension", async () => {
+      // Stamped (provenance guard) and then owned-but-unstamped (claimant guard): the suspension
+      // check runs after both, so neither refusal can tell the attacker a member is suspended.
+      await seedChild('ezs-web', 'ezs', { groupContainer: 'ezs' });
+      await getSuspensionStore().suspend('ezs-web', 'admin-1');
+      await registerTenantContainer();
+
+      const stamped = await expand('evil', ['web'], 'ezs').then(
+        () => undefined,
+        (err: Error) => err
+      );
+      expect(stamped?.message).toMatch(PROV_ERR);
+      expect(stamped?.message).not.toMatch(/suspend/i);
+
+      await acs.upsertSystemConfig('ezs-web', { groupContainer: undefined });
+      await stateManager.updateApp('ezs-web', { userId: 'victim' });
+      const claimed = await expand('evil', ['web'], 'ezs').then(
+        () => undefined,
+        (err: Error) => err
+      );
+      // Unstamped now: the adoption guard (an older member this container did not create) answers.
+      expect(claimed?.message).toMatch(ADOPT_ERR);
+      expect(claimed?.message).not.toMatch(/suspend/i);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it('refuses a NEW group whose host another app already serves through domains:', async () => {
+      await acs.upsertSystemConfig('tenant-a', { type: 'static', path: childPathOf('tenant-a'), domains: ['foo.localhost'] });
+
+      await expect(expand('ezs', ['web'], 'foo')).rejects.toThrow(OWNER_ERR);
+
+      expect(await exists(childPathOf('foo-web'))).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
+    it('persists the trust it decided on the container, for the synchronous resolver', async () => {
+      // Folder-dropped operator container registered into state: ownerless, so trusted.
+      await stateManager.registerApp('ezs', repoPathOf('ezs'), 'unknown');
+      await expand('ezs', ['web']);
+      expect(stateManager.getApp('ezs')).toMatchObject({ isGroupContainer: true, groupTrusted: true });
+
+      await registerTenantContainer();
+      await expand('evil', ['web']);
+      expect(stateManager.getApp('evil')).toMatchObject({ isGroupContainer: true, groupTrusted: false });
     });
 
     it('does not let a refused container lock the operator out', async () => {

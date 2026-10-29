@@ -129,6 +129,7 @@ import { getStateManager } from '../managers/app/state-manager';
 import { getAppConfigService } from '../managers/app/app-config';
 import { getDeployTracker, getDeployDetailStore } from '../managers/deploy-tracker';
 import { getDeployBreaker } from '../managers/guardrail/deploy-breaker';
+import { getSuspensionStore } from '../managers/suspension';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 10000, intervalMs = 25): Promise<void> {
   const started = Date.now();
@@ -439,6 +440,132 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     expect(recordFailure).not.toHaveBeenCalled();
   }, 30000);
 
+  describe('a suspension landing after the new instance started', () => {
+    type CutoverInternals = {
+      awaitStrictReadiness: (...a: unknown[]) => Promise<unknown>;
+      cutovers: Set<string>;
+      router: { setUpstream: (...a: unknown[]) => unknown };
+    };
+
+    async function expectNothingSwitched(oldPort: number, setUpstream: jest.SpyInstance): Promise<void> {
+      expect(setUpstream).not.toHaveBeenCalled();
+      // The new instance was deleted, the old one never was, and the slot did not move.
+      expect(log).toContain('delete site.b');
+      expect(log).not.toContain('delete site');
+      expect(fakeRuntime.getLiveInstance('site')).toBe('a');
+      expect(cfg('site')?.port).toBe(oldPort);
+      expect((platform as unknown as CutoverInternals).cutovers.has('site')).toBe(false);
+      const [episode] = getDeployTracker().getEpisodes('site');
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+    }
+
+    it('after readiness, before anything is persisted: nothing is persisted and traffic does not move', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const oldPort = getStateManager().getApp('site')!.port!;
+      const internals = platform as unknown as CutoverInternals;
+      const setUpstream = jest.spyOn(internals.router, 'setUpstream');
+      const ready = internals.awaitStrictReadiness.bind(platform);
+      jest.spyOn(internals, 'awaitStrictReadiness').mockImplementationOnce(async (...a: unknown[]) => {
+        const result = await ready(...a);
+        await getSuspensionStore().suspend('site', 'admin-1');
+        return result;
+      });
+      log.length = 0;
+
+      await redeploy('site', appPath, 'v2');
+
+      await expectNothingSwitched(oldPort, setUpstream);
+      expect(cfg('site')?.runtimeSlot).toBeUndefined();
+    }, 30000);
+
+    it('during the drain, after traffic moved: the episode closes as failed, the app ends stopped, running is never written', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const internals = platform as unknown as CutoverInternals & {
+        cutoverDrainMs: () => number;
+        armPostDeployWatches: (...a: unknown[]) => void;
+        healthProbers: Map<string, unknown>;
+      };
+      const arm = jest.spyOn(internals, 'armPostDeployWatches');
+      const statuses: string[] = [];
+      const unsubscribe = eventBus.subscribe('app:updated', (p) => {
+        const status = (p.changes as { status?: string })?.status;
+        if (p.appId === 'site' && status) statuses.push(status);
+      });
+      // The suspension lands while the old instance drains.
+      // A real suspension (record, then both slots taken down) lands while the old instance drains.
+      jest.spyOn(internals, 'cutoverDrainMs').mockImplementation(() => {
+        void platform!.suspendApp('site', 'admin-1');
+        return 400;
+      });
+      arm.mockClear();
+
+      await redeploy('site', appPath, 'v2');
+      unsubscribe();
+
+      expect(statuses).not.toContain('running');
+      expect(getStateManager().getApp('site')?.status).toBe('stopped');
+      expect(arm).not.toHaveBeenCalled();
+      expect(internals.healthProbers.has('site')).toBe(false);
+      expect(getDeployTracker().hasOpenEpisode('site')).toBe(false);
+      const [episode] = getDeployTracker().getEpisodes('site');
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+    }, 30000);
+
+    it('an unreadable store during the drain does not fail the deploy: it completes running', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const internals = platform as unknown as CutoverInternals & { cutoverDrainMs: () => number };
+      jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(internals, 'cutoverDrainMs').mockImplementation(() => {
+        void (async () => {
+          await fs.writeFile(path.join(tempDir, 'data', 'drop-svc', 'suspensions.json'), '{ broken');
+          await getSuspensionStore().load();
+        })();
+        return 400;
+      });
+
+      await redeploy('site', appPath, 'v2');
+
+      expect(getStateManager().getApp('site')?.status).toBe('running');
+      expect(getDeployTracker().getEpisodes('site')[0].status).toBe('succeeded');
+    }, 30000);
+
+    it('after the config writes, before the traffic switch: the config is put back and traffic does not move', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const oldPort = getStateManager().getApp('site')!.port!;
+      const internals = platform as unknown as CutoverInternals;
+      const setUpstream = jest.spyOn(internals.router, 'setUpstream');
+      const acs = getAppConfigService();
+      const updateConfig = acs.updateConfig.bind(acs);
+      let suspended = false;
+      jest.spyOn(acs, 'updateConfig').mockImplementation(async (...a: Parameters<typeof updateConfig>) => {
+        const result = await updateConfig(...a);
+        // The cutover's own write of the new port (not the earlier bookkeeping, nor the rollback's).
+        const port = (a[1] as { port?: number }).port;
+        if (!suspended && port !== undefined && port !== oldPort) {
+          suspended = true;
+          await getSuspensionStore().suspend('site', 'admin-1');
+        }
+        return result;
+      });
+      log.length = 0;
+
+      await redeploy('site', appPath, 'v2');
+
+      await expectNothingSwitched(oldPort, setUpstream);
+      expect(cfg('site')?.runtimeSlot).toBe('a');
+    }, 30000);
+  });
+
   it('never routes traffic to the new instance on its start event', async () => {
     platform = makePlatform();
     await platform.start();
@@ -609,6 +736,51 @@ describe('zero-downtime cutover (#298 step 5)', () => {
       await expect(get(oldPort)).rejects.toThrow();
       expect(cfg('site')?.currentRelease?.path).toBe(held);
       expect(cfg('site')?.pendingPromotion).toBeUndefined();
+      expect(settled('site')).toBe(true);
+    }, 30000);
+
+    it('a suspension during the drain of a promotion: the swap stands, the hold stays cleared, the episode closes', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      await getAppConfigService().updateConfig('site', { promotion: 'manual' });
+      await redeploy('site', appPath, 'v2');
+      const held = cfg('site')!.pendingPromotion!.releasePath!;
+      jest
+        .spyOn(platform as unknown as { cutoverDrainMs: () => number }, 'cutoverDrainMs')
+        .mockImplementation(() => {
+          void platform!.suspendApp('site', 'admin-1');
+          return 400;
+        });
+
+      await expect(platform!.promoteApp('site')).rejects.toMatchObject({ code: 'APP_SUSPENDED' });
+
+      // Applied, not un-applied: the promoted release is current and nothing is held again.
+      expect(cfg('site')?.currentRelease?.path).toBe(held);
+      expect(cfg('site')?.pendingPromotion).toBeUndefined();
+      expect(getStateManager().getApp('site')?.awaitingPromotion).toBeFalsy();
+      expect(getStateManager().getApp('site')?.status).toBe('stopped');
+      expect(getDeployTracker().hasOpenEpisode('site')).toBe(false);
+      expect(settled('site')).toBe(true);
+    }, 30000);
+
+    it('a suspension during the drain of a rollback: the rotation stands and the refusal is still a 409 suspension', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const first = cfg('site')!.currentRelease!;
+      await redeploy('site', appPath, 'v2');
+      jest
+        .spyOn(platform as unknown as { cutoverDrainMs: () => number }, 'cutoverDrainMs')
+        .mockImplementation(() => {
+          void platform!.suspendApp('site', 'admin-1');
+          return 400;
+        });
+
+      await expect(platform!.rollbackApp('site')).rejects.toMatchObject({ code: 'APP_SUSPENDED' });
+
+      expect(cfg('site')?.currentRelease?.id).toBe(first.id);
+      expect(getStateManager().getApp('site')?.status).toBe('stopped');
       expect(settled('site')).toBe(true);
     }, 30000);
 
