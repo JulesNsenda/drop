@@ -27,11 +27,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-29
+
 ### Security
 
+- **An admin's app suspension now sticks, and a suspended app is refused
+  everywhere (#386, #387, #388).** A suspension used to stop the app only
+  until its owner started it again. Now a suspended app stays down until an
+  administrator lifts it, including across a platform restart, and every start
+  and deploy path refuses it with `409 APP_SUSPENDED` before anything lands:
+  start, restart, redeploy, upload, git push, rollback, attach and promote.
+  A refused request is never charged against a deploy quota.
+- **A redeploy can no longer bring back a git token grant that was revoked
+  while it ran (#376).** If an administrator withdrew an app's use of a stored
+  token while that app's repository was being cloned, the redeploy used to put
+  the old grant back when it finished. The revocation now holds, and the next
+  redeploy pulls without the token.
+- **MCP tools that change something now need at least the `user` role
+  (#381).** `deploy_files`, `deploy_from_git`, `redeploy_app`, `restart_app`,
+  `rollback_app` and `custom_domain` are refused for a `readonly` account,
+  matching the REST API; read-only tools stay available. Lowering a user's
+  role now signs them out of their sessions and connector grants, which must be
+  authorized again; their API keys and agent tokens keep working, limited to
+  the new role.
+- **An upload and a build can no longer write the same app folder at once
+  (#383).** An upload in progress now counts as the app being busy, so a
+  build, restart or rollback waits for it. A redeploy upload that arrives while
+  the app is building is refused with 409.
+- **A monorepo service counts as busy while its files are being copied
+  (#384).** A file change seen mid-copy could start a build on a half-written
+  service. That build is now refused until the copy finishes, and a service
+  whose build is still running is skipped with a warning rather than
+  overwritten.
 - Hardened how git-deployed apps are updated: a redeploy now downloads a fresh shallow copy into a private platform folder and copies the repository's files into the app, instead of running git inside the app's own folder. The copy is size- and entry-limited like an upload, refuses to write through links, and records which files it wrote so it only ever deletes those.
 - Hostnames under the platform's own public host can no longer be claimed as an app's custom domain.
-
 - **Stored git tokens are now scoped to the user who added them.** Listing,
   deleting, and choosing a token for a git deploy or redeploy are limited to its
   owner, and an administrator can manage any token. A token that is not yours
@@ -54,7 +83,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Deleting an account now also deletes the git tokens it added.** Any app
   that had one attached fails its next pull with the ordinary
   "GitHub token ... not found" error until a new token is attached.
-
 
 ### Upgrading
 
@@ -101,7 +129,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the app. A refused redeploy says why, with a retry hint where waiting
   helps: `APP_BUSY`, `APP_STOPPED`, `APP_SOURCE_MISSING`, `INVALID_GIT_SOURCE`,
   `REDEPLOY_VIA_CONTAINER`, `RATE_LIMITED` or `INSUFFICIENT_DISK`.
-
+- **Lift an app suspension, and see which apps are suspended (#386, #387,
+  #388).** `POST /api/v1/admin/apps/:name/unsuspend` lifts a suspension; it
+  needs an administrator signed in through the dashboard, not an API key or
+  agent token, and leaves the app stopped for its owner to start. `GET /apps`
+  reports a `suspended` field for each app, and only administrators see who
+  suspended it and why. Suspensions are included in backup and restore, so
+  restoring an older backup lifts any suspension made after it. A deploy cut
+  short because its app was stopped or suspended mid-deploy is recorded with
+  the new error code `DEPLOY_STOPPED`; it does not count as the app failing.
 - **Attach object storage to an app (#301).** Once an operator has set object
   storage up, an app owner can attach a private S3 bucket from the app's
   Database tab or `POST /api/v1/apps/:name/services/object-storage`. The app
@@ -182,6 +218,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   app now carries the same random suffix as its bucket
   (`drop-<prefix>-<app>-<suffix>`), so a recreated app can never collide with
   a user still waiting to be removed.
+- **Two apps' domain routes can no longer overwrite each other (#377).** An
+  app's route was identified by a name built from the app and the hostname,
+  and because app names may contain dashes, two different apps (`shop` serving
+  `www.example.com` and `shop-www` serving `example.com`, for example) could
+  end up with the same name, so one app's route silently replaced the
+  other's. Each route now keeps its own name, and DROP refuses, with a
+  warning, to replace a route that belongs to another app.
+- **GitHub push webhooks no longer show as failed (#382).** GitHub waits only
+  10 seconds for a webhook to answer, and a redeploy's fresh clone can take
+  longer, so deliveries were marked failed even though the redeploy ran. The
+  webhook still checks the signature and finds the matching apps before it
+  answers, then answers at once with `redeploying` for each app and runs the
+  redeploys in the background. A redeploy refused after that point (a quota or
+  disk limit, for example) is now reported in the server log, not in GitHub's
+  delivery view.
 
 ## [1.7.1] - 2026-10-26
 
