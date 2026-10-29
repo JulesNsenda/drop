@@ -215,6 +215,22 @@ describe('handleConfigureRoute: hosts claimed by a suspension', () => {
     expect(getAppConfigService().getConfig('site')?.customDomainVerified).toBeUndefined();
   });
 
+  it("a wildcard route survives another app later owning a host it covers", async () => {
+    await register('b');
+    await register('a');
+    await declareDomains('b', ['"*.example.com"']);
+    await (platform as any).handleConfigureRoute('b', 4100);
+    expect(hostsOf('b')).toEqual(['*.example.com']);
+
+    await getAppConfigService().upsertSystemConfig('a', { type: 'static', path: path.join(appsDir, 'a') });
+    await declareDomains('a', ['a.example.com']);
+    await (platform as any).handleConfigureRoute('a', 4200);
+    await (platform as any).handleConfigureRoute('b', 4100);
+
+    expect(hostsOf('a')).toEqual(['a.example.com']);
+    expect(hostsOf('b')).toEqual(['*.example.com']);
+  });
+
   it("a suspended app's own record claims nothing against itself", async () => {
     await register('site');
     await getSuspensionStore().suspend('site', 'admin-1');

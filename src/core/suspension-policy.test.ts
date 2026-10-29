@@ -454,6 +454,13 @@ describe('suspension policy: refusalForApp', () => {
       expect(claimedAgainst(claims, 'gone.dropkit.sh', 'x')).toBe(true);
     });
 
+    it("another app's persisted domain does not conflict with a covering wildcard (exact match only)", () => {
+      const owners = new Map([['a.example.com', 'a']]);
+      const claims = hostClaims('dropkit.sh', depsOf([{ name: 'a' }, { name: 'b' }]), owners);
+      expect(claimedAgainst(claims, 'a.example.com', 'b')).toBe(true);
+      expect(claimedAgainst(claims, '*.example.com', 'b')).toBe(false);
+    });
+
     it('a wildcard that expands, by one label, to a claimed host is refused', async () => {
       await store.suspend('susp', 'admin');
       const claims = hostClaims('localhost', depsOf([{ name: 'evil' }]));

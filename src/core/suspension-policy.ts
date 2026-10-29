@@ -314,11 +314,21 @@ export function refusalForExpansion(
  * Record claims come from `store.list()`, which is empty while the store is
  * unreadable: a corrupt store claims nothing and so withdraws no route.
  */
+/**
+ * Host (lower-cased) to the apps allowed to use it. `covering` is the subset that
+ * came from a group or a suspension record: only those can make a wildcard
+ * `domains:` entry conflict. A host that is merely some app's persisted domain
+ * is an exact-match claim and never refuses or prunes a covering wildcard.
+ */
+export class HostClaims extends Map<string, Set<string>> {
+  readonly covering = new Set<string>();
+}
+
 export function hostClaims(
   domainSuffix: string,
   deps: SuspensionPolicyDeps = defaultDeps(),
   owners?: Map<string, string>
-): Map<string, Set<string>> {
+): HostClaims {
   const groupHolders = new Map<string, Set<string>>();
   const recordHolders = new Map<string, Set<string>>();
   const put = (into: Map<string, Set<string>>, label: string, holder: string): void => {
@@ -338,7 +348,8 @@ export function hostClaims(
   // group host: a non-member that already owns it keeps it and the group yields;
   // a record's host is the record's whoever else listed it.
   const ownerOf = owners ?? deps.configs?.getDomainOwners?.(domainSuffix) ?? new Map<string, string>();
-  const claims = new Map<string, Set<string>>();
+  const claims = new HostClaims();
+  for (const host of [...groupHolders.keys(), ...recordHolders.keys()]) claims.covering.add(host);
   for (const host of new Set([...ownerOf.keys(), ...groupHolders.keys(), ...recordHolders.keys()])) {
     const owner = ownerOf.get(host);
     const record = recordHolders.get(host);
@@ -353,9 +364,10 @@ export function hostClaims(
 /**
  * Whether `appName` may route `entry` (a `domains:` entry) given `claims`:
  * refused when the host is claimed by others, or when it is a wildcard
- * (`*.rest`) that expands, by one label, to a host claimed by others.
+ * (`*.rest`) that expands, by one label, to a GROUP or RECORD host claimed by
+ * others (another app's persisted `domains:` never conflicts with a wildcard).
  */
-export function claimedAgainst(claims: Map<string, Set<string>>, entry: string, appName: string): boolean {
+export function claimedAgainst(claims: HostClaims, entry: string, appName: string): boolean {
   const host = entry.toLowerCase();
   const held = (h: string): boolean => {
     const holders = claims.get(h);
@@ -363,7 +375,7 @@ export function claimedAgainst(claims: Map<string, Set<string>>, entry: string, 
   };
   if (!host.startsWith('*.')) return held(host);
   const rest = host.slice(1); // ".rest"
-  for (const claimed of claims.keys()) {
+  for (const claimed of claims.covering) {
     const label = claimed.endsWith(rest) ? claimed.slice(0, claimed.length - rest.length) : '';
     if (label !== '' && !label.includes('.') && held(claimed)) {
       return true;
