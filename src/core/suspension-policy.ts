@@ -380,7 +380,10 @@ export function hostClaims(
   }
   for (const name of names) {
     const stamp = deps.configs?.getConfig(name)?.groupContainer;
-    if (stamp) for (const group of groupsOf(name, deps)) put(groupHolders, group, stamp);
+    // Only a CURRENT container: a stale stamp (the named app is no longer one) holds nothing.
+    if (stamp && containersOf(name, 'gate', deps).includes(stamp)) {
+      for (const group of groupsOf(name, deps)) put(groupHolders, group, stamp);
+    }
   }
   for (const record of deps.store.list()) put(recordHolders, record.name, record.name);
 

@@ -235,6 +235,7 @@ import {
   refusalForApp,
   refusalForExpansion,
   hostClaims,
+  childrenOf,
   claimedAgainst,
   refusalCauseOf,
   refusalEpisodeCode,
@@ -10187,25 +10188,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    *   4. routes and the app's minted DROP_API_KEY are removed;
    *   5. 'stopped' is written.
    *
+   * A monorepo container runs nothing itself, so steps 2-5 repeat for each of
+   * its children (`childrenOf`, the exact attribution, never a case-insensitive
+   * guess). Suspending a CHILD takes down only that child.
+   *
    * Anything still live afterwards comes back as `stopErrors`: the suspension
-   * holds regardless, but the caller is never told a bare success.
+   * holds regardless, but the caller is never told a bare success. The app's
+   * own errors are reported as they are; a child's are prefixed `<child>: `.
    */
   async suspendApp(appName: string, by: string, reason?: string): Promise<SuspendAppResult> {
     const runtime = this.runtime;
     const state = this.stateManager;
     if (!runtime || !state) throw new Error('Platform is not fully initialized');
-
-    // Its services are the runtime apps; the container itself runs nothing.
-    const current = state.getApp(appName);
-    if (current?.isGroupContainer) {
-      return {
-        refused: 'group-container',
-        services: state
-          .getAllApps()
-          .filter((a) => a.group === current.group && !a.isGroupContainer)
-          .map((a) => a.name),
-      };
-    }
 
     // Names are matched ignoring case by the store; another existing app that
     // differs only in case would be suspended with this one.
@@ -10218,6 +10212,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     await state.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
 
+    for (const child of childrenOf(appName)) {
+      const childErrors = await this.takeAppDown(child, { revokeKey: true });
+      stopErrors.push(...childErrors.map((e) => `${child}: ${e}`));
+      if (state.getApp(child)) await state.setAppStatus(child, 'stopped', { error: 'Suspended by admin' });
+    }
+
     return { suspended: true, at: record.at, ...(stopErrors.length > 0 ? { stopErrors } : {}) };
   }
 
@@ -10225,6 +10225,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * Lift a suspension. The app is left 'stopped' explicitly (never a leftover
    * 'errored' or 'crash-looping'), so its owner starts it deliberately. A name
    * with a record but no app state (the app was deleted) just loses the record.
+   * A container's children are left 'stopped' the same way, except any that
+   * another record still refuses; none is started. The restart path is a
+   * redeploy of the container, or a start per child.
    */
   async unsuspendApp(appName: string): Promise<UnsuspendAppResult> {
     // The store matches ignoring case: lifting this name would lift another app's.
@@ -10234,6 +10237,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const lifted = await getSuspensionStore().unsuspend(appName);
     if (lifted && this.stateManager?.getApp(appName)) {
       await this.stateManager.setAppStatus(appName, 'stopped', { error: undefined });
+    }
+    if (lifted && this.stateManager) {
+      for (const child of childrenOf(appName)) {
+        if (this.stateManager.getApp(child) && refusalForApp(child) === null) {
+          await this.stateManager.setAppStatus(child, 'stopped', { error: undefined });
+        }
+      }
     }
     return { unsuspended: lifted };
   }
@@ -12338,8 +12348,51 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // accumulating the data.
       void this.sweepGuestRetention();
       void this.sweepRetiredObjectStorage();
+      // Its own chain too: retries a take-down that failed, and finds an
+      // instance a suspension missed.
+      void this.reconcileSuspensions();
     }, 15 * 60 * 1000);
     this.idleSweepTimer.unref?.();
+  }
+
+  /**
+   * Idempotent: every app a suspension RECORD refuses (its own, or its
+   * container's) has no live instance and is 'stopped'. Retries what
+   * `suspendApp` could not finish. Acts on the `record` reason only, so an
+   * unreadable store never takes anything down, and by the DESTRUCTIVE
+   * attribution (`childrenOf`) for a container's record, so a case-insensitive
+   * gate reading never reaches an app the container does not own. Skips apps
+   * mid-operation; they are caught on the next pass. Not run at boot.
+   */
+  private async reconcileSuspensions(): Promise<void> {
+    const state = this.stateManager;
+    if (!this.runtime || !state) return;
+    for (const app of state.getAllApps()) {
+      const name = app.name;
+      try {
+        if (this.appsInProgress.has(name)) continue;
+        const verdict = refusalForApp(name);
+        if (verdict?.reason !== 'record') continue;
+        if (verdict.via !== undefined && !childrenOf(verdict.via).includes(name)) continue;
+        const live = await this.runtimeInstancesOf(name);
+        const current = state.getApp(name);
+        if (live.length === 0 && (!current || current.status === 'stopped')) continue;
+        this.logger.warn(
+          `Suspended app '${name}' was still up (${live.length} instance(s), status '${current?.status}'): taking it down`,
+          'SUSPEND'
+        );
+        const errors = await this.takeAppDown(name, { revokeKey: true });
+        if (errors.length > 0) {
+          this.logger.warn(`Suspended app '${name}' is NOT fully down: ${errors.join('; ')}`, 'SUSPEND');
+        }
+        if (state.getApp(name)) await state.setAppStatus(name, 'stopped', { error: 'Suspended by admin' });
+      } catch (err) {
+        this.logger.warn(
+          `Could not reconcile the suspension of '${name}': ${err instanceof Error ? err.message : String(err)}`,
+          'SUSPEND'
+        );
+      }
+    }
   }
 
   /**

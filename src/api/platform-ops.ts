@@ -238,10 +238,12 @@ export type RedeployStart =
 
 /** What `suspendApp` did: the app is down, or the suspension was refused. */
 export type SuspendAppResult =
-  /** `stopErrors` names instances still live afterwards; the suspension is recorded regardless. */
+  /**
+   * `stopErrors` names what is still live afterwards; the suspension is recorded regardless.
+   * A monorepo container's services are taken down with it: an error of the app
+   * itself is unprefixed, one of a service is prefixed `<service>: `.
+   */
   | { suspended: true; at: string; stopErrors?: string[] }
-  /** A monorepo container runs nothing itself - its services are the runtime apps. */
-  | { refused: 'group-container'; services: string[] }
   /** Another existing app differs only in case; the store matches ignoring case, so it would be suspended too. */
   | { refused: 'case-collision'; names: string[] };
 

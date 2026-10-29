@@ -358,6 +358,12 @@ export class AppStateManager {
       ...updates,
       updatedAt: new Date().toISOString(),
     };
+    // `groupTrusted` is the trust decision made for the owner who expanded this
+    // container. A new owner has made none: drop it (read as legacy, which gates
+    // cautiously and destroys narrowly) unless the same write sets it afresh.
+    if ('userId' in updates && updates.userId !== app.userId && !('groupTrusted' in updates)) {
+      delete updated.groupTrusted;
+    }
 
     this.apps.set(name, updated);
     this.scheduleSave();
