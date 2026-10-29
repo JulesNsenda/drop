@@ -9407,8 +9407,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // what the gate would, marked `replaced`, and the caller's existing catch
     // settles once and closes the episode. Never report the app running or arm
     // watches that would restart what the suspension took away.
+    // A record (or a stop) only: an unreadable store must not fail a deploy whose
+    // new version is already serving.
     try {
-      this.gateBeforeSwap(appName, ctx);
+      if (ctx?.stop || refusalForApp(appName)?.reason === 'record') this.gateBeforeSwap(appName, ctx);
     } catch (error) {
       const late =
         error instanceof StartRefused && !ctx && error.cause.kind === 'suspended'

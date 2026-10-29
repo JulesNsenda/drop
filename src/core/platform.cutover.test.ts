@@ -517,6 +517,26 @@ describe('zero-downtime cutover (#298 step 5)', () => {
       expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
     }, 30000);
 
+    it('an unreadable store during the drain does not fail the deploy: it completes running', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const internals = platform as unknown as CutoverInternals & { cutoverDrainMs: () => number };
+      jest.spyOn(console, 'error').mockImplementation();
+      jest.spyOn(internals, 'cutoverDrainMs').mockImplementation(() => {
+        void (async () => {
+          await fs.writeFile(path.join(tempDir, 'data', 'drop-svc', 'suspensions.json'), '{ broken');
+          await getSuspensionStore().load();
+        })();
+        return 400;
+      });
+
+      await redeploy('site', appPath, 'v2');
+
+      expect(getStateManager().getApp('site')?.status).toBe('running');
+      expect(getDeployTracker().getEpisodes('site')[0].status).toBe('succeeded');
+    }, 30000);
+
     it('after the config writes, before the traffic switch: the config is put back and traffic does not move', async () => {
       platform = makePlatform();
       await platform.start();
