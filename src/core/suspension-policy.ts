@@ -103,15 +103,12 @@ function containersOf(name: string, deps: SuspensionPolicyDeps): string[] {
   return [...found];
 }
 
-/**
- * The members of `group` (state and config, never a container, never `except`),
- * plus any app stamped with `container`. Used for "group frozen" and fan-out.
- */
+/** The members of `group` (state and config, never a container, never `except`). Used for "group frozen". */
 function membersOfGroup(
   group: string,
   same: NameMatch,
   deps: SuspensionPolicyDeps,
-  opts: { except?: string; container?: string } = {}
+  opts: { except?: string } = {}
 ): string[] {
   const found = new Set<string>();
   for (const app of deps.state?.getAllApps() ?? []) {
@@ -119,9 +116,7 @@ function membersOfGroup(
   }
   for (const config of deps.configs?.getAllConfigs() ?? []) {
     if (deps.state?.getApp(config.name)?.isGroupContainer) continue;
-    if (same(config.group, group) || (opts.container !== undefined && config.groupContainer === opts.container)) {
-      found.add(config.name);
-    }
+    if (same(config.group, group)) found.add(config.name);
   }
   found.delete(opts.except ?? '');
   return [...found];
@@ -181,15 +176,18 @@ export function refusalForApp(name: string, deps: SuspensionPolicyDeps = default
 }
 
 /**
- * The apps that run under `container`: its group's members and any app stamped
- * with its name. Empty unless `container` is a CURRENT container, so an ordinary
- * app, or a stale name, has none.
+ * The apps that run under `container`: exactly those `refusalForApp` would
+ * refuse on its record (rule 2), so the fan-out, the unsuspend and the boot sweep
+ * can never disagree with the gate. Empty unless `container` is a CURRENT
+ * container, so an ordinary app, or a stale name, has none.
  */
 export function childrenOf(container: string, deps: SuspensionPolicyDeps = defaultDeps()): string[] {
   if (!isCurrentContainer(container, deps)) return [];
-  const group = groupOfContainer(container, deps);
-  if (group === undefined) return [];
-  return membersOfGroup(group, sameNameFor(container, deps), deps, { except: container, container });
+  const names = new Set<string>();
+  for (const app of deps.state?.getAllApps() ?? []) names.add(app.name);
+  for (const config of deps.configs?.getAllConfigs() ?? []) names.add(config.name);
+  names.delete(container);
+  return [...names].filter((name) => containersOf(name, deps).includes(container));
 }
 
 /**

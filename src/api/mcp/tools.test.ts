@@ -785,6 +785,18 @@ describe('MCP tool handlers', () => {
         });
       });
 
+      it('a child known only by its stamp (no state group) reads suspended too', async () => {
+        const state = getStateManager();
+        await state.registerApp('alice-site', path.join(tempDir, 'alice-site'));
+        await state.updateApp('alice-site', { userId: alice.userId, isGroupContainer: true, group: 'alice-site' } as never);
+        await getAppConfigService().upsertSystemConfig('alice-app', { groupContainer: 'alice-site' });
+        await getSuspensionStore().suspend('alice-site', 'admin-1');
+
+        expect(firstText(await handleAppStatus(alice, { name: 'alice-app' }))).toContain(
+          'suspended: record (via alice-site)'
+        );
+      });
+
       it("the suspension store's own state is for an admin; anyone else sees a plain record", async () => {
         const storeFile = path.join(tempDir, 'unreadable-suspensions.json');
         await fs.writeFile(storeFile, '{ broken');

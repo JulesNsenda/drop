@@ -4760,20 +4760,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
     }
 
-    // A suspension holding this GROUP: a member's record (a renamed service must
-    // not escape it), or a record that is the group's very name (its children
-    // would be served on that app's host). Before the provenance and claimant
-    // guards, so the refusal names the suspension and not drop.yaml.
-    heldGroup = { group, trusted: containerTrusted };
-    const stoppedByGroup = containerStopped();
-    if (stoppedByGroup) {
-      this.logger.info(
-        `Not expanding '${repoName}': group '${group}' is held by the suspension of '${stoppedByGroup.via ?? repoName}'`,
-        'MONOREPO'
-      );
-      return stoppedByGroup;
-    }
-
     // PROVENANCE GUARD, ahead of the group tag and every child: a child
     // records the container that materialized it (`groupContainer`), and a
     // group holding a child stamped by ANOTHER container is not this one's to
@@ -4937,6 +4923,44 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Monorepo group '${group}' is already in use by another account. ` +
           'Choose a different `group:` in drop.yaml.'
       );
+    }
+
+    // A suspension holding this GROUP. AFTER the provenance, adoption and claimant
+    // guards, so a foreign container naming someone else's group is refused by
+    // those and never learns (in a tenant-readable episode) that a member of it
+    // is suspended; whatever reaches here is this container's own group.
+    //
+    // A NEW group whose name is a suspension record is a naming conflict (its
+    // children would be served on that app's host): refused like a claimed name,
+    // with the real cause in the log only. An EXISTING group that later comes to
+    // match a record is the owner's own: refused as a suspension, naming it.
+    const nameHeld = refusalForGroupName(group, repoName);
+    if (nameHeld) {
+      const groupHasMembers =
+        (this.stateManager?.getAllApps() ?? []).some(
+          (a) => a.name !== repoName && !a.isGroupContainer && sameName(a.group, group)
+        ) ||
+        (this.appConfigService?.getAllConfigs() ?? []).some((c) => c.name !== repoName && sameName(c.group, group));
+      if (!groupHasMembers) {
+        this.logger.error(
+          `Refusing monorepo group '${group}' for '${repoName}': the name is a suspension record (${nameHeld.via}).`,
+          'MONOREPO'
+        );
+        throw new Error(
+          `Monorepo group '${group}' is already in use by another account. ` +
+            'Choose a different `group:` in drop.yaml.'
+        );
+      }
+    }
+    // A member's record freezes the group (a renamed service must not escape it).
+    heldGroup = { group, trusted: containerTrusted };
+    const stoppedByGroup = containerStopped();
+    if (stoppedByGroup) {
+      this.logger.info(
+        `Not expanding '${repoName}': group '${group}' is held by the suspension of '${stoppedByGroup.via ?? repoName}'`,
+        'MONOREPO'
+      );
+      return stoppedByGroup;
     }
 
     // Synchronously before the write: the awaits above can outlive a suspension,

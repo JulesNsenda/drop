@@ -251,6 +251,25 @@ describe('suspension policy: refusalForApp', () => {
       expect(childrenOf('nobody', depsOf(apps))).toEqual([]);
     });
 
+    it("agrees exactly with the gate: a stamped child that moved to another group is neither refused nor a child", async () => {
+      await store.suspend('site', 'admin');
+      const apps = [
+        container('site'),
+        { name: 'site-web', group: 'site', groupContainer: 'site' },
+        { name: 'moved', group: 'elsewhere', groupContainer: 'site' },
+        { name: 'site-api', cfgGroup: 'site', configOnly: true },
+        { name: 'bystander', group: 'other' },
+        container('site-two', { group: 'site' }),
+      ];
+      const deps = depsOf(apps);
+      const refusedVia = apps
+        .map((a) => a.name)
+        .filter((name) => refusalForApp(name, deps)?.via === 'site')
+        .sort();
+      expect(childrenOf('site', deps).sort()).toEqual(refusedVia);
+      expect(refusedVia).toEqual(['site-api', 'site-web']);
+    });
+
     it('never includes another container of the same group', () => {
       const apps = [container('site'), container('site-two', { group: 'site' }), { name: 'site-web', group: 'site' }];
       expect(childrenOf('site', depsOf(apps))).toEqual(['site-web']);

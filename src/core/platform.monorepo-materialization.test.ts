@@ -291,12 +291,16 @@ describe('expandMonorepo re-materializing a live child', () => {
   describe('a group named after a suspension record', () => {
     const grouped = (group: string) => ({ group, services: { frontend: { path: 'frontend', type: 'static' } } });
 
-    it('a NEW group whose name is a record (even of a deleted app) is refused, naming the suspension', async () => {
+    it('a NEW group whose name is a record (even of a deleted app) is refused as a naming conflict, saying nothing of the suspension', async () => {
       await getSuspensionStore().suspend('shared', 'admin-1');
 
-      const result = await (platform as any).expandMonorepo(repoPath, repoName, grouped('shared'));
+      const refusal = await (platform as any).expandMonorepo(repoPath, repoName, grouped('shared')).then(
+        () => undefined,
+        (err: Error) => err
+      );
 
-      expect(result).toEqual({ suspended: 'record', via: 'shared' });
+      expect(refusal?.message).toMatch(/already in use by another account/);
+      expect(refusal?.message).not.toMatch(/suspend/i);
       expect(await exists(path.join(appsDir, 'shared-frontend'))).toBe(false);
       expect(await exists(childPath())).toBe(false);
       expect(handleBuildApp).not.toHaveBeenCalled();
@@ -305,9 +309,9 @@ describe('expandMonorepo re-materializing a live child', () => {
     it('matches the record ignoring case', async () => {
       await getSuspensionStore().suspend('Shared', 'admin-1');
 
-      const result = await (platform as any).expandMonorepo(repoPath, repoName, grouped('shared'));
-
-      expect(result).toEqual({ suspended: 'record', via: 'Shared' });
+      await expect((platform as any).expandMonorepo(repoPath, repoName, grouped('shared'))).rejects.toThrow(
+        /already in use by another account/
+      );
     });
 
     it('an EXISTING group whose name later matches a record gets the same refusal (not a drop.yaml message), and nothing is touched', async () => {
