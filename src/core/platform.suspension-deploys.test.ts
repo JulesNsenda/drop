@@ -406,6 +406,131 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
     }, 20000);
   });
 
+  describe('the children of a suspended container (a plain app reclassified mid-expansion)', () => {
+    /** A deployed child 'site-web' of 'site', stamped as expansion stamps it, before the container's suspension lands. */
+    async function stampedChild(): Promise<string> {
+      const childPath = await deploy('site-web');
+      await getAppConfigService().upsertSystemConfig('site-web', { groupContainer: 'site' });
+      return childPath;
+    }
+
+    it("a child's redeploy waiting for a build slot is refused when its container is suspended during the wait", async () => {
+      platform = makePlatform();
+      await platform.start();
+      const childPath = await stampedChild();
+      const builder = internals().builder as unknown as {
+        reserveSlot: (name: string) => Promise<() => void>;
+        waitingApps: Set<string>;
+      };
+      const build = jest.spyOn(internals().builder!, 'build');
+      const held = await Promise.all(['occ1', 'occ2', 'occ3'].map((n) => builder.reserveSlot(n)));
+
+      const run = internals().handleAppUpdate('site-web', childPath, 'file change', true);
+      for (let i = 0; i < 500 && !builder.waitingApps.has('site-web'); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(builder.waitingApps.has('site-web')).toBe(true);
+      await getSuspensionStore().suspend('site', 'admin-1');
+      held.forEach((release) => release());
+
+      expect(await run).toBe(false);
+      expect(build).not.toHaveBeenCalled();
+      expect(internals().appsInProgress.has('site-web')).toBe(false);
+    }, 20000);
+
+    it('drainPendingBuilds does not build a queued child of a suspended container', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const childPath = await createStaticApp('site-web');
+      await getStateManager().registerApp('site-web', childPath, 'static');
+      await getAppConfigService().upsertSystemConfig('site-web', { groupContainer: 'site' });
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const build = jest.spyOn(internals().builder!, 'build');
+      const pending = (platform as unknown as {
+        pendingBuilds: Map<string, { appPath: string; appType: string }>;
+        drainPendingBuilds: () => Promise<void>;
+      });
+      pending.pendingBuilds.set('site-web', { appPath: childPath, appType: 'static' });
+
+      await pending.drainPendingBuilds();
+      await new Promise((r) => setTimeout(r, 200));
+
+      expect(build).not.toHaveBeenCalled();
+      expect(fakeRuntime.startCount).toBe(0);
+      expect(internals().appsInProgress.has('site-web')).toBe(false);
+    }, 20000);
+
+    it("the owner's start of a registered child is refused with the container's reason", async () => {
+      platform = makePlatform();
+      await platform.start();
+      await stampedChild();
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const starts = fakeRuntime.startCount;
+      const restarts = fakeRuntime.restartCount;
+
+      await expect(platform.restartApp('site-web')).rejects.toMatchObject({
+        code: 'APP_SUSPENDED',
+        reason: 'record',
+      });
+
+      expect(fakeRuntime.startCount).toBe(starts);
+      expect(fakeRuntime.restartCount).toBe(restarts);
+    }, 20000);
+
+    it('a child of an UNsuspended container is unaffected', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const childPath = await stampedChild();
+      await getSuspensionStore().suspend('other', 'admin-1');
+      const build = jest.spyOn(internals().builder!, 'build');
+
+      await expect(platform.restartApp('site-web')).resolves.toBeDefined();
+      expect(await internals().handleAppUpdate('site-web', childPath, 'file change', true)).toBe(true);
+      expect(build).toHaveBeenCalled();
+    }, 30000);
+  });
+
+  describe('the episode code says why the start was refused', () => {
+    it('a reExpandContainer held while the store is unreadable closes its episode as DEPLOY_REFUSED', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deploy('site');
+      jest.spyOn(internals(), 'expandMonorepo').mockResolvedValue({ suspended: 'store-unreadable' });
+
+      await internals().reExpandContainer(
+        'site',
+        appPath,
+        { services: { web: { path: 'web', type: 'static' } } },
+        { principalId: 'p-1' },
+        jest.fn()
+      );
+
+      const episodes = getDeployTracker().getEpisodes('site');
+      const codes = episodes.map((e) => getDeployDetailStore().getDetail(e.deployId)?.errorCode);
+      expect(codes).toContain('DEPLOY_REFUSED');
+      expect(codes).not.toContain('DEPLOY_STOPPED');
+    }, 20000);
+
+    it('a first deploy (no episode open) refused because the store is unreadable reports DEPLOY_REFUSED', async () => {
+      platform = makePlatform();
+      await platform.start();
+      jest.spyOn(console, 'error').mockImplementation();
+      const appPath = await createStaticApp('fresh');
+      await getStateManager().registerApp('fresh', appPath, 'static');
+      const original = internals().prepareDeployTarget.bind(platform);
+      jest.spyOn(internals(), 'prepareDeployTarget').mockImplementationOnce(async (...args) => {
+        const target = await original(...args);
+        await fs.writeFile(path.join(tempDir, 'data', 'drop-svc', 'suspensions.json'), '{ broken');
+        await getSuspensionStore().load();
+        return target;
+      });
+
+      await internals().handleBuildApp(appPath, 'fresh', 'static');
+
+      const [episode] = getDeployTracker().getEpisodes('fresh');
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
+    }, 20000);
+  });
+
   describe('a re-check right before the build runs tenant code', () => {
     it('a first deploy: a suspension landing after the target is prepared builds nothing and leaves the app stopped, not errored', async () => {
       platform = makePlatform();

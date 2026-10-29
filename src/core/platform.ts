@@ -161,6 +161,7 @@ import {
   AppManifestInvalidError,
   AppNeedsConfigError,
   AppSuspendedError,
+  suspensionEpisodeCode,
   needsConfigAction,
   StaleDependenciesError,
   setPlatformOps,
@@ -892,12 +893,23 @@ type UpdateRefused =
   | { refused: 'suspended'; suspension: SuspensionRefusal; retryAfterSeconds?: undefined };
 
 /**
- * The episode code for a suspended refusal: DEPLOY_STOPPED only for an
- * administrator's record. When the store merely cannot answer, nobody stopped
- * anything and the old instance may still be serving, so it is a refusal.
+ * Why a start or build of the app must be refused, or null: its own suspension,
+ * or the suspension of the container stamped on it as `groupContainer`. A real
+ * container cannot be suspended (the suspend route answers 409), so the second
+ * clause only ever catches the children of a plain app that was suspended while
+ * it was being reclassified as a monorepo container: they serve on its hostname.
+ * The refusal is the container's own reason. Synchronous (the config cache and
+ * the store both answer from memory).
  */
-function suspensionEpisodeCode(reason: SuspensionRefusal): 'DEPLOY_STOPPED' | 'DEPLOY_REFUSED' {
-  return reason === 'record' ? 'DEPLOY_STOPPED' : 'DEPLOY_REFUSED';
+function suspensionRefusalOf(
+  appName: string,
+  configs: Pick<AppConfigService, 'getConfig'> | null
+): SuspensionRefusal | null {
+  const store = getSuspensionStore();
+  const own = store.refusalFor(appName);
+  if (own) return own;
+  const container = configs?.getConfig?.(appName)?.groupContainer;
+  return container && container !== appName ? store.refusalFor(container) : null;
 }
 
 /**
@@ -905,8 +917,11 @@ function suspensionEpisodeCode(reason: SuspensionRefusal): 'DEPLOY_STOPPED' | 'D
  * every entry, ahead of the stale-tree and container exemptions (a stopped
  * app's stale marker is tenant-forgeable), and uncharged: no quota, no breaker.
  */
-function suspendedUpdateRefusal(appName: string): UpdateRefused | null {
-  const suspension = getSuspensionStore().refusalFor(appName);
+function suspendedUpdateRefusal(
+  appName: string,
+  configs: Pick<AppConfigService, 'getConfig'> | null
+): UpdateRefused | null {
+  const suspension = suspensionRefusalOf(appName, configs);
   return suspension ? { refused: 'suspended', suspension } : null;
 }
 
@@ -4734,7 +4749,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // record the expansion as a success. Checked again at each point below
     // where an await has passed, because a suspension can land mid-expansion.
     const containerStopped = (): { suspended: SuspensionRefusal } | null => {
-      const refusal = suspendedUpdateRefusal(repoName);
+      const refusal = suspendedUpdateRefusal(repoName, this.appConfigService);
       return refusal ? { suspended: refusal.suspension! } : null;
     };
     const stoppedAtEntry = containerStopped();
@@ -5121,7 +5136,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.logger.info(`Not expanding '${repoName}': app was suspended during the expansion`, 'MONOREPO');
           return stoppedBeforeCopy;
         }
-        if (suspendedUpdateRefusal(childName)) {
+        if (suspendedUpdateRefusal(childName, this.appConfigService)) {
           this.logger.info(`Skipping service '${svcName}': '${childName}' is suspended`, 'MONOREPO');
           continue;
         }
@@ -5415,7 +5430,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               'MONOREPO'
             );
             return containerStopped()!;
-          } else if (suspendedUpdateRefusal(childName)) {
+          } else if (suspendedUpdateRefusal(childName, this.appConfigService)) {
             this.logger.info(
               `Not building service '${svcName}': '${childName}' was suspended during expansion`,
               'MONOREPO'
@@ -5502,7 +5517,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Decided BEFORE the drop.yaml is read, so a container-shaped tree under a
     // suspended name is not intercepted and expanded into children either.
-    const suspendedHere = suspendedUpdateRefusal(payload.name) !== null;
+    const suspendedHere = suspendedUpdateRefusal(payload.name, this.appConfigService) !== null;
 
     // Monorepo interception (M2): a root drop.yaml with a `services:` map
     // describes a group container, never a single app. Materialize each
@@ -5646,7 +5661,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // THE build choke point for a suspended app: a build runs tenant code, so
     // it is refused before 'building' is written, before the deferral queue and
     // before any guardrail key is taken.
-    if (suspendedUpdateRefusal(appName)) {
+    if (suspendedUpdateRefusal(appName, this.appConfigService)) {
       this.logger.info(`Not building ${appName} - app is suspended`, 'BUILD');
       return;
     }
@@ -7756,7 +7771,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // A suspended app is refused FIRST: before the stale-tree and container
     // exemptions below (a stopped app's stale marker is tenant-forgeable), and
     // before anything is claimed, charged or built.
-    if (suspendedUpdateRefusal(appName)) {
+    if (suspendedUpdateRefusal(appName, this.appConfigService)) {
       this.logger.info(`Dropped update for ${appName} - app is suspended`, 'UPDATE');
       return false;
     }
@@ -8433,7 +8448,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
   > {
     // FIRST: before the stale-tree and container exemptions, and before any charge.
-    const suspended = suspendedUpdateRefusal(appName);
+    const suspended = suspendedUpdateRefusal(appName, this.appConfigService);
     if (suspended) return redeployRefusalOf(appName, suspended);
     const appState = this.stateManager!.getApp(appName);
     if (!appState) return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
@@ -8643,7 +8658,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     // Suspended while it waited: the entry check is stale after a long wait.
     // Before the stopped exemption below (an app stopped at entry proceeds).
-    const suspended = suspendedUpdateRefusal(appName);
+    const suspended = suspendedUpdateRefusal(appName, this.appConfigService);
     if (suspended) {
       this.logger.info(`Dropped redeploy for ${appName} - app was suspended while waiting for a build slot`, 'UPDATE');
       releaseSlot();
@@ -9834,7 +9849,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     // The refusal says WHY (a record, an unreadable store, a store not yet
     // loaded), rather than attributing it to an administrator who never acted.
-    const refusal = getSuspensionStore().refusalFor(appName);
+    const refusal = suspensionRefusalOf(appName, this.appConfigService);
     if (refusal) throw new AppSuspendedError(appName, refusal);
   }
 
@@ -9919,7 +9934,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (opts.closeEpisode && !opts.progress?.episodeClosed && this.deployEpisodeOpen(appName)) {
       if (opts.progress) opts.progress.episodeClosed = true;
       await attempt('close the deploy episode', () =>
-        this.failDeployEpisode(appName, new Error(shown), undefined, 'DEPLOY_STOPPED')
+        this.failDeployEpisode(
+          appName,
+          new Error(shown),
+          undefined,
+          cause.kind === 'suspended' ? suspensionEpisodeCode(cause.reason) : 'DEPLOY_STOPPED'
+        )
       );
     }
     await attempt('close the runtime-log window', () => this.noteRuntimeLogEnd(appName));

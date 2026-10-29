@@ -99,6 +99,15 @@ export class AppSuspendedError extends Error {
 }
 
 /**
+ * The episode code for a suspended refusal: DEPLOY_STOPPED only for an
+ * administrator's record. When the store merely cannot answer, nobody stopped
+ * anything and the old instance may still be serving, so it is a refusal.
+ */
+export function suspensionEpisodeCode(reason: AppSuspendedReason): 'DEPLOY_STOPPED' | 'DEPLOY_REFUSED' {
+  return reason === 'record' ? 'DEPLOY_STOPPED' : 'DEPLOY_REFUSED';
+}
+
+/**
  * Thrown before a start, restart, rollback, promotion or attach that would run
  * a node_modules tree built for a different Node runtime. Those entry points
  * throw it before touching anything; the start-spec backstop beneath them can

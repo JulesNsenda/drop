@@ -609,7 +609,8 @@ describe('app suspension (platform, Item 1)', () => {
       expect(app.error).not.toContain('Suspended by admin');
       expect(app.error).not.toContain('suspension store');
       const [episode] = getDeployTracker().getEpisodes('site');
-      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+      // Nobody stopped anything (the store cannot answer): a refusal, not a stop.
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
       // The episode detail is tenant-readable too: no store state there either.
       expect(JSON.stringify(getDeployDetailStore().getDetail(episode.deployId))).not.toContain('suspension store');
     }, 30000);
