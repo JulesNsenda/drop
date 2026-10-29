@@ -48,9 +48,10 @@ import {
   selectImageUser,
 } from './container-config';
 import { AppType } from '../../core/detector/detector.types';
+import { CONTAINER_NAME_PREFIX, PLATFORM_SERVICE_LABEL } from './platform-containers';
 
 /** Prefix for all DROP-managed container names. */
-const NAME_PREFIX = 'drop-';
+const NAME_PREFIX = CONTAINER_NAME_PREFIX;
 
 /** Docker label applied to every DROP-managed container. */
 const MANAGED_LABEL = 'drop.managed';
@@ -430,6 +431,7 @@ export class ContainerManager implements AppRuntime {
   async stop(name: string): Promise<void> {
     const instance = this.live.resolve(name);
     this.stopLogTailer(instance);
+    await this.refuseIfPlatformContainer(containerName(instance));
     const container = this.docker.getContainer(containerName(instance));
     try {
       await container.stop({ t: STOP_GRACE_SECONDS });
@@ -441,6 +443,7 @@ export class ContainerManager implements AppRuntime {
   async restart(name: string): Promise<AppProcessInfo> {
     const instance = this.live.resolve(name);
     this.stopLogTailer(instance);
+    await this.refuseIfPlatformContainer(containerName(instance));
     const container = this.docker.getContainer(containerName(instance));
     await container.restart({ t: STOP_GRACE_SECONDS });
     return {
@@ -452,6 +455,7 @@ export class ContainerManager implements AppRuntime {
   async delete(name: string): Promise<void> {
     const instance = this.live.resolve(name);
     this.stopLogTailer(instance);
+    await this.refuseIfPlatformContainer(containerName(instance));
     const container = this.docker.getContainer(containerName(instance));
     try {
       await container.stop({ t: STOP_GRACE_SECONDS });
@@ -472,6 +476,8 @@ export class ContainerManager implements AppRuntime {
       const instance = this.live.resolve(name);
       const container = this.docker.getContainer(containerName(instance));
       const info = await container.inspect();
+      // A platform container is not an app: report it as absent, never as this app's.
+      if (this.isPlatformContainer(info)) return null;
       const base = { ...this.inspectToInfo(appNameOfInstance(instance), info), instance };
       if (base.status === 'running') {
         const stats = await this.fetchContainerStats(container);
@@ -498,10 +504,12 @@ export class ContainerManager implements AppRuntime {
   }
 
   async getAllStatus(): Promise<AppProcessInfo[]> {
-    const containers = await this.docker.listContainers({
-      all: true,
-      filters: JSON.stringify({ label: [`${MANAGED_LABEL}=true`] }),
-    });
+    const containers = (
+      await this.docker.listContainers({
+        all: true,
+        filters: JSON.stringify({ label: [`${MANAGED_LABEL}=true`] }),
+      })
+    ).filter((c) => !c.Labels?.[PLATFORM_SERVICE_LABEL]);
 
     // Parity with getStatus(): a RUNNING container must carry live cpu/memory.
     // inspect() alone leaves both at 0 (see inspectToInfo), and 0 is
@@ -783,7 +791,34 @@ export class ContainerManager implements AppRuntime {
     return DROP_NET_GATEWAY;
   }
 
+  /** Whether an inspected container is one the platform runs for itself (bundled Redis), not a tenant app. */
+  private isPlatformContainer(info: Docker.ContainerInspectInfo | undefined): boolean {
+    return Boolean(info?.Config?.Labels?.[PLATFORM_SERVICE_LABEL]);
+  }
+
+  /**
+   * Throws when `cName` is a platform service container. Every by-name mutation
+   * calls this first: the app-name rules reserve these names, but a container
+   * that already holds one must still never be stopped, replaced or removed on
+   * an app's behalf. Inspects only; a missing container is fine.
+   */
+  private async refuseIfPlatformContainer(cName: string): Promise<void> {
+    let info: Docker.ContainerInspectInfo | undefined;
+    try {
+      info = await this.docker.getContainer(cName).inspect();
+    } catch (err: unknown) {
+      if (this.isNotFound(err)) return;
+      throw err;
+    }
+    if (this.isPlatformContainer(info)) {
+      throw new Error(
+        `Refusing to act on ${cName}: it is a platform service container, not an app`
+      );
+    }
+  }
+
   private async removeIfExists(cName: string): Promise<void> {
+    await this.refuseIfPlatformContainer(cName);
     try {
       const c = this.docker.getContainer(cName);
       await c.remove({ force: true });
