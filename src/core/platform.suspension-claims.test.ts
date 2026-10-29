@@ -152,6 +152,69 @@ describe('handleConfigureRoute: hosts claimed by a suspension', () => {
     expect(hostsOf('fine')).toEqual(['*.example.com']);
   });
 
+  describe('first holder wins for a group host', () => {
+    async function configured(name: string, extra: Record<string, unknown> = {}): Promise<void> {
+      await register(name);
+      await getAppConfigService().upsertSystemConfig(name, { type: 'static', path: path.join(appsDir, name), ...extra });
+    }
+    async function routeYaml(app: string): Promise<void> {
+      await fs.mkdir(path.join(appsDir, app), { recursive: true });
+      await fs.writeFile(path.join(appsDir, app, 'drop.yaml'), 'route:\n  path: /\n');
+    }
+
+    it('a tenant already serving foo.<suffix> keeps it when a group named foo appears', async () => {
+      await configured('tenant-a');
+      await declareDomains('tenant-a', ['foo.dropkit.sh']);
+      await (platform as any).handleConfigureRoute('tenant-a', 4100);
+      expect(hostsOf('tenant-a')).toEqual(['foo.dropkit.sh']);
+
+      await register('foo', { group: 'foo', isGroupContainer: true });
+      await register('foo-web', { group: 'foo' });
+      await getAppConfigService().upsertSystemConfig('foo-web', { type: 'static', path: path.join(appsDir, 'foo-web'), group: 'foo' });
+      await routeYaml('foo-web');
+      await (platform as any).handleConfigureRoute('foo-web', 4200);
+      await (platform as any).handleConfigureRoute('tenant-a', 4100);
+
+      // The group's default route on that host is not added; the child keeps its own host.
+      expect(hostsOf('foo-web')).toEqual(['foo-web.dropkit.sh']);
+      expect(hostsOf('tenant-a')).toEqual(['foo.dropkit.sh']);
+    });
+
+    it('the other order: a group already serving foo.<suffix> refuses a tenant\'s later claim', async () => {
+      await register('foo', { group: 'foo', isGroupContainer: true });
+      await register('foo-web', { group: 'foo' });
+      await getAppConfigService().upsertSystemConfig('foo-web', { type: 'static', path: path.join(appsDir, 'foo-web'), group: 'foo' });
+      await routeYaml('foo-web');
+      await (platform as any).handleConfigureRoute('foo-web', 4200);
+      expect(hostsOf('foo-web')).toEqual(['foo.dropkit.sh']);
+
+      await configured('tenant-a');
+      await declareDomains('tenant-a', ['foo.dropkit.sh']);
+      await (platform as any).handleConfigureRoute('tenant-a', 4100);
+
+      expect(hostsOf('tenant-a')).toEqual(['tenant-a.dropkit.sh']);
+      expect(hostsOf('foo-web')).toEqual(['foo.dropkit.sh']);
+    });
+  });
+
+  it('a verified custom domain claimed since is withdrawn with its verification', async () => {
+    await register('site');
+    await getStateManager().updateApp('site', { customDomain: 'victim.dropkit.sh' } as never);
+    await getAppConfigService().upsertSystemConfig('site', {
+      type: 'static',
+      path: path.join(appsDir, 'site'),
+      customDomainVerified: { domain: 'victim.dropkit.sh', verifiedAt: '2026-10-29T00:00:00Z' },
+    });
+    await (platform as any).handleConfigureRoute('site', 4100);
+    expect(hostsOf('site')).toEqual(['site.dropkit.sh', 'victim.dropkit.sh']);
+
+    await getSuspensionStore().suspend('victim', 'admin-1');
+    await (platform as any).handleConfigureRoute('site', 4100);
+
+    expect(hostsOf('site')).toEqual(['site.dropkit.sh']);
+    expect(getAppConfigService().getConfig('site')?.customDomainVerified).toBeUndefined();
+  });
+
   it("a suspended app's own record claims nothing against itself", async () => {
     await register('site');
     await getSuspensionStore().suspend('site', 'admin-1');

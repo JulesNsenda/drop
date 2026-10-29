@@ -44,6 +44,7 @@ import { getStateManager } from '../managers/app/state-manager';
 import type { AppStateManager } from '../managers/app/state-manager';
 import { getAppConfigServiceOrNull } from '../managers/app/app-config';
 import type { AppConfigService } from '../managers/app/app-config';
+import { AppSuspendedError } from '../api/platform-ops';
 
 /** Why an app is refused: the reason, and the OTHER app whose record it is, if any. */
 export interface SuspensionVerdict {
@@ -60,19 +61,39 @@ export type StartRefusalCause =
   | { kind: 'suspended'; reason: SuspensionRefusal; via?: string }
   | { kind: 'stopped'; error?: string };
 
-/** Thrown by a gate that refuses a start, carrying the cause the closer settles by. */
+/**
+ * Thrown by a gate that refuses a start, carrying the cause the closer settles by.
+ * `replaced` says the swap had already happened when the refusal came (a cutover
+ * that moved traffic and was refused afterwards), so a caller must treat the new
+ * version as applied. (Named `refusal`, not `cause`: that would shadow Error.cause.)
+ */
 export class StartRefused extends Error {
   constructor(
     readonly appName: string,
-    readonly cause: StartRefusalCause
+    readonly refusal: StartRefusalCause,
+    readonly replaced: boolean = false
   ) {
     super(
-      cause.kind === 'stopped'
+      refusal.kind === 'stopped'
         ? `Application '${appName}' was stopped`
-        : `Starting '${appName}' is refused (${cause.reason}${cause.via ? `, via '${cause.via}'` : ''})`
+        : `Starting '${appName}' is refused (${refusal.reason}${refusal.via ? `, via '${refusal.via}'` : ''})`
     );
     this.name = 'StartRefused';
   }
+}
+
+/**
+ * The cause (and whether the swap had happened) of a refusal error, or null when
+ * `err` is not one. Accepts both shapes a refusal arrives in: `StartRefused`
+ * (a gate) and `AppSuspendedError` (the start choke point, which has no swap
+ * stage to speak of). Every catch that settles a refusal goes through this.
+ */
+export function refusalCauseOf(err: unknown): { cause: StartRefusalCause; replaced: boolean } | null {
+  if (err instanceof StartRefused) return { cause: err.refusal, replaced: err.replaced };
+  if (err instanceof AppSuspendedError) {
+    return { cause: { kind: 'suspended', reason: err.reason, via: err.via }, replaced: false };
+  }
+  return null;
 }
 
 /**
@@ -97,7 +118,7 @@ export function refusalEpisodeCode(
 export interface SuspensionPolicyDeps {
   store: Pick<SuspensionStore, 'refusalFor' | 'list'>;
   state: Pick<AppStateManager, 'getApp' | 'getAllApps'> | null;
-  configs: Pick<AppConfigService, 'getConfig' | 'getAllConfigs'> | null;
+  configs: (Pick<AppConfigService, 'getConfig' | 'getAllConfigs'> & Partial<Pick<AppConfigService, 'getDomainOwners'>>) | null;
 }
 
 function defaultDeps(): SuspensionPolicyDeps {
@@ -159,33 +180,45 @@ function allNames(deps: SuspensionPolicyDeps): string[] {
 function containersOf(name: string, use: Use, deps: SuspensionPolicyDeps): string[] {
   if (!deps.state || isStateContainer(name, deps)) return [];
   const groups = groupsOf(name, deps);
-  const found = new Map<string, { exactly: boolean; trusted: boolean }>();
-  const add = (container: string, exactly: boolean): void => {
-    found.set(container, { exactly, trusted: deps.state?.getApp(container)?.groupTrusted === true });
+  const found = new Map<string, { exactly: boolean; trusted: boolean; stamped: boolean }>();
+  const add = (container: string, exactly: boolean, stamped: boolean, trusted?: boolean): void => {
+    found.set(container, {
+      exactly,
+      trusted: trusted ?? deps.state?.getApp(container)?.groupTrusted === true,
+      stamped,
+    });
   };
   const stamp = deps.configs?.getConfig(name)?.groupContainer;
   if (stamp && stamp !== name) {
     const entry = deps.state.getApp(stamp);
     if (!entry) {
-      // No state entry at all: a folder-dropped (or unregistered) container. Nothing to compare.
-      add(stamp, false);
+      // No state entry at all: a folder-dropped (or unregistered) container, the operator's
+      // own. Nothing to compare: it is trusted and its stamp is exact.
+      add(stamp, true, true, true);
     } else if (entry.isGroupContainer) {
       // For THAT group: with no group to compare (a child mid-materialisation) the
       // stamp stands, because "cannot tell" must not read as "not a member".
       const group = groupOfContainer(stamp, deps);
       const same = sameNameFor(stamp, use, deps);
-      if (groups.length === 0 || groups.some((g) => same(group, g))) add(stamp, groups.some((g) => exact(group, g)));
+      if (groups.length === 0 || groups.some((g) => same(group, g))) {
+        add(stamp, groups.some((g) => exact(group, g)), true);
+      }
     }
     // A state entry that is not a container: the stamp is stale and names nothing.
   }
   for (const app of deps.state.getAllApps()) {
     if (!app.isGroupContainer || app.name === name || app.group === undefined) continue;
     const same = sameNameFor(app.name, use, deps);
-    if (groups.some((g) => same(app.group, g))) add(app.name, groups.some((g) => exact(app.group, g)));
+    if (groups.some((g) => same(app.group, g)) && !found.has(app.name)) {
+      add(app.name, groups.some((g) => exact(app.group, g)), false);
+    }
   }
-  // A child that matches a TRUSTED container exactly is that container's alone.
-  const exactlyTrusted = [...found].filter(([, v]) => v.trusted && v.exactly);
-  return (exactlyTrusted.length > 0 ? exactlyTrusted : [...found]).map(([container]) => container);
+  // A child that matches a TRUSTED container exactly is that container's alone: it
+  // narrows the containers found by GROUP NAME, never the one explicitly stamped.
+  const exactlyTrusted = new Set([...found].filter(([, v]) => v.trusted && v.exactly).map(([c]) => c));
+  return [...found]
+    .filter(([container, v]) => v.stamped || exactlyTrusted.size === 0 || exactlyTrusted.has(container))
+    .map(([container]) => container);
 }
 
 /** Whether `group`'s exact spelling belongs to a trusted container other than `except`. */
@@ -245,7 +278,7 @@ export function refusalForExpansion(
   group: string,
   trusted: boolean,
   deps: SuspensionPolicyDeps = defaultDeps()
-): { verdict: SuspensionVerdict | null; newGroupConflict: boolean } {
+): { verdict: SuspensionVerdict | null; newGroupConflict: boolean; hasMembers: boolean } {
   const same = trusted ? exact : ignoringCase;
   const members = new Set<string>();
   for (const app of deps.state?.getAllApps() ?? []) {
@@ -257,11 +290,15 @@ export function refusalForExpansion(
   members.delete(repoName);
   const mine = [...members].filter((m) => !groupsOf(m, deps).every((g) => exactlyHeldByOtherTrusted(g, repoName, deps)));
   for (const member of mine) {
-    if (deps.store.refusalFor(member) === 'record') return { verdict: { reason: 'record', via: member }, newGroupConflict: false };
+    if (deps.store.refusalFor(member) === 'record') {
+      return { verdict: { reason: 'record', via: member }, newGroupConflict: false, hasMembers: true };
+    }
   }
   const named = deps.store.list().find((r) => ignoringCase(r.name, group) && !ignoringCase(r.name, repoName));
-  if (named) return { verdict: { reason: 'record', via: named.name }, newGroupConflict: mine.length === 0 };
-  return { verdict: null, newGroupConflict: false };
+  if (named) {
+    return { verdict: { reason: 'record', via: named.name }, newGroupConflict: mine.length === 0, hasMembers: mine.length > 0 };
+  }
+  return { verdict: null, newGroupConflict: false, hasMembers: mine.length > 0 };
 }
 
 /**
@@ -277,19 +314,39 @@ export function refusalForExpansion(
  * Record claims come from `store.list()`, which is empty while the store is
  * unreadable: a corrupt store claims nothing and so withdraws no route.
  */
-export function hostClaims(domainSuffix: string, deps: SuspensionPolicyDeps = defaultDeps()): Map<string, Set<string>> {
-  const claims = new Map<string, Set<string>>();
-  const add = (label: string, holder: string): void => {
+export function hostClaims(
+  domainSuffix: string,
+  deps: SuspensionPolicyDeps = defaultDeps(),
+  owners?: Map<string, string>
+): Map<string, Set<string>> {
+  const groupHolders = new Map<string, Set<string>>();
+  const recordHolders = new Map<string, Set<string>>();
+  const put = (into: Map<string, Set<string>>, label: string, holder: string): void => {
     const host = `${label}.${domainSuffix}`.toLowerCase();
-    if (!claims.has(host)) claims.set(host, new Set());
-    claims.get(host)!.add(holder);
+    if (!into.has(host)) into.set(host, new Set());
+    into.get(host)!.add(holder);
   };
   for (const name of allNames(deps)) {
-    for (const group of groupsOf(name, deps)) add(group, name);
+    for (const group of groupsOf(name, deps)) put(groupHolders, group, name);
     const stamp = deps.configs?.getConfig(name)?.groupContainer;
-    if (stamp) for (const group of groupsOf(name, deps)) add(group, stamp);
+    if (stamp) for (const group of groupsOf(name, deps)) put(groupHolders, group, stamp);
   }
-  for (const record of deps.store.list()) add(record.name, record.name);
+  for (const record of deps.store.list()) put(recordHolders, record.name, record.name);
+
+  // The per-app owner map (persisted hostnames, `domains:`, verified custom domains,
+  // default hostnames) folded in, so there is ONE map. FIRST HOLDER WINS for a
+  // group host: a non-member that already owns it keeps it and the group yields;
+  // a record's host is the record's whoever else listed it.
+  const ownerOf = owners ?? deps.configs?.getDomainOwners?.(domainSuffix) ?? new Map<string, string>();
+  const claims = new Map<string, Set<string>>();
+  for (const host of new Set([...ownerOf.keys(), ...groupHolders.keys(), ...recordHolders.keys()])) {
+    const owner = ownerOf.get(host);
+    const record = recordHolders.get(host);
+    const group = groupHolders.get(host);
+    if (record) claims.set(host, record);
+    else if (group) claims.set(host, owner !== undefined && !group.has(owner) ? new Set([owner]) : group);
+    else if (owner !== undefined) claims.set(host, new Set([owner]));
+  }
   return claims;
 }
 

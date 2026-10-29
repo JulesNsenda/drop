@@ -739,6 +739,51 @@ describe('zero-downtime cutover (#298 step 5)', () => {
       expect(settled('site')).toBe(true);
     }, 30000);
 
+    it('a suspension during the drain of a promotion: the swap stands, the hold stays cleared, the episode closes', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      await getAppConfigService().updateConfig('site', { promotion: 'manual' });
+      await redeploy('site', appPath, 'v2');
+      const held = cfg('site')!.pendingPromotion!.releasePath!;
+      jest
+        .spyOn(platform as unknown as { cutoverDrainMs: () => number }, 'cutoverDrainMs')
+        .mockImplementation(() => {
+          void platform!.suspendApp('site', 'admin-1');
+          return 400;
+        });
+
+      await expect(platform!.promoteApp('site')).rejects.toMatchObject({ code: 'APP_SUSPENDED' });
+
+      // Applied, not un-applied: the promoted release is current and nothing is held again.
+      expect(cfg('site')?.currentRelease?.path).toBe(held);
+      expect(cfg('site')?.pendingPromotion).toBeUndefined();
+      expect(getStateManager().getApp('site')?.awaitingPromotion).toBeFalsy();
+      expect(getStateManager().getApp('site')?.status).toBe('stopped');
+      expect(getDeployTracker().hasOpenEpisode('site')).toBe(false);
+      expect(settled('site')).toBe(true);
+    }, 30000);
+
+    it('a suspension during the drain of a rollback: the rotation stands and the refusal is still a 409 suspension', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const first = cfg('site')!.currentRelease!;
+      await redeploy('site', appPath, 'v2');
+      jest
+        .spyOn(platform as unknown as { cutoverDrainMs: () => number }, 'cutoverDrainMs')
+        .mockImplementation(() => {
+          void platform!.suspendApp('site', 'admin-1');
+          return 400;
+        });
+
+      await expect(platform!.rollbackApp('site')).rejects.toMatchObject({ code: 'APP_SUSPENDED' });
+
+      expect(cfg('site')?.currentRelease?.id).toBe(first.id);
+      expect(getStateManager().getApp('site')?.status).toBe('stopped');
+      expect(settled('site')).toBe(true);
+    }, 30000);
+
     it('a held release that never becomes ready is not promoted, and the old one keeps serving', async () => {
       platform = makePlatform();
       await platform.start();

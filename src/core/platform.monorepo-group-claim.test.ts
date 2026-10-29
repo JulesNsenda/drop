@@ -188,6 +188,15 @@ describe('monorepo group provenance (groupContainer)', () => {
       expect(handleBuildApp).not.toHaveBeenCalled();
     });
 
+    it('refuses a NEW group whose host another app already serves through domains:', async () => {
+      await acs.upsertSystemConfig('tenant-a', { type: 'static', path: childPathOf('tenant-a'), domains: ['foo.localhost'] });
+
+      await expect(expand('ezs', ['web'], 'foo')).rejects.toThrow(OWNER_ERR);
+
+      expect(await exists(childPathOf('foo-web'))).toBe(false);
+      expect(handleBuildApp).not.toHaveBeenCalled();
+    });
+
     it('persists the trust it decided on the container, for the synchronous resolver', async () => {
       // Folder-dropped operator container registered into state: ownerless, so trusted.
       await stateManager.registerApp('ezs', repoPathOf('ezs'), 'unknown');

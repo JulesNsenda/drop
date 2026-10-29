@@ -600,7 +600,7 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
       const gate = (platform as unknown as { gateBeforeSwap: (a: string, c?: { stop?: boolean }) => void }).gateBeforeSwap.bind(platform);
 
       expect(() => gate('site')).not.toThrow();
-      expect(() => gate('site', { stop: true })).toThrow(expect.objectContaining({ cause: { kind: 'stopped' } }));
+      expect(() => gate('site', { stop: true })).toThrow(expect.objectContaining({ refusal: { kind: 'stopped' } }));
       await getSuspensionStore().suspend('site', 'admin-1');
       let thrown: unknown;
       try {
@@ -610,9 +610,9 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
       }
       expect(thrown).toBeInstanceOf(StartRefused);
       expect(thrown).not.toBeInstanceOf(AppSuspendedError);
-      expect((thrown as StartRefused).cause).toEqual({ kind: 'suspended', reason: 'record' });
+      expect((thrown as StartRefused).refusal).toEqual({ kind: 'suspended', reason: 'record' });
       // A stop outranks a refusal, as it will when a stopped deploy is also suspended.
-      expect(() => gate('site', { stop: true })).toThrow(expect.objectContaining({ cause: { kind: 'stopped' } }));
+      expect(() => gate('site', { stop: true })).toThrow(expect.objectContaining({ refusal: { kind: 'stopped' } }));
     }, 20000);
   });
 
