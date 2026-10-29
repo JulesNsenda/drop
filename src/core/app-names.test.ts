@@ -39,6 +39,12 @@ describe('isNameTaken', () => {
     }
   });
 
+  it("reserves the platform's own runtime process name, ignoring case", () => {
+    expect(check('drop-platform')).toBe(true);
+    expect(check('Drop-Platform')).toBe(true);
+    expect(check('drop-platform-two')).toBe(false);
+  });
+
   it('is true for a name with a suspension record and no app, ignoring case, so a variant cannot strand it', async () => {
     resetSuspensionStore();
     await getSuspensionStore(path.join(tempDir, 'suspensions.json')).load();

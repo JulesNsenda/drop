@@ -61,6 +61,9 @@ export function isNameTaken(
   deps: { stateManager: AppStateManager; appConfigService?: AppConfigService; ownGroup?: string }
 ): boolean {
   if (!deps.appConfigService) return true;
+  // The platform's own process name in the runtime: an app by that name would be
+  // indistinguishable from it to anything that matches runtime processes by name.
+  if (name.toLowerCase() === 'drop-platform') return true;
   // An unreadable suspension store cannot say which names it holds. (An UNLOADED one is not
   // treated the same: it is an early-boot state, and every test that never loads it would refuse.)
   if (getSuspensionStore().refusalFor(name) === 'store-unreadable') return true;

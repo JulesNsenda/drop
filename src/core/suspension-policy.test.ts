@@ -16,6 +16,8 @@ import { resetAppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
 import {
   childrenOf,
+  enforcementTargets,
+  isStillEnforced,
   claimedAgainst,
   hostClaims,
   refusalCauseOf,
@@ -420,6 +422,57 @@ describe('suspension policy: refusalForApp', () => {
     });
   });
 
+  describe('stampOnly keeps a state container the stateless stamp would strip', () => {
+    it('a folder-dropped stamp (no state entry) beside a state container with an exact group match', () => {
+      const apps = [
+        container('Mono'),
+        { name: 'kid', group: 'Mono', groupContainer: 'dropped' },
+        { name: 'dropped', configOnly: true },
+      ];
+      // 'dropped' has no state entry; 'Mono' is a state container and kid's group matches it exactly.
+      expect(childrenOf('Mono', depsOf(apps))).toEqual(['kid']);
+      expect(childrenOf('dropped', depsOf(apps))).toEqual(['kid']);
+    });
+  });
+
+  describe('enforcementTargets and isStillEnforced', () => {
+    it('a record names its own app only when one is known by exactly that name, plus its children', async () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'bystander' }];
+      await store.suspend('site', 'admin');
+      await store.suspend('drop-platform', 'admin');
+      await store.suspend('Bystander', 'admin');
+
+      const targets = enforcementTargets(depsOf(apps));
+
+      expect([...targets].sort()).toEqual([
+        ['site', 'site'],
+        ['site-web', 'site'],
+      ]);
+    });
+
+    it('is empty while the store is unreadable', async () => {
+      await store.suspend('site', 'admin');
+      fs.writeFileSync(path.join(dir, 'suspensions.json'), '{ broken');
+      jest.spyOn(console, 'error').mockImplementation();
+      await store.load();
+
+      expect(enforcementTargets(depsOf([container('site')])).size).toBe(0);
+    });
+
+    it('isStillEnforced follows the record and the attribution', async () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'other' }];
+      await store.suspend('site', 'admin');
+      const deps = depsOf(apps);
+
+      expect(isStillEnforced('site', 'site', deps)).toBe(true);
+      expect(isStillEnforced('site-web', 'site', deps)).toBe(true);
+      expect(isStillEnforced('other', 'site', deps)).toBe(false);
+      expect(isStillEnforced('site-web', 'gone', deps)).toBe(false);
+      await store.unsuspend('site');
+      expect(isStillEnforced('site-web', 'site', deps)).toBe(false);
+    });
+  });
+
   describe('hostClaims', () => {
     const holders = (claims: Map<string, Set<string>>, host: string): string[] => [...(claims.get(host) ?? [])].sort();
 
@@ -609,7 +662,7 @@ describe('suspension policy: pins', () => {
 
   it('the platform only writes records and loads the store; apps.ts only reads the record detail', () => {
     const platformCalls = new Set(storeCallsIn(path.join(srcRoot, 'core/platform.ts')));
-    expect([...platformCalls].sort()).toEqual(['list', 'load', 'suspend', 'unsuspend']);
+    expect([...platformCalls].sort()).toEqual(['load', 'suspend', 'unsuspend']);
     expect(storeCallsIn(path.join(srcRoot, 'api/routes/apps.ts'))).toEqual(['get']);
   });
 

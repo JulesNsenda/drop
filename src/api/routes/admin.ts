@@ -18,7 +18,7 @@ import {
   AuthContext,
 } from '../middleware/auth';
 import { interactiveSessionOnly } from '../access';
-import { getStateManager, clearGroupTrustForUser } from '../../managers/app/state-manager';
+import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
 import { logActivityFor } from '../../managers/activity';
 import { getDiskFreeMb } from '../../utils/disk';
@@ -210,7 +210,6 @@ admin.post('/users/:id/suspend', async (c) => {
     if (!suspended) {
       return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
     }
-    await clearGroupTrustForUser(userId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Suspend failed';
     return c.json(error(ErrorCodes.BAD_REQUEST, msg), 400);

@@ -308,8 +308,8 @@ describe('app suspension (platform, Item 1)', () => {
       const result = await platform.suspendApp('mono', 'admin-1');
 
       expect((result as { stopErrors?: string[] }).stopErrors).toEqual([
-        'mono-api: still present after delete',
-        'mono-web: still present after delete',
+        'mono-api: mono-api: still present after delete',
+        'mono-web: mono-web: still present after delete',
       ]);
     }, 30000);
 
@@ -340,7 +340,8 @@ describe('app suspension (platform, Item 1)', () => {
       const api = getStateManager().getApp('mono-api')!;
       expect(api.status).toBe('stopped');
       expect(api.error).toBeUndefined();
-      expect(getStateManager().getApp('mono')?.error).toBeUndefined();
+      // The container itself is still frozen by its service's record, so it keeps its text.
+      expect(getStateManager().getApp('mono')?.error).toBe('Suspended by admin');
       // Still refused by its own record: left as suspended.
       expect(getStateManager().getApp('mono-web')?.error).toBe('Suspended by admin');
       expect(fakeRuntime.startCount).toBe(starts);
@@ -393,10 +394,13 @@ describe('app suspension (platform, Item 1)', () => {
       await deployGroup();
       jest.spyOn(fakeRuntime, 'delete').mockImplementation(async () => undefined);
       await platform.suspendApp('mono', 'admin-1');
+      // Still live: the real status is kept and only the suspension text goes.
+      await getStateManager().updateApp('mono-api', { status: 'running' });
 
       await platform.unsuspendApp('mono');
 
-      expect(getStateManager().getApp('mono-api')?.error).toBe('Suspended by admin');
+      expect(getStateManager().getApp('mono-api')?.status).toBe('running');
+      expect(getStateManager().getApp('mono-api')?.error).toBeUndefined();
       expect(getStateManager().getApp('mono')?.error).toBeUndefined();
     }, 30000);
 
@@ -421,15 +425,109 @@ describe('app suspension (platform, Item 1)', () => {
         expect(revoke).toHaveBeenCalledWith('app:site:provision');
       }, 20000);
 
-      it('takes down a runtime-only instance under a recorded name', async () => {
+      it('never takes down a runtime-only process under a recorded name (it is not an app of ours)', async () => {
         platform = makePlatform();
         await platform.start();
-        fakeRuntime.seedRunning('ghost', 4555);
-        await getSuspensionStore().suspend('ghost', 'admin-1');
+        fakeRuntime.seedRunning('drop-platform', 4555);
+        await getSuspensionStore().suspend('drop-platform', 'admin-1');
 
         await reconcile();
 
+        expect(fakeRuntime.runningNames()).toEqual(['drop-platform']);
+      }, 20000);
+
+      it('a converged pass writes nothing', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await platform.suspendApp('site', 'admin-1');
+        await reconcile();
+        const sm = getStateManager();
+        const save = jest.spyOn(sm as unknown as { scheduleSave: () => void }, 'scheduleSave');
+        const setStatus = jest.spyOn(sm, 'setAppStatus');
+
+        await reconcile();
+
+        expect(setStatus).not.toHaveBeenCalled();
+        expect(save).not.toHaveBeenCalled();
         expect(fakeRuntime.runningNames()).toEqual([]);
+      }, 20000);
+
+      it('stop() waits for a pass in flight', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await getSuspensionStore().suspend('site', 'admin-1');
+        const priv = platform as unknown as { takeAppDown: (n: string, o: object) => Promise<string[]> };
+        const original = priv.takeAppDown.bind(platform);
+        let release: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let entered = false;
+        jest.spyOn(priv, 'takeAppDown').mockImplementation(async (n: string, o: object) => {
+          entered = true;
+          await gate;
+          return original(n, o);
+        });
+        const pass = reconcile();
+        await waitFor(() => entered);
+
+        let stopped = false;
+        const stopping = platform.stop().then(() => {
+          stopped = true;
+        });
+        await new Promise((r) => setTimeout(r, 300));
+        expect(stopped).toBe(false);
+
+        release();
+        await pass;
+        await stopping;
+        expect(stopped).toBe(true);
+      }, 30000);
+
+      it('a stricter call behind a running pass earns exactly one more pass', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await getSuspensionStore().suspend('site', 'admin-1');
+        const priv = platform as unknown as {
+          takeAppDown: (n: string, o: object) => Promise<string[]>;
+          enforceSuspensions: (o: { skipBusy: boolean }) => Promise<void>;
+        };
+        const original = priv.takeAppDown.bind(platform);
+        let release: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let calls = 0;
+        jest.spyOn(priv, 'takeAppDown').mockImplementation(async (n: string, o: object) => {
+          calls++;
+          if (calls === 1) await gate;
+          return original(n, o);
+        });
+        const first = priv.enforceSuspensions({ skipBusy: true });
+        await waitFor(() => calls === 1);
+        const second = priv.enforceSuspensions({ skipBusy: false });
+        expect(second).toBe(first);
+        release();
+        await second;
+
+        expect(calls).toBe(2);
+      }, 30000);
+
+      it('a busy target is skipped, never acted on unreserved', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await getSuspensionStore().suspend('site', 'admin-1');
+        (platform as unknown as { appsInProgress: Set<string> }).appsInProgress.add('site');
+        const priv = platform as unknown as { enforceSuspensions: (o: { skipBusy: boolean }) => Promise<void> };
+
+        await priv.enforceSuspensions({ skipBusy: false });
+
+        expect(fakeRuntime.runningNames()).toEqual(['site']);
+        (platform as unknown as { appsInProgress: Set<string> }).appsInProgress.delete('site');
       }, 20000);
 
       it('one target throwing does not stop the next', async () => {

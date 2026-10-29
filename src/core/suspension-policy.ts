@@ -22,14 +22,14 @@
  *     children), a record held by ANY member of its group ("group frozen").
  *
  * A group that is undefined never matches anything. Group names are compared
- * the way `expandMonorepo` decided for that container: it persists the trust
- * it computed as `groupTrusted` on the container's state entry, and a trusted
- * container compares exactly, an untrusted one ignoring case. A container with
- * no such field (legacy, or folder-dropped) compares ignoring case when GATING
- * (refuse more) and exactly when something DESTRUCTIVE asks (`childrenOf`), so
- * a doubt never widens a take-down. A child that matches a trusted container
- * exactly belongs to it alone: an untrusted container's case-insensitive reading
- * cannot reach it, so `ezsign` and `EzSign` never cross.
+ * by what is being asked. GATING (refuse more) compares exactly only when
+ * `expandMonorepo` persisted `groupTrusted === true` on the container's state
+ * entry; an untrusted or legacy (no field) container compares ignoring case.
+ * Something DESTRUCTIVE (`childrenOf`, and everything built on it: the fan-out,
+ * the enforcement pass) ALWAYS compares exactly, whatever the trust, and a child
+ * with a current `groupContainer` stamp belongs only to its stamp. So a doubt
+ * never widens a take-down, and `ezsign` and `EzSign` never cross. For gating,
+ * a child that matches a trusted container exactly belongs to it alone.
  *
  * `via` names the other app whose record is the cause. Only a `record` reason
  * ever has one.
@@ -193,6 +193,7 @@ function containersOf(name: string, use: Use, deps: SuspensionPolicyDeps): strin
   if (!deps.state || isStateContainer(name, deps)) return [];
   const groups = groupsOf(name, deps);
   const found = new Map<string, { exactly: boolean; trusted: boolean; stamped: boolean }>();
+  let stampStateless = false;
   const add = (container: string, exactly: boolean, stamped: boolean, trusted?: boolean): void => {
     found.set(container, {
       exactly,
@@ -207,6 +208,7 @@ function containersOf(name: string, use: Use, deps: SuspensionPolicyDeps): strin
       // No state entry at all: a folder-dropped (or unregistered) container, the operator's
       // own. Nothing to compare: it is trusted and its stamp is exact.
       add(stamp, true, true, true);
+      stampStateless = true;
     } else if (entry.isGroupContainer) {
       // For THAT group: with no group to compare (a child mid-materialisation) the
       // stamp stands, because "cannot tell" must not read as "not a member".
@@ -229,10 +231,14 @@ function containersOf(name: string, use: Use, deps: SuspensionPolicyDeps): strin
   // narrows the containers found by GROUP NAME, never the one explicitly stamped.
   const exactlyTrusted = new Set([...found].filter(([, v]) => v.trusted && v.exactly).map(([c]) => c));
   // For something destructive a child with a current stamp belongs ONLY to its stamped container.
+  // A stamp with no state entry names an operator's folder-dropped container: a state container
+  // whose group matches exactly is kept beside it, or the stamp would strip it of its own member.
   const stampOnly = use === 'destructive' && [...found.values()].some((v) => v.stamped);
   return [...found]
     .filter(([container, v]) =>
-      stampOnly ? v.stamped : v.stamped || exactlyTrusted.size === 0 || exactlyTrusted.has(container)
+      stampOnly
+        ? v.stamped || (stampStateless && v.exactly)
+        : v.stamped || exactlyTrusted.size === 0 || exactlyTrusted.has(container)
     )
     .map(([container]) => container);
 }
@@ -297,6 +303,37 @@ export function refusalForApp(name: string, deps: SuspensionPolicyDeps = default
  */
 export function childrenOf(container: string, deps: SuspensionPolicyDeps = defaultDeps()): string[] {
   return membersOf(container, 'destructive', deps);
+}
+
+/** Whether the platform knows an app under exactly this name: a state entry or a config. */
+function knowsApp(name: string, deps: SuspensionPolicyDeps): boolean {
+  return deps.state?.getApp(name) !== undefined || deps.configs?.getConfig(name) !== undefined;
+}
+
+/**
+ * What a record makes true, for the enforcement pass: target app to the record
+ * that holds it. A record's own name is a target only when an app of EXACTLY
+ * that name is known (a record can name something that is not an app, and the
+ * runtime holds processes that are not DROP's); plus each of its `childrenOf`
+ * (the exact attribution). Empty while the store is unreadable (its list is).
+ */
+export function enforcementTargets(deps: SuspensionPolicyDeps = defaultDeps()): Map<string, string> {
+  const targets = new Map<string, string>();
+  for (const { name: record } of deps.store.list()) {
+    if (knowsApp(record, deps) && !targets.has(record)) targets.set(record, record);
+    for (const child of childrenOf(record, deps)) if (!targets.has(child)) targets.set(child, record);
+  }
+  return targets;
+}
+
+/** Whether `target` is still held by `record` (the pass re-asks on the line before it acts). */
+export function isStillEnforced(
+  target: string,
+  record: string,
+  deps: SuspensionPolicyDeps = defaultDeps()
+): boolean {
+  if (!deps.store.list().some((r) => r.name === record)) return false;
+  return target === record ? knowsApp(target, deps) : childrenOf(record, deps).includes(target);
 }
 
 /**

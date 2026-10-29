@@ -379,7 +379,7 @@ export class AppStateManager {
     // `groupTrusted` is the trust decision made for the owner who expanded this
     // container. A new owner has made none: drop it (read as legacy, which gates
     // cautiously and destroys narrowly) unless the same write sets it afresh.
-    if (updates.userId !== undefined && updates.userId !== app.userId && updates.groupTrusted === undefined) {
+    if ('userId' in updates && updates.userId !== app.userId && updates.groupTrusted === undefined) {
       delete updated.groupTrusted;
     }
 

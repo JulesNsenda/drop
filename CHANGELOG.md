@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Suspending a monorepo container now takes all of its services down (and revokes their keys), and lifting it leaves them stopped. It used to be refused with a 409 telling the caller to suspend the services one by one.
+- Suspending a monorepo container now takes all of its services down (and revokes their keys), and lifting it leaves them stopped. It used to be refused with a 409 telling the caller to suspend the services one by one. The admin suspend route now also accepts a folder-dropped container (one with no state entry of its own) that has services.
 
 ## [1.8.0] - 2026-10-29
 
