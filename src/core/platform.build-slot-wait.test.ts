@@ -26,6 +26,7 @@ jest.mock('../utils/disk', () => ({
 
 import { DropPlatform, createPlatform } from './platform';
 import { loadEmptySuspensionStore } from './__testutils__/suspension';
+import { getSuspensionStore } from '../managers/suspension';
 
 // An unloaded suspension store fails closed; these tests never start the platform that loads it.
 beforeEach(loadEmptySuspensionStore);
@@ -218,6 +219,27 @@ describe('redeploy of a running app while the builder is at its cap', () => {
     expect(setAppStatus).not.toHaveBeenCalled();
     expect(runtimeStart).not.toHaveBeenCalled();
     expect(appState.status).toBe('stopped');
+    expect(p().appsInProgress.has(appName)).toBe(false);
+    expect(p().breakerKeys.has(appName)).toBe(false);
+    await expectSlotFree();
+  });
+
+  it('aborts, nothing built or started, when an administrator suspends the app during the wait', async () => {
+    const outcome = jest.spyOn(p(), 'recordDeployOutcome');
+    const { occupant, redeploy } = await redeployBehindOccupant();
+
+    await getSuspensionStore().suspend(appName, 'admin-1');
+    release.get('occupant')!();
+    await occupant;
+    await redeploy;
+
+    expect(buildsRun).toEqual(['occupant']);
+    expect(setAppStatus).not.toHaveBeenCalled();
+    expect(startBuildLog).not.toHaveBeenCalled();
+    expect(runtimeStart).not.toHaveBeenCalled();
+    // Uncharged: a refusal is not evidence the caller is looping.
+    expect(outcome).not.toHaveBeenCalled();
+    expect(appState.status).toBe('running');
     expect(p().appsInProgress.has(appName)).toBe(false);
     expect(p().breakerKeys.has(appName)).toBe(false);
     await expectSlotFree();

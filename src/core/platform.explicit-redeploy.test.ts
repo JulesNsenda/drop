@@ -33,6 +33,8 @@ import {
   resetDeployDetailStore,
 } from '../managers/deploy-tracker';
 import { hasEnoughDisk } from '../utils/disk';
+import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
+import { AppSuspendedError } from '../api/platform-ops';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -1079,6 +1081,142 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       const [episode] = getDeployTracker().getEpisodes(containerName);
       expect(episode.status).toBe('failed');
       expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
+    });
+  });
+  describe('a suspended app (F2 Item 2)', () => {
+    const suspend = () => getSuspensionStore().suspend(appName, 'admin-1');
+
+    it('is refused APP_SUSPENDED before the admission: no quota, no slot, no write, nothing held', async () => {
+      await suspend();
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+
+      const out = await p().redeployApp(appName, actor);
+
+      expect(out.refused).toEqual({
+        code: 'APP_SUSPENDED',
+        message: `Application '${appName}' is suspended by an administrator`,
+        suspension: 'record',
+      });
+      expect(admit).not.toHaveBeenCalled();
+      expect(p().builder.reserveSlot).not.toHaveBeenCalled();
+      expect(p().builder.build).not.toHaveBeenCalled();
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      expect(p().stateManager.setAppStatus).not.toHaveBeenCalled();
+      expect(appState.status).toBe('running');
+      expectNothingHeld();
+    });
+
+    it('is refused for a STOPPED app whose tree reads as stale (the marker is tenant-forgeable): the exemption never gets a vote', async () => {
+      appState = { ...appState, status: 'stopped' };
+      const stale = jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
+      await suspend();
+
+      const human = await p().redeployApp(appName, actor);
+
+      expect(human.refused.code).toBe('APP_SUSPENDED');
+      expect(stale).not.toHaveBeenCalled();
+      expect(p().builder.reserveSlot).not.toHaveBeenCalled();
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      expectNothingHeld();
+    });
+
+    it('is refused for a stopped container too: the container exemption never gets a vote', async () => {
+      appState = { ...appState, status: 'stopped', isGroupContainer: true, group: 'g' };
+      await suspend();
+      const expand = jest.spyOn(p(), 'reExpandContainer');
+
+      const out = await p().redeployApp(appName, actor);
+
+      expect(out.refused.code).toBe('APP_SUSPENDED');
+      expect(expand).not.toHaveBeenCalled();
+      expectNothingHeld();
+    });
+
+    it('does not tell a tenant that the store is the reason when it cannot answer', async () => {
+      resetSuspensionStore();
+      const file = path.join(tempDir, 'suspensions.json');
+      fs.writeFileSync(file, '{not json');
+      await getSuspensionStore(file).load();
+
+      const out = await p().redeployApp(appName, actor);
+
+      expect(out.refused).toEqual({
+        code: 'APP_SUSPENDED',
+        message: `Starting '${appName}' is refused right now; contact your administrator`,
+        suspension: 'store-unreadable',
+      });
+      expect(p().builder.build).not.toHaveBeenCalled();
+      expectNothingHeld();
+    });
+
+    it('handleAppUpdate drops it FIRST: nothing claimed, no stale-tree read, no slot, no key', async () => {
+      appState = { ...appState, status: 'stopped' };
+      const stale = jest.spyOn(p(), 'dependenciesAreStale').mockResolvedValue(true);
+      await suspend();
+
+      expect(await p().handleAppUpdate(appName, appPath, 'file change', true)).toBe(false);
+
+      expect(stale).not.toHaveBeenCalled();
+      expect(p().builder.reserveSlot).not.toHaveBeenCalled();
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      expect(getDeployTracker().getEpisodes(appName)).toEqual([]);
+      expectNothingHeld();
+    });
+
+    it.each([
+      ['record', 'DEPLOY_STOPPED'],
+      ['store-unreadable', 'DEPLOY_REFUSED'],
+    ] as const)('a suspension (%s) landing during the land (continueRedeploy) is %s: uncharged, the tenant text, and rethrown', async (reason, code) => {
+      const url = 'https://github.com/user/repo';
+      appState = { ...appState, gitSource: { repoUrl: url, branch: 'main' } };
+      const land = jest.fn().mockRejectedValue(new AppSuspendedError(appName, reason));
+      p().gitDeployService = {
+        isAvailable: () => true,
+        isCloning: () => false,
+        recordedCloneUrl: jest.fn().mockReturnValue(url),
+        supersedeQueued: jest.fn(),
+        landUnderHold: land,
+      };
+      const failure = jest.spyOn(getDeployBreaker(), 'recordFailure');
+      const loggedErrors = jest.spyOn(p().logger, 'error').mockImplementation(() => undefined);
+
+      const out = await p().redeployApp(appName, actor, { caller: null });
+      expect(out).toEqual({ accepted: true });
+      await settle();
+
+      expect(land).toHaveBeenCalledTimes(1);
+      expect(failure).not.toHaveBeenCalled();
+      expect(p().breakerKeys.has(appName)).toBe(false);
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      expect(loggedErrors).toHaveBeenCalled();
+      const [episode] = getDeployTracker().getEpisodes(appName);
+      expect(episode.status).toBe('failed');
+      const detail = getDeployDetailStore().getDetail(episode.deployId);
+      expect(detail?.errorCode).toBe(code);
+      // Never the store's own state.
+      expect(JSON.stringify(detail)).not.toContain('unreadable');
+      expectNothingHeld();
+    });
+
+    it('a redeploy queued behind a full builder cap is refused AFTER the slot wait: no build, no start, nothing held', async () => {
+      let freeSlot!: () => void;
+      slotGate = new Promise<void>((resolve) => (freeSlot = resolve));
+      const out = await p().redeployApp(appName, actor);
+      expect(out).toEqual({ accepted: true });
+
+      await suspend();
+      freeSlot();
+      await settle();
+
+      expect(p().builder.build).not.toHaveBeenCalled();
+      expect(p().runtime.start).not.toHaveBeenCalled();
+      expect(p().stateManager.setAppStatus).not.toHaveBeenCalled();
+      expectNothingHeld();
+      // Nobody is left to be told, so it is a failed deploy the caller can follow, and an uncharged one.
+      // A stop, not a refusal of the caller: the same code the closer gives a start.
+      const [episode] = getDeployTracker().getEpisodes(appName);
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
     });
   });
 });

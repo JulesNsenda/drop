@@ -30,6 +30,11 @@ import { selectBuildImage } from '../managers/runtime/container-config';
 
 const SENTINEL = 'node-abi-999-sentinel-x64-glibc';
 
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('build exec parity between the two build paths', () => {
   let tempDir: string;
 

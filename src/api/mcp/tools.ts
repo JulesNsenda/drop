@@ -573,6 +573,9 @@ export async function handleDeployFiles(
     // Shared preflight — same policy as POST /apps/:name/source (PRD-040 §5).
     const preflight = await runUploadPreflight(auth, name);
     if (!preflight.ok) {
+      if (preflight.error instanceof AppSuspendedError) {
+        return toolError(suspendedFor(preflight.error, auth?.role === 'admin'));
+      }
       return toolError(preflight.error.message);
     }
     release = preflight.release;
@@ -625,6 +628,7 @@ export async function handleDeployFiles(
     ) {
       return toolError(err.message);
     }
+    if (err instanceof AppSuspendedError) return toolError(suspendedFor(err, auth?.role === 'admin'));
     const refusal = deployRefusal(name, err);
     if (refusal) return refusal;
     if (err instanceof EphemeralQuotaError) {
@@ -754,6 +758,7 @@ export async function handleDeployFromGit(
       return /^[\w.-]{1,128}$/.test(derived) ? derived : '';
     }, err);
     if (refusal) return refusal;
+    if (err instanceof AppSuspendedError) return toolError(suspendedFor(err, auth?.role === 'admin'));
     if (err instanceof AppInProgressError) {
       return toolError(`Conflict: ${err.message}`);
     }
@@ -1208,6 +1213,11 @@ export async function handleRedeployApp(
       const { code, message, retryAfterSeconds } = result.refused;
       // The recorded git URL is tenant-controlled and rides in this one message.
       let text = code === 'INVALID_GIT_SOURCE' ? wrapUntrusted(`GIT SOURCE: ${target}`, message) : message;
+      if (result.refused.code === 'APP_SUSPENDED') {
+        // Not the APP_STOPPED hint below: restart_app is refused too, and only an administrator lifts it.
+        // Rendered as every other suspended refusal is, by reason and by role.
+        text = suspendedFor(new AppSuspendedError(target, result.refused.suspension), auth?.role === 'admin');
+      }
       if (code === 'APP_STOPPED') {
         // An agent never rebuilds a stopped app, so do not send it round restart_app and back:
         // restart_app starts one whose dependencies are intact, and says so when they are not.

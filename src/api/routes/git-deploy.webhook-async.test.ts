@@ -16,6 +16,7 @@ import * as activity from '../../managers/activity';
 import * as gitDeployModule from '../../core/git-deploy';
 import { getLogger } from '../../utils/logger';
 import { AppInProgressError } from '../platform-ops';
+import { AppSuspendedError } from '../platform-ops';
 
 describe('git webhook answers before the clone', () => {
   let tempDir: string;
@@ -103,6 +104,20 @@ describe('git webhook answers before the clone', () => {
 
     expect(logSpy).toHaveBeenCalledTimes(1);
     expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'redeploy', appName: 'myapp' });
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not queue, record or log an error for an app suspended after the push was matched', async () => {
+    redeploy.mockRejectedValueOnce(new AppSuspendedError('myapp'));
+
+    const res = await postWebhook();
+    await flush();
+
+    expect(res.status).toBe(200);
+    // Refused before any pull (the service throws first), and not remembered to replay later.
+    expect(redeploy).toHaveBeenCalledTimes(1);
+    expect(queueRedeploy).not.toHaveBeenCalled();
+    expect(logSpy).not.toHaveBeenCalled();
     expect(errorSpy).not.toHaveBeenCalled();
   });
 

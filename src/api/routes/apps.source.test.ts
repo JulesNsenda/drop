@@ -19,6 +19,8 @@ import { createUser, resetAuth } from '../middleware/auth';
 import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { setPlatformOps, resetPlatformOps, PlatformOps } from '../platform-ops';
+import { AppSuspendedError } from '../platform-ops';
+import { getSuspensionStore } from '../../managers/suspension';
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
 import * as diskUtils from '../../utils/disk';
 import * as runtimeConfigModule from '../runtime-config';
@@ -32,6 +34,11 @@ type DeployMock = jest.Mock;
 function makeOps(overrides?: Partial<PlatformOps>): PlatformOps {
   return makePlatformOpsStub(overrides);
 }
+
+import { loadEmptySuspensionStore } from '../../core/__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 
 describe('POST /apps/:name/source (upload deploy)', () => {
   let tempDir: string;
@@ -120,6 +127,27 @@ describe('POST /apps/:name/source (upload deploy)', () => {
       body: Buffer.from('fake-archive-bytes'),
     });
     expect(res.status).toBe(404);
+    expect(deployMock).not.toHaveBeenCalled();
+  });
+
+  it('answers a suspended (and therefore stopped) app 409 APP_SUSPENDED, not "start or remove it"; a non-owner still gets 404', async () => {
+    await getStateManager().setAppStatus('alice-app', 'stopped');
+    await getSuspensionStore().suspend('alice-app', 'admin-1');
+    const upload = (token: string) =>
+      hono.request('/api/v1/apps/alice-app/source', {
+        method: 'POST',
+        headers: authHeader(token),
+        body: Buffer.from('fake-archive-bytes'),
+      });
+
+    const owner = await upload(aliceToken);
+    expect(owner.status).toBe(409);
+    const json = (await owner.json()) as { error: { code: string; message: string } };
+    expect(json.error.code).toBe('APP_SUSPENDED');
+    expect(json.error.message).not.toContain('start or remove');
+
+    // The ownership answer comes first: never an oracle for someone else's app.
+    expect((await upload(bobToken)).status).toBe(404);
     expect(deployMock).not.toHaveBeenCalled();
   });
 
@@ -406,6 +434,31 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: { message: string } };
     expect(body.error.message).toContain('path_escape');
+  });
+
+  it('maps a suspended app to 409 APP_SUSPENDED, naming the administrator only for a real suspension', async () => {
+    deployMock.mockRejectedValueOnce(new AppSuspendedError('alice-app'));
+    const upload = () =>
+      hono.request('/api/v1/apps/alice-app/source', {
+        method: 'POST',
+        headers: authHeader(aliceToken),
+        body: Buffer.from('fake-archive-bytes'),
+      });
+
+    const res = await upload();
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: { code: string; message: string } }).error).toMatchObject({
+      code: 'APP_SUSPENDED',
+      message: "Application 'alice-app' is suspended by an administrator",
+    });
+
+    // The store's own state is not a tenant's to read.
+    deployMock.mockRejectedValueOnce(new AppSuspendedError('alice-app', 'store-unreadable'));
+    const generic = await upload();
+    expect(generic.status).toBe(409);
+    expect(((await generic.json()) as { error: { message: string } }).error.message).toBe(
+      "Starting 'alice-app' is refused right now; contact your administrator"
+    );
   });
 
   describe('auth disabled (single-user box)', () => {

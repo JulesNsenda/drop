@@ -91,6 +91,11 @@ export class AppSuspendedError extends Error {
       ? this.message
       : `Starting '${this.appName}' is refused right now; contact your administrator`;
   }
+
+  /** The one renderer: the specific text for an administrator, the tenant-safe one for anyone else. */
+  messageFor(isAdmin: boolean): string {
+    return isAdmin ? this.message : this.tenantMessage;
+  }
 }
 
 /**
@@ -187,6 +192,8 @@ export type RedeployRefusalCode =
   | 'APP_BUSY'
   | 'SERVICE_UNAVAILABLE'
   | 'APP_STOPPED'
+  // An administrator suspended the app: retrying cannot help, and it is never the "start it" hint.
+  | 'APP_SUSPENDED'
   // A git-backed app whose recorded repository URL no longer validates.
   | 'INVALID_GIT_SOURCE'
   // A service of a git-deployed group: its container holds the repository.
@@ -194,11 +201,15 @@ export type RedeployRefusalCode =
   | 'RATE_LIMITED'
   | 'INSUFFICIENT_DISK';
 
-export interface RedeployRefusal {
-  code: RedeployRefusalCode;
-  message: string;
-  retryAfterSeconds?: number;
-}
+export type RedeployRefusal =
+  | {
+      code: Exclude<RedeployRefusalCode, 'APP_SUSPENDED'>;
+      message: string;
+      retryAfterSeconds?: number;
+      suspension?: undefined;
+    }
+  // Why, so each surface renders it through AppSuspendedError.messageFor.
+  | { code: 'APP_SUSPENDED'; message: string; retryAfterSeconds?: undefined; suspension: AppSuspendedReason };
 
 /**
  * What an explicit redeploy came to: started (it has a builder slot and the

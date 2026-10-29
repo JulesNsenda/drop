@@ -26,6 +26,7 @@ describe('POST /apps/:name/redeploy', () => {
   let t: TestApiServer;
   let ownerId: string;
   let ownerToken: string;
+  let adminToken: string;
   let strangerToken: string;
   let readonlyToken: string;
   let logSpy: jest.SpyInstance;
@@ -45,7 +46,9 @@ describe('POST /apps/:name/redeploy', () => {
     ownerId = owner.id;
     await createUser({ username: 'stranger', role: 'user', credential: { password: 'password123' } });
     await createUser({ username: 'viewer', role: 'readonly', credential: { password: 'password123' } });
+    await createUser({ username: 'sysadmin', role: 'admin', credential: { password: 'password123' } });
     ownerToken = await getTestToken('owner', 'password123');
+    adminToken = await getTestToken('sysadmin', 'password123');
     strangerToken = await getTestToken('stranger', 'password123');
     readonlyToken = await getTestToken('viewer', 'password123');
 
@@ -293,7 +296,7 @@ describe('POST /apps/:name/redeploy', () => {
   });
 
   describe('refusals', () => {
-    const cases: Array<[RedeployRefusal['code'], number, string]> = [
+    const cases: Array<[Exclude<RedeployRefusal['code'], 'APP_SUSPENDED'>, number, string]> = [
       ['NOT_FOUND', 404, 'NOT_FOUND'],
       ['APP_SOURCE_MISSING', 409, 'APP_SOURCE_MISSING'],
       ['APP_BUSY', 409, 'APP_BUSY'],
@@ -309,6 +312,33 @@ describe('POST /apps/:name/redeploy', () => {
       expect(res.status).toBe(status);
       const json = await body(res);
       expect(json.error).toMatchObject({ code: apiCode, message: `refused: ${code}` });
+      expect(logSpy).not.toHaveBeenCalled();
+    });
+
+    it('renders an APP_SUSPENDED refusal by reason and role: the specific text for an admin, the generic one for a tenant', async () => {
+      refuse({ code: 'APP_SUSPENDED', message: 'x', suspension: 'store-unreadable' });
+      const tenant = await redeploy('site', bearer(ownerToken));
+      expect(tenant.status).toBe(409);
+      expect((await body(tenant)).error).toMatchObject({
+        code: 'APP_SUSPENDED',
+        message: "Starting 'site' is refused right now; contact your administrator",
+      });
+
+      refuse({ code: 'APP_SUSPENDED', message: 'x', suspension: 'store-unreadable' });
+      const admin = await redeploy('site', bearer(adminToken));
+      expect(admin.status).toBe(409);
+      const adminError = (await body(admin)).error;
+      expect(adminError).toMatchObject({ code: 'APP_SUSPENDED' });
+      expect(adminError.message).toContain('suspension store is unreadable');
+
+      refuse({ code: 'APP_SUSPENDED', message: 'x', suspension: 'record' });
+      const record = await redeploy('site', bearer(ownerToken));
+      expect(record.status).toBe(409);
+      expect((await body(record)).error).toMatchObject({
+        code: 'APP_SUSPENDED',
+        message: "Application 'site' is suspended by an administrator",
+      });
+      // A refusal is not an action: nothing is logged (the row this replaces asserted the same).
       expect(logSpy).not.toHaveBeenCalled();
     });
 

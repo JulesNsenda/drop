@@ -93,6 +93,22 @@ function bodyOf(lines: string[], signature: RegExp): [number, number] {
   return [first, first + offset];
 }
 
+/** Every `builder.build(` call (also `this.builder!.build(`) in `text`, as 0-based line numbers. */
+function builderBuildCalls(text: string): number[] {
+  const code = codeOf(text);
+  return [...code.matchAll(/\bbuilder[!?]?\s*\.\s*build\s*\(/g)].map((m) => code.slice(0, m.index).split('\n').length - 1);
+}
+
+/** Whether the nearest code line above `line` that calls assertStartable has no `await` between it and `line`. */
+function guardedSynchronously(lines: string[], line: number): boolean {
+  for (let i = line - 1; i >= 0; i--) {
+    if (isComment(lines[i])) continue;
+    if (lines[i].includes('this.assertStartable(')) return true;
+    if (/\bawait\b/.test(lines[i])) return false;
+  }
+  return false;
+}
+
 describe('the suspension start choke point', () => {
   const platformLines = fs.readFileSync(PLATFORM, 'utf-8').split(/\r?\n/);
   const allowed = [
@@ -137,6 +153,44 @@ describe('the suspension start choke point', () => {
       for (const i of runtimeStartCalls(fs.readFileSync(file, 'utf-8'))) {
         offenders.push(`${path.relative(SRC, file)}:${i + 1}`);
       }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the build scan sees a build with no guard and one with a guard, and an await in between', () => {
+    const lines = (t: string) => t.split('\n');
+    expect(builderBuildCalls('await this.builder!.build({})').length).toBe(1);
+    expect(builderBuildCalls('await this.builder.build({})').length).toBe(1);
+    expect(builderBuildCalls('// builder.build(x)').length).toBe(0);
+    expect(guardedSynchronously(lines('this.assertStartable(a);\nbuilderEntered = true;\nawait this.builder.build({})'), 2)).toBe(true);
+    expect(guardedSynchronously(lines('this.assertStartable(a);\nawait x();\nawait this.builder.build({})'), 2)).toBe(false);
+    expect(guardedSynchronously(lines('await this.builder.build({})'), 0)).toBe(false);
+  });
+
+  it('every builder.build( in platform.ts follows an assertStartable with no await in between', () => {
+    const calls = builderBuildCalls(platformLines.join('\n'));
+    // handleBuildApp and buildAndSwap (the scan is not silently matching nothing).
+    expect(calls.length).toBe(2);
+    const unguarded = calls.filter((i) => !guardedSynchronously(platformLines, i));
+    expect(unguarded.map((i) => `${i + 1}: ${platformLines[i].trim()}`)).toEqual([]);
+  });
+
+  it('every builder.build( in platform.ts runs on a slot the caller reserved (slotReserved: true)', () => {
+    const calls = builderBuildCalls(platformLines.join('\n'));
+    // The guard comes after the slot wait; a build that waited for its own slot would
+    // put the wait (an await a suspension can land in) back between the guard and the build.
+    const ownSlot = calls.filter((i) => {
+      const end = platformLines.findIndex((l, j) => j > i && /^\s*\}\);/.test(l));
+      return !platformLines.slice(i, end + 1).some((l) => /slotReserved:\s*true/.test(l));
+    });
+    expect(ownSlot.map((i) => `${i + 1}: ${platformLines[i].trim()}`)).toEqual([]);
+  });
+
+  it('no other source file builds an app on the builder', () => {
+    const offenders: string[] = [];
+    for (const file of sourceFiles(SRC)) {
+      if (file === PLATFORM || file.includes(`${path.sep}builder${path.sep}`)) continue;
+      for (const i of builderBuildCalls(fs.readFileSync(file, 'utf-8'))) offenders.push(`${path.relative(SRC, file)}:${i + 1}`);
     }
     expect(offenders).toEqual([]);
   });
