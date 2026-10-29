@@ -481,6 +481,36 @@ describe('zero-downtime cutover (#298 step 5)', () => {
       expect(cfg('site')?.runtimeSlot).toBeUndefined();
     }, 30000);
 
+    it('during the drain, after traffic moved: the app is not reported running, no watch is armed, the key is revoked', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const internals = platform as unknown as CutoverInternals & {
+        cutoverDrainMs: () => number;
+        armPostDeployWatches: (...a: unknown[]) => void;
+        healthProbers: Map<string, unknown>;
+      };
+      const arm = jest.spyOn(internals, 'armPostDeployWatches');
+      const statuses: string[] = [];
+      const unsubscribe = eventBus.subscribe('app:updated', (p) => {
+        const status = (p.changes as { status?: string })?.status;
+        if (p.appId === 'site' && status) statuses.push(status);
+      });
+      // The suspension lands while the old instance drains.
+      jest.spyOn(internals, 'cutoverDrainMs').mockImplementation(() => {
+        void getSuspensionStore().suspend('site', 'admin-1');
+        return 400;
+      });
+      arm.mockClear();
+
+      await redeploy('site', appPath, 'v2');
+      unsubscribe();
+
+      expect(statuses).not.toContain('running');
+      expect(arm).not.toHaveBeenCalled();
+      expect(internals.healthProbers.has('site')).toBe(false);
+    }, 30000);
+
     it('after the config writes, before the traffic switch: the config is put back and traffic does not move', async () => {
       platform = makePlatform();
       await platform.start();

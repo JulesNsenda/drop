@@ -127,6 +127,31 @@ describe('handleConfigureRoute: hosts claimed by a suspension', () => {
     expect(hostsOf('grp-api')).toEqual(['grp.dropkit.sh']);
   });
 
+  it('a LIVE group host (nothing suspended anywhere) is no other app\'s to claim either', async () => {
+    await register('grp', { group: 'grp', isGroupContainer: true });
+    await register('grp-web', { group: 'grp' });
+    await register('evil');
+    await declareDomains('evil', ['grp.dropkit.sh', 'evil.example.com']);
+
+    await (platform as any).handleConfigureRoute('evil', 4100);
+
+    expect(hostsOf('evil')).toEqual(['evil.example.com']);
+  });
+
+  it('a wildcard that expands to a suspended app\'s host is refused, and an unrelated one is not', async () => {
+    await getSuspensionStore().suspend('susp', 'admin-1');
+    await register('evil');
+    await register('fine');
+    await declareDomains('evil', ['"*.dropkit.sh"', 'evil.example.com']);
+    await declareDomains('fine', ['"*.example.com"']);
+
+    await (platform as any).handleConfigureRoute('evil', 4100);
+    await (platform as any).handleConfigureRoute('fine', 4200);
+
+    expect(hostsOf('evil')).toEqual(['evil.example.com']);
+    expect(hostsOf('fine')).toEqual(['*.example.com']);
+  });
+
   it("a suspended app's own record claims nothing against itself", async () => {
     await register('site');
     await getSuspensionStore().suspend('site', 'admin-1');

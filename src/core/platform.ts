@@ -161,7 +161,6 @@ import {
   AppManifestInvalidError,
   AppNeedsConfigError,
   AppSuspendedError,
-  suspensionEpisodeCode,
   needsConfigAction,
   StaleDependenciesError,
   setPlatformOps,
@@ -173,7 +172,6 @@ import {
   type DetachServiceRestartOutcome,
   type RedeployRefusal,
   type RedeployStart,
-  type StartRefusalCause,
   type SuspendAppResult,
   type UnsuspendAppResult,
 } from '../api/platform-ops';
@@ -233,7 +231,15 @@ import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAccessLog, resetAccessLog } from '../managers/access-log/access-log';
 import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
 import { getSuspensionStore, resetSuspensionStore, type SuspensionRefusal } from '../managers/suspension';
-import { refusalForApp, refusalForGroup, refusalForGroupName, claimedHostsAgainst } from './suspension-policy';
+import {
+  refusalForApp,
+  refusalForExpansion,
+  hostClaims,
+  claimedAgainst,
+  refusalEpisodeCode,
+  StartRefused,
+  type StartRefusalCause,
+} from './suspension-policy';
 import { sessionCookieName as appSessionCookieName } from '../api/app-access/names';
 import {
   assessAccessGate,
@@ -1002,6 +1008,8 @@ interface UpdateProgress {
   builderEntered: boolean;
   /** failDeployEpisode has already closed this deploy's episode. */
   episodeClosed: boolean;
+  /** The old version has been taken away (replaceLiveProcess returned): a refusal after this left nothing serving. */
+  replaced?: boolean;
 }
 
 /**
@@ -4730,10 +4738,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // container is never in state, so the container-keyed rules cannot see it.
       const verdict =
         refusalForApp(repoName) ??
-        (heldGroup
-          ? (refusalForGroup(heldGroup.group, { except: repoName, trusted: heldGroup.trusted }) ??
-            refusalForGroupName(heldGroup.group, repoName))
-          : null);
+        (heldGroup ? refusalForExpansion(repoName, heldGroup.group, heldGroup.trusted).verdict : null);
       return verdict ? { suspended: verdict.reason, ...(verdict.via !== undefined ? { via: verdict.via } : {}) } : null;
     };
     const stoppedAtEntry = containerStopped();
@@ -4934,23 +4939,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // children would be served on that app's host): refused like a claimed name,
     // with the real cause in the log only. An EXISTING group that later comes to
     // match a record is the owner's own: refused as a suspension, naming it.
-    const nameHeld = refusalForGroupName(group, repoName);
-    if (nameHeld) {
-      const groupHasMembers =
-        (this.stateManager?.getAllApps() ?? []).some(
-          (a) => a.name !== repoName && !a.isGroupContainer && sameName(a.group, group)
-        ) ||
-        (this.appConfigService?.getAllConfigs() ?? []).some((c) => c.name !== repoName && sameName(c.group, group));
-      if (!groupHasMembers) {
-        this.logger.error(
-          `Refusing monorepo group '${group}' for '${repoName}': the name is a suspension record (${nameHeld.via}).`,
-          'MONOREPO'
-        );
-        throw new Error(
-          `Monorepo group '${group}' is already in use by another account. ` +
-            'Choose a different `group:` in drop.yaml.'
-        );
-      }
+    const expansion = refusalForExpansion(repoName, group, containerTrusted);
+    if (expansion.newGroupConflict) {
+      this.logger.error(
+        `Refusing monorepo group '${group}' for '${repoName}': the name is a suspension record (${expansion.verdict?.via}).`,
+        'MONOREPO'
+      );
+      throw new Error(
+        `Monorepo group '${group}' is already in use by another account. ` +
+          'Choose a different `group:` in drop.yaml.'
+      );
     }
     // A member's record freezes the group (a renamed service must not escape it).
     heldGroup = { group, trusted: containerTrusted };
@@ -4971,7 +4969,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return stoppedBeforeTag;
     }
     if (this.stateManager?.hasApp(repoName)) {
-      await this.stateManager.updateApp(repoName, { group, isGroupContainer: true });
+      await this.stateManager.updateApp(repoName, { group, isGroupContainer: true, groupTrusted: containerTrusted });
     }
 
     if (serviceNames.size > this.config.maxConcurrentBuilds) {
@@ -6645,9 +6643,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       const refusedHostnames: string[] = [];
       if (hasCustomDomains && this.appConfigService) {
         const owners = this.appConfigService.getDomainOwners(domainSuffix);
-        // A suspended app's host (its record outlives the app, so `owners` may not list
-        // it) and a suspended member's group host are not for anyone else's `domains:`.
-        const suspendedHosts = claimedHostsAgainst(appName, domainSuffix);
+        // A group's host (nobody's config entry) and a suspension record's host (it
+        // outlives the app, so `owners` may not list it) are not for anyone else's
+        // `domains:`, nor is a wildcard that expands to one.
+        const claims = hostClaims(domainSuffix);
         acceptedCustomDomains = domains.filter((d) => {
           // The platform's OWN host is not in `owners` — it is not an app — so
           // it read as unclaimed, and unclaimed means available. A tenant
@@ -6676,9 +6675,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             );
             return false;
           }
-          if (suspendedHosts.has(d.toLowerCase())) {
+          if (claimedAgainst(claims, d, appName)) {
             this.logger.warn(
-              `Refusing domain '${d}' for ${appName}: it belongs to a suspended application or group`,
+              `Refusing domain '${d}' for ${appName}: it belongs to a monorepo group or a suspended application`,
               'ROUTER'
             );
             refusedHostnames.push(d);
@@ -8139,7 +8138,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           new Error(redeployRefusalOf(appName, refused).refused.message),
           crypto.randomUUID(),
           refused.refused === 'suspended'
-            ? suspensionEpisodeCode({ kind: 'suspended', reason: refused.suspension, via: refused.via })
+            ? refusalEpisodeCode(
+                { kind: 'suspended', reason: refused.suspension, via: refused.via },
+                { replaced: false, live: null }
+              )
             : 'DEPLOY_REFUSED',
           admitted.trigger,
           { newEpisode: true }
@@ -8349,7 +8351,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               appName,
               new Error(new AppSuspendedError(appName, expanded.suspended, expanded.via).tenantMessage),
               crypto.randomUUID(),
-              suspensionEpisodeCode({ kind: 'suspended', reason: expanded.suspended, via: expanded.via }),
+              refusalEpisodeCode(
+                { kind: 'suspended', reason: expanded.suspended, via: expanded.via },
+                { replaced: false, live: null }
+              ),
               undefined,
               { newEpisode: true }
             );
@@ -8433,7 +8438,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           appName,
           new Error(error.tenantMessage),
           crypto.randomUUID(),
-          suspensionEpisodeCode({ kind: 'suspended', reason: error.reason, via: error.via }),
+          refusalEpisodeCode({ kind: 'suspended', reason: error.reason, via: error.via }, { replaced: false, live: null }),
           'deploy',
           { newEpisode: true }
         );
@@ -8952,8 +8957,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // landed during the build is caught here, with nothing awaited between
       // the check and the replace. (startInstance re-checks, but by then the
       // old version is gone.)
-      this.assertStartable(appName);
+      this.gateBeforeSwap(appName);
       await this.replaceLiveProcess(appName);
+      progress.replaced = true;
 
       this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
@@ -9009,8 +9015,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await this.discardDeployTarget(appName);
       // Checked first: a suspension must not fall through to the 'errored'
       // write and the breaker charge below, which would undo the stop.
+      if (error instanceof StartRefused) {
+        await this.settleRefusedStart(appName, error.cause, {
+          progress,
+          closeEpisode: true,
+          replaced: progress.replaced === true,
+        });
+        return false;
+      }
       if (error instanceof AppSuspendedError) {
-        await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason, via: error.via }, { progress, closeEpisode: true });
+        await this.settleRefusedStart(
+          appName,
+          { kind: 'suspended', reason: error.reason, via: error.via },
+          { progress, closeEpisode: true, replaced: progress.replaced === true }
+        );
         return false;
       }
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
@@ -9275,7 +9293,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     targetPath: string,
     detection: DetectionResult,
     outputPath: string | undefined,
-    oldPort: number
+    oldPort: number,
+    ctx?: { stop?: boolean }
   ): Promise<
     | { ok: true; port: number }
     | { ok: false; error: unknown; healthCheckPath: string | undefined }
@@ -9317,7 +9336,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // A suspension that landed during the build or the readiness wait: before
       // anything is persisted or traffic moves, nothing awaited in between.
-      this.assertStartable(appName);
+      this.gateBeforeSwap(appName, ctx);
 
       // Point of no return for bookkeeping: see the method doc on ordering.
       await this.appConfigService?.updateSystemConfig(appName, { runtimeSlot: newSlot });
@@ -9329,7 +9348,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       // Again: the writes above are awaits. Throwing here rolls the config back
       // below; traffic has not moved.
-      this.assertStartable(appName);
+      this.gateBeforeSwap(appName, ctx);
       const switched = await this.router?.setUpstream(appName, `localhost:${newPort}`);
       if (switched?.outcome === 'rejected') {
         throw new CutoverError('Caddy rejected the config that switched traffic to the new version', false);
@@ -9349,6 +9368,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // A suspension is not a failed cutover: the caller settles it, rather than
       // failCutover writing 'errored' and putting 'running' and the prober back.
       if (error instanceof AppSuspendedError) throw error;
+      if (error instanceof StartRefused) {
+        // A caller that passed a ctx speaks StartRefused; the others (rollback,
+        // promotion) settle an AppSuspendedError.
+        if (!ctx && error.cause.kind === 'suspended') {
+          throw new AppSuspendedError(appName, error.cause.reason, error.cause.via);
+        }
+        throw error;
+      }
       return { ok: false, error, healthCheckPath: spec?.healthCheckPath };
     }
 
@@ -9371,6 +9398,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     await this.commitServedPath(appName, targetPath, newSlot);
     void this.recordDeploySignature(appName, this.sourcePathOf(appName));
     const info = await runtime.getStatus(appName);
+    // A suspension that landed during the drain (traffic has already moved, so
+    // nothing can be undone): do not report the app running or arm watches that
+    // would restart what the suspension took away. The closer revokes the key and
+    // leaves the status true; the episode is the caller's.
+    const lateRefusal = refusalForApp(appName);
+    if (lateRefusal?.reason === 'record') {
+      await this.settleRefusedStart(
+        appName,
+        { kind: 'suspended', reason: lateRefusal.reason, via: lateRefusal.via },
+        { closeEpisode: false }
+      );
+      return { ok: true, port: newPort };
+    }
     await this.stateManager?.setAppStatus(appName, 'running', { port: newPort, pid: info?.pid ?? undefined });
     this.appDeployTimes.set(appName, Date.now());
     this.armPostDeployWatches(appName, newPort, spec.healthCheckPath);
@@ -9393,7 +9433,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     healthCheckPath: string | undefined
   ): Promise<void> {
     // Backstop: cutoverTo re-throws a suspension, so it should never arrive here.
-    if (error instanceof AppSuspendedError) throw error;
+    if (error instanceof AppSuspendedError || error instanceof StartRefused) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     const exited = error instanceof CutoverError && error.exited;
     this.logger.warn(`Zero-downtime deploy of ${appName} failed; previous version still serving: ${reason}`, 'CUTOVER');
@@ -9906,6 +9946,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * The refusal that sits right before an irreversible swap (replacing the live
+   * process, persisting a cutover, moving traffic): synchronous, nothing awaited
+   * between it and the step. Throws a `StartRefused` carrying the CAUSE the
+   * closer settles by: a stop recorded on `ctx` (follow-up F's seam; nothing
+   * sets it yet) or the app's refusal. `AppSuspendedError` stays the error of
+   * `startInstance`/`restartInstance`, which have no ctx.
+   */
+  private gateBeforeSwap(appName: string, ctx?: { stop?: boolean }): void {
+    if (ctx?.stop) throw new StartRefused(appName, { kind: 'stopped' });
+    const refusal = refusalForApp(appName);
+    if (refusal) throw new StartRefused(appName, { kind: 'suspended', reason: refusal.reason, via: refusal.via });
+  }
+
+  /**
    * THE choke point for starting an app on the runtime: every start goes
    * through here, so none can skip the suspension check. A test pins
    * `runtime.start(` / `runtime.restart(` to this method and `restartInstance`.
@@ -9934,8 +9988,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    *   1. the guardrail keys are released, UNCHARGED;
    *   2. when `closeEpisode` (the deploy paths: buildAndSwap and a first
    *      deploy), the episode is closed once, with the code
-   *      `suspensionEpisodeCode` gives for the cause and the liveness read
-   *      below, and only when one is open. failDeployEpisode is not idempotent, so
+   *      `refusalEpisodeCode` gives for the cause, `opts.replaced` and the
+   *      liveness read below, and only when one is open. failDeployEpisode is not idempotent, so
    *      `progress.episodeClosed` is set first and closure is read from the
    *      tracker. A restart or a promotion passes false: a restart has no
    *      episode, and a held build's is left open by design;
@@ -9968,7 +10022,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private async settleRefusedStart(
     appName: string,
     cause: StartRefusalCause,
-    opts: { progress?: UpdateProgress; closeEpisode: boolean }
+    opts: { progress?: UpdateProgress; closeEpisode: boolean; replaced?: boolean }
   ): Promise<'DEPLOY_STOPPED' | 'DEPLOY_REFUSED'> {
     // Whether the caller is taking the app down itself, or the store is what refused.
     const unreadable = cause.kind === 'suspended' && cause.reason !== 'record';
@@ -9984,14 +10038,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
     };
     await attempt('release the guardrail keys', () => this.releaseGuardrailKeys(appName));
+    const readLive = async (): Promise<boolean | null> => {
+      try {
+        return (await this.runtimeInstancesOf(appName)).some(isLiveRuntimeState);
+      } catch (err) {
+        this.logger.warn(`Could not read the runtime for ${appName}`, 'SUSPENSION', err);
+        return null;
+      }
+    };
     // Read BEFORE the episode closes: its code says whether anything is still serving.
-    let live: boolean | null = null;
-    try {
-      live = (await this.runtimeInstancesOf(appName)).some(isLiveRuntimeState);
-    } catch (err) {
-      this.logger.warn(`Could not read the runtime for ${appName}`, 'SUSPENSION', err);
-    }
-    const code = suspensionEpisodeCode(cause, live);
+    // Not at all for a stopping platform that closes nothing: no code and no status are wanted.
+    const earlyLive = this.stopping && !opts.closeEpisode ? null : await readLive();
+    const code = refusalEpisodeCode(cause, { replaced: opts.replaced === true, live: earlyLive });
     if (opts.closeEpisode && !opts.progress?.episodeClosed && this.deployEpisodeOpen(appName)) {
       if (opts.progress) opts.progress.episodeClosed = true;
       await attempt('close the deploy episode', () => this.failDeployEpisode(appName, new Error(shown), undefined, code));
@@ -10000,6 +10058,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     await attempt('revoke the provisioning key', () => deleteApiKeysByName(appProvisionKeyName(appName)));
     // A platform that is stopping owns its own shutdown of the state: no write.
     if (this.stopping) return code;
+    // Read again for the STATUS: the closing steps above awaited, and a suspension's own
+    // take-down may have finished since the early read that fed the code.
+    const live = await readLive();
     // An episode this call does not own stays open: the tracker would close it on 'running' or 'errored'.
     const foreignEpisodeOpen = !opts.closeEpisode && this.deployEpisodeOpen(appName);
     const withheld = (status: string): void =>

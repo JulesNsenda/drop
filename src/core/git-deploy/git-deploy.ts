@@ -30,8 +30,8 @@ import { landTracked, readManifest, writeManifest, gitManifestDir } from './land
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { logActivityFor } from '../../managers/activity';
 import { getDeployTracker } from '../../managers/deploy-tracker';
-import { getPlatformOps, AppInProgressError, AppSuspendedError, suspensionEpisodeCode } from '../../api/platform-ops';
-import { refusalForApp } from '../suspension-policy';
+import { getPlatformOps, AppInProgressError, AppSuspendedError } from '../../api/platform-ops';
+import { refusalForApp, refusalEpisodeCode } from '../suspension-policy';
 import { getStateManager } from '../../managers/app/state-manager';
 import type { AppState } from '../../managers/app/state-manager';
 import { isAdminPrincipalId, getUserById } from '../../api/middleware/auth';
@@ -321,7 +321,7 @@ export class GitDeployService {
         error: suspended || !(err instanceof Error) ? new Error(message) : err,
         stage: 'pre-build',
         // The one rule for the code (nothing was looked at here, so a store that cannot answer stopped nothing).
-        ...(suspended ? { code: suspensionEpisodeCode({ kind: 'suspended', reason: err.reason, via: err.via }) } : {}),
+        ...(suspended ? { code: refusalEpisodeCode({ kind: 'suspended', reason: err.reason, via: err.via }, { replaced: false, live: null }) } : {}),
       });
     } catch {
       // Tracker not initialised (isolated tests): observability only.

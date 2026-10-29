@@ -103,35 +103,6 @@ export class AppSuspendedError extends Error {
 }
 
 /**
- * Why a start was cut short, which decides the status text and what to do with
- * an instance that is still live (see the platform's settleRefusedStart). Only
- * `suspended` has callers today; `stopped` is the user-stop cause the closer
- * is shaped for.
- */
-export type StartRefusalCause =
-  | { kind: 'suspended'; reason: AppSuspendedReason; via?: string }
-  | { kind: 'stopped'; error?: string };
-
-/**
- * The deploy-episode code for a refused start, from the cause and what the
- * closer saw of the runtime (`live`: something is up; `null` or omitted:
- * nobody looked, or the runtime could not be read). ONE rule for every surface
- * that closes an episode on a refusal:
- *  - an administrator's record, or a user stop, is DEPLOY_STOPPED;
- *  - otherwise (the store merely cannot answer) it is DEPLOY_STOPPED only when
- *    nothing is live, as after a replace that took the old version away;
- *  - otherwise nobody stopped anything and the old instance may still be
- *    serving, so it is a refusal: DEPLOY_REFUSED.
- */
-export function suspensionEpisodeCode(
-  cause: StartRefusalCause,
-  live?: boolean | null
-): 'DEPLOY_STOPPED' | 'DEPLOY_REFUSED' {
-  if (cause.kind === 'stopped' || cause.reason === 'record') return 'DEPLOY_STOPPED';
-  return live === false ? 'DEPLOY_STOPPED' : 'DEPLOY_REFUSED';
-}
-
-/**
  * Thrown before a start, restart, rollback, promotion or attach that would run
  * a node_modules tree built for a different Node runtime. Those entry points
  * throw it before touching anything; the start-spec backstop beneath them can

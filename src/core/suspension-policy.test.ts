@@ -10,16 +10,17 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { SuspensionStore } from '../managers/suspension';
-import { suspensionEpisodeCode, type StartRefusalCause } from '../api/platform-ops';
 import { resetStateManager } from '../managers/app/state-manager';
 import { resetAppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
 import {
   childrenOf,
-  claimedHostsAgainst,
+  claimedAgainst,
+  hostClaims,
+  refusalEpisodeCode,
   refusalForApp,
-  refusalForGroup,
-  refusalForGroupName,
+  refusalForExpansion,
+  type StartRefusalCause,
   type SuspensionPolicyDeps,
 } from './suspension-policy';
 
@@ -28,6 +29,8 @@ interface FakeApp {
   group?: string;
   isGroupContainer?: boolean;
   userId?: string;
+  /** The trust expandMonorepo persisted on the container's state entry. */
+  groupTrusted?: boolean;
   /** Config-side fields. */
   cfgGroup?: string;
   groupContainer?: string;
@@ -127,10 +130,23 @@ describe('suspension policy: refusalForApp', () => {
       expect(refusalForApp('site-web', depsOf(apps))).toEqual({ reason: 'record', via: 'site' });
     });
 
-    it('a stale stamp to a container that is gone names nothing', async () => {
+    it('a stamp to a container with NO state entry (folder-dropped) stands', async () => {
       await store.suspend('site', 'admin');
       const apps = [{ name: 'site-web', group: 'site', groupContainer: 'site' }];
-      expect(refusalForApp('site-web', depsOf(apps))).toBeNull();
+      expect(refusalForApp('site-web', depsOf(apps))).toEqual({ reason: 'record', via: 'site' });
+    });
+
+    it('a folder-dropped container is frozen by its stamped child\'s record, and has children', async () => {
+      await store.suspend('site-api', 'admin');
+      const apps = [
+        { name: 'site-web', group: 'site', groupContainer: 'site' },
+        { name: 'site-api', group: 'site', groupContainer: 'site' },
+      ];
+      const deps = depsOf(apps);
+      expect(refusalForApp('site', deps)).toEqual({ reason: 'record', via: 'site-api' });
+      expect(childrenOf('site', deps).sort()).toEqual(['site-api', 'site-web']);
+      // The sibling is not frozen by the other child.
+      expect(refusalForApp('site-web', deps)).toBeNull();
     });
 
     it('a bare stamp to an app that is not a container is ignored', async () => {
@@ -196,40 +212,94 @@ describe('suspension policy: refusalForApp', () => {
       expect(refusalForApp('lone', depsOf(apps))).toBeNull();
     });
 
-    it('refusalForGroup answers for a container that is not in state (a folder-dropped one)', async () => {
+    it('refusalForExpansion answers for a group whose container is not in state (a folder-dropped one)', async () => {
       await store.suspend('site-api', 'admin');
       const apps = [{ name: 'site-api', group: 'site' }];
-      expect(refusalForGroup('site', { except: 'site', trusted: true }, depsOf(apps))).toEqual({
-        reason: 'record',
-        via: 'site-api',
+      expect(refusalForExpansion('site', 'site', true, depsOf(apps))).toEqual({
+        verdict: { reason: 'record', via: 'site-api' },
+        newGroupConflict: false,
       });
-      expect(refusalForGroup('site', { except: 'site-api', trusted: true }, depsOf(apps))).toBeNull();
+      expect(refusalForExpansion('site-api', 'site', true, depsOf(apps)).verdict).toBeNull();
     });
   });
 
-  describe('case: trust decides how groups compare, as in expandMonorepo', () => {
-    it("an owned container's group matches ignoring case", async () => {
+  describe('case: the trust expandMonorepo persisted decides how groups compare', () => {
+    it("an untrusted container's group matches ignoring case, when gating", async () => {
       await store.suspend('site', 'admin');
-      const apps = [container('site', { userId: 'u1' }), { name: 'site-web', group: 'SITE' }];
+      const apps = [container('site', { groupTrusted: false }), { name: 'site-web', group: 'SITE' }];
       expect(refusalForApp('site-web', depsOf(apps))).toEqual({ reason: 'record', via: 'site' });
     });
 
-    it("the operator's own (ownerless) container compares exactly", async () => {
+    it('a trusted container compares exactly', async () => {
       await store.suspend('site', 'admin');
-      const apps = [container('site'), { name: 'site-web', group: 'SITE' }];
+      const apps = [container('site', { groupTrusted: true }), { name: 'site-web', group: 'SITE' }];
       expect(refusalForApp('site-web', depsOf(apps))).toBeNull();
+    });
+
+    it('a legacy container (no field) gates ignoring case but is destructive only on an exact match', async () => {
+      await store.suspend('site', 'admin');
+      const apps = [container('site'), { name: 'site-web', group: 'SITE' }, { name: 'site-api', group: 'site' }];
+      expect(refusalForApp('site-web', depsOf(apps))).toEqual({ reason: 'record', via: 'site' });
+      expect(childrenOf('site', depsOf(apps))).toEqual(['site-api']);
+    });
+
+    it('a trusted ezsign group and a tenant EzSign group never cross', async () => {
+      const apps = [
+        container('ezsign', { groupTrusted: true }),
+        container('tenant-site', { group: 'EzSign', groupTrusted: false }),
+        { name: 'ezsign-web', group: 'ezsign' },
+        { name: 'tenant-web', group: 'EzSign' },
+      ];
+      const deps = depsOf(apps);
+
+      // Suspending the trusted container reaches only its own child.
+      await store.suspend('ezsign', 'admin');
+      expect(refusalForApp('ezsign-web', deps)).toEqual({ reason: 'record', via: 'ezsign' });
+      expect(refusalForApp('tenant-web', deps)).toBeNull();
+      expect(refusalForApp('tenant-site', deps)).toBeNull();
+      expect(childrenOf('ezsign', deps)).toEqual(['ezsign-web']);
+      expect(childrenOf('tenant-site', deps)).toEqual(['tenant-web']);
+      await store.unsuspend('ezsign');
+
+      // And the tenant's container reaches only its own.
+      await store.suspend('tenant-site', 'admin');
+      expect(refusalForApp('tenant-web', deps)).toEqual({ reason: 'record', via: 'tenant-site' });
+      expect(refusalForApp('ezsign-web', deps)).toBeNull();
+      expect(refusalForApp('ezsign', deps)).toBeNull();
+      await store.unsuspend('tenant-site');
+
+      // Nor does a member's record freeze the other side's container.
+      await store.suspend('tenant-web', 'admin');
+      expect(refusalForApp('tenant-site', deps)).toEqual({ reason: 'record', via: 'tenant-web' });
+      expect(refusalForApp('ezsign', deps)).toBeNull();
+      await store.unsuspend('tenant-web');
+      await store.suspend('ezsign-web', 'admin');
+      expect(refusalForApp('ezsign', deps)).toEqual({ reason: 'record', via: 'ezsign-web' });
+      expect(refusalForApp('tenant-site', deps)).toBeNull();
     });
   });
 
-  describe('refusalForGroupName', () => {
-    it('finds a record that is the group name, ignoring case', async () => {
+  describe('refusalForExpansion: a group named after a record', () => {
+    it('is a naming conflict when the group has no members, ignoring case', async () => {
       await store.suspend('Shared', 'admin');
-      expect(refusalForGroupName('shared', 'site', depsOf([]))).toEqual({ reason: 'record', via: 'Shared' });
+      expect(refusalForExpansion('site', 'shared', true, depsOf([]))).toEqual({
+        verdict: { reason: 'record', via: 'Shared' },
+        newGroupConflict: true,
+      });
+    });
+
+    it('is a plain suspension (not a conflict) once the group has members', async () => {
+      await store.suspend('shared', 'admin');
+      const apps = [{ name: 'kid', group: 'shared' }];
+      expect(refusalForExpansion('site', 'shared', true, depsOf(apps))).toEqual({
+        verdict: { reason: 'record', via: 'shared' },
+        newGroupConflict: false,
+      });
     });
 
     it("ignores the asking container's own name", async () => {
       await store.suspend('site', 'admin');
-      expect(refusalForGroupName('site', 'site', depsOf([]))).toBeNull();
+      expect(refusalForExpansion('site', 'site', true, depsOf([])).verdict).toBeNull();
     });
   });
 
@@ -276,59 +346,80 @@ describe('suspension policy: refusalForApp', () => {
     });
   });
 
-  describe('claimedHostsAgainst', () => {
-    it("claims every record's host against everyone else", async () => {
+  describe('hostClaims', () => {
+    const holders = (claims: Map<string, Set<string>>, host: string): string[] => [...(claims.get(host) ?? [])].sort();
+
+    it("a record's host belongs to the record alone", async () => {
       await store.suspend('gone', 'admin');
-      const deps = depsOf([{ name: 'evil' }]);
-      expect(claimedHostsAgainst('evil', 'dropkit.sh', deps)).toEqual(new Set(['gone.dropkit.sh']));
+      const claims = hostClaims('dropkit.sh', depsOf([{ name: 'evil' }]));
+      expect(holders(claims, 'gone.dropkit.sh')).toEqual(['gone']);
+      expect(claimedAgainst(claims, 'gone.dropkit.sh', 'evil')).toBe(true);
+      expect(claimedAgainst(claims, 'gone.dropkit.sh', 'gone')).toBe(false);
     });
 
-    it("does not claim an app's own host against itself", async () => {
-      await store.suspend('site', 'admin');
-      expect(claimedHostsAgainst('site', 'dropkit.sh', depsOf([{ name: 'site' }])).size).toBe(0);
+    it('a group host ALWAYS belongs to the container and members, with nothing suspended', () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'evil' }];
+      const claims = hostClaims('dropkit.sh', depsOf(apps));
+      expect(holders(claims, 'site.dropkit.sh')).toEqual(['site', 'site-web']);
+      expect(claimedAgainst(claims, 'site.dropkit.sh', 'evil')).toBe(true);
+      expect(claimedAgainst(claims, 'SITE.dropkit.sh', 'site-web')).toBe(false);
     });
 
-    it('claims the group host of a group with a record-refused member, except for the group itself', async () => {
-      await store.suspend('site-api', 'admin');
-      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'site-api', group: 'site' }, { name: 'evil' }];
-      expect(claimedHostsAgainst('evil', 'dropkit.sh', depsOf(apps))).toEqual(
-        new Set(['site-api.dropkit.sh', 'site.dropkit.sh'])
-      );
-      const forMember = claimedHostsAgainst('site-web', 'dropkit.sh', depsOf(apps));
-      expect(forMember.has('site.dropkit.sh')).toBe(false);
-      expect(forMember.has('site-api.dropkit.sh')).toBe(true);
+    it('a folder-dropped container holds its stamped children\'s group host', () => {
+      const apps = [{ name: 'site-web', group: 'site', groupContainer: 'site' }];
+      expect(holders(hostClaims('dropkit.sh', depsOf(apps)), 'site.dropkit.sh')).toEqual(['site', 'site-web']);
     });
 
-    it('claims nothing while the store is unreadable (no records to list)', async () => {
+    it('a group stays claimed through a config alone (its state entries are gone)', () => {
+      const apps = [{ name: 'kid', group: 'site', configOnly: true }];
+      expect(claimedAgainst(hostClaims('dropkit.sh', depsOf(apps)), 'site.dropkit.sh', 'evil')).toBe(true);
+    });
+
+    it('a wildcard that expands, by one label, to a claimed host is refused', async () => {
+      await store.suspend('susp', 'admin');
+      const claims = hostClaims('localhost', depsOf([{ name: 'evil' }]));
+      expect(claimedAgainst(claims, '*.localhost', 'evil')).toBe(true);
+      expect(claimedAgainst(claims, '*.localhost', 'susp')).toBe(false);
+      expect(claimedAgainst(claims, '*.example.com', 'evil')).toBe(false);
+      // Only a SINGLE label: a deeper claimed host is not a *.rest expansion.
+      const deep = hostClaims('a.localhost', depsOf([{ name: 'evil' }]));
+      expect(claimedAgainst(deep, '*.localhost', 'evil')).toBe(false);
+    });
+
+    it('claims no RECORD host while the store is unreadable (nothing to list)', async () => {
       await store.suspend('gone', 'admin');
       fs.writeFileSync(path.join(dir, 'suspensions.json'), '{ broken');
       jest.spyOn(console, 'error').mockImplementation();
       await store.load();
-      expect(claimedHostsAgainst('evil', 'dropkit.sh', depsOf([{ name: 'evil' }])).size).toBe(0);
+      expect(hostClaims('dropkit.sh', depsOf([{ name: 'evil' }])).size).toBe(0);
     });
   });
 });
 
-describe('suspensionEpisodeCode: the one rule', () => {
+describe('refusalEpisodeCode: the one rule', () => {
   const record: StartRefusalCause = { kind: 'suspended', reason: 'record' };
   const unreadable: StartRefusalCause = { kind: 'suspended', reason: 'store-unreadable' };
+  const stages = [true, false].flatMap((replaced) => [true, false, null].map((live) => ({ replaced, live })));
 
-  it('a record or a user stop is DEPLOY_STOPPED whatever the runtime shows', () => {
-    for (const live of [true, false, null, undefined]) {
-      expect(suspensionEpisodeCode(record, live)).toBe('DEPLOY_STOPPED');
-      expect(suspensionEpisodeCode({ kind: 'stopped' }, live)).toBe('DEPLOY_STOPPED');
+  it('a record or a user stop is DEPLOY_STOPPED at every stage', () => {
+    for (const stage of stages) {
+      expect(refusalEpisodeCode(record, stage)).toBe('DEPLOY_STOPPED');
+      expect(refusalEpisodeCode({ kind: 'stopped' }, stage)).toBe('DEPLOY_STOPPED');
     }
   });
 
-  it('a store that cannot answer is DEPLOY_STOPPED only when nothing is live', () => {
-    expect(suspensionEpisodeCode(unreadable, false)).toBe('DEPLOY_STOPPED');
-    expect(suspensionEpisodeCode({ kind: 'suspended', reason: 'not-loaded' }, false)).toBe('DEPLOY_STOPPED');
+  it('a store that cannot answer is DEPLOY_STOPPED only after the old version was replaced and nothing is live', () => {
+    expect(refusalEpisodeCode(unreadable, { replaced: true, live: false })).toBe('DEPLOY_STOPPED');
+    expect(refusalEpisodeCode({ kind: 'suspended', reason: 'not-loaded' }, { replaced: true, live: false })).toBe(
+      'DEPLOY_STOPPED'
+    );
   });
 
-  it('otherwise (something live, or nobody looked) it is DEPLOY_REFUSED', () => {
-    expect(suspensionEpisodeCode(unreadable, true)).toBe('DEPLOY_REFUSED');
-    expect(suspensionEpisodeCode(unreadable, null)).toBe('DEPLOY_REFUSED');
-    expect(suspensionEpisodeCode(unreadable)).toBe('DEPLOY_REFUSED');
+  it('otherwise (before the swap, something live, or nobody looked) it is DEPLOY_REFUSED', () => {
+    expect(refusalEpisodeCode(unreadable, { replaced: false, live: false })).toBe('DEPLOY_REFUSED');
+    expect(refusalEpisodeCode(unreadable, { replaced: true, live: true })).toBe('DEPLOY_REFUSED');
+    expect(refusalEpisodeCode(unreadable, { replaced: true, live: null })).toBe('DEPLOY_REFUSED');
+    expect(refusalEpisodeCode(unreadable, { replaced: false, live: null })).toBe('DEPLOY_REFUSED');
   });
 });
 
@@ -379,12 +470,33 @@ describe('suspension policy: pins', () => {
   // free to create?), which is name-keyed by nature; the store defines the methods.
   const ALLOWED = new Set(['core/suspension-policy.ts', 'core/app-names.ts', 'managers/suspension/suspension-store.ts']);
 
-  it('only the resolver and the name-reservation rule ask the store by name (refusalFor / isSuspended)', () => {
+  it('only the resolver and the name-reservation rule ask the store by name (refusalFor)', () => {
     const offenders = sourceFiles(srcRoot)
       .filter((file) => !ALLOWED.has(rel(file)))
       .filter((file) => /\.(refusalFor|isSuspended)\(/.test(fs.readFileSync(file, 'utf-8')))
       .map(rel);
     expect(offenders).toEqual([]);
+  });
+
+  /** The method names called on `getSuspensionStore(...)` in a file, however its argument is laid out. */
+  function storeCallsIn(file: string): string[] {
+    const text = fs.readFileSync(file, 'utf-8');
+    return [...text.matchAll(/getSuspensionStore\((?:[^()]|\([^()]*\))*\)\s*\.(\w+)/g)].map((m) => m[1]);
+  }
+
+  it('only the resolver, the name-reservation rule, the platform and one DTO detail import the store', () => {
+    const importers = sourceFiles(srcRoot)
+      .filter((file) => !/^managers\/suspension\//.test(rel(file)))
+      .filter((file) => /\bgetSuspensionStore\b/.test(fs.readFileSync(file, 'utf-8')))
+      .map(rel)
+      .sort();
+    expect(importers).toEqual(['api/routes/apps.ts', 'core/app-names.ts', 'core/platform.ts', 'core/suspension-policy.ts']);
+  });
+
+  it('the platform only writes records and loads the store; apps.ts only reads the record detail', () => {
+    const platformCalls = new Set(storeCallsIn(path.join(srcRoot, 'core/platform.ts')));
+    expect([...platformCalls].sort()).toEqual(['load', 'suspend', 'unsuspend']);
+    expect(storeCallsIn(path.join(srcRoot, 'api/routes/apps.ts'))).toEqual(['get']);
   });
 
   it('the store no longer calls its own name-keyed check THE predicate', () => {

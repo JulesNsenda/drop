@@ -98,6 +98,7 @@ import { getSuspensionStore } from '../managers/suspension';
 import { getDeployTracker, getDeployDetailStore } from '../managers/deploy-tracker';
 import { getDeployBreaker } from '../managers/guardrail/deploy-breaker';
 import { AppSuspendedError } from '../api/platform-ops';
+import { StartRefused } from './suspension-policy';
 import { getAppConfigService } from '../managers/app/app-config';
 import { getDatabaseProvisioner } from '../managers/database';
 import { captureBeforeRedeploy, getRollbackStore } from '../managers/rollback';
@@ -547,7 +548,7 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
       expect(codes).not.toContain('DEPLOY_STOPPED');
     }, 20000);
 
-    it('a first deploy refused because the store went unreadable, with nothing live, is DEPLOY_STOPPED (the closer saw nothing serving)', async () => {
+    it('a first deploy refused because the store went unreadable is DEPLOY_REFUSED: nothing was replaced, so nobody stopped anything', async () => {
       platform = makePlatform();
       await platform.start();
       jest.spyOn(console, 'error').mockImplementation();
@@ -565,7 +566,7 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
 
       const [episode] = getDeployTracker().getEpisodes('fresh');
       expect(episode.status).toBe('failed');
-      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
     }, 20000);
 
     it('the same refusal with an old instance still serving is DEPLOY_REFUSED', async () => {
@@ -589,6 +590,29 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
       expect(episodes.length).toBeGreaterThan(before);
       expect(getDeployDetailStore().getDetail(episodes[0].deployId)?.errorCode).toBe('DEPLOY_REFUSED');
       expect(fakeRuntime.runningNames()).toContain('site');
+    }, 20000);
+  });
+
+  describe('gateBeforeSwap: the seam for a stop', () => {
+    it('speaks the cause: a ctx stop is a stop, a refusal is a suspension, neither is an AppSuspendedError', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const gate = (platform as unknown as { gateBeforeSwap: (a: string, c?: { stop?: boolean }) => void }).gateBeforeSwap.bind(platform);
+
+      expect(() => gate('site')).not.toThrow();
+      expect(() => gate('site', { stop: true })).toThrow(expect.objectContaining({ cause: { kind: 'stopped' } }));
+      await getSuspensionStore().suspend('site', 'admin-1');
+      let thrown: unknown;
+      try {
+        gate('site');
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(StartRefused);
+      expect(thrown).not.toBeInstanceOf(AppSuspendedError);
+      expect((thrown as StartRefused).cause).toEqual({ kind: 'suspended', reason: 'record' });
+      // A stop outranks a refusal, as it will when a stopped deploy is also suspended.
+      expect(() => gate('site', { stop: true })).toThrow(expect.objectContaining({ cause: { kind: 'stopped' } }));
     }, 20000);
   });
 

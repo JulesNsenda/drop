@@ -188,6 +188,17 @@ describe('monorepo group provenance (groupContainer)', () => {
       expect(handleBuildApp).not.toHaveBeenCalled();
     });
 
+    it('persists the trust it decided on the container, for the synchronous resolver', async () => {
+      // Folder-dropped operator container registered into state: ownerless, so trusted.
+      await stateManager.registerApp('ezs', repoPathOf('ezs'), 'unknown');
+      await expand('ezs', ['web']);
+      expect(stateManager.getApp('ezs')).toMatchObject({ isGroupContainer: true, groupTrusted: true });
+
+      await registerTenantContainer();
+      await expand('evil', ['web']);
+      expect(stateManager.getApp('evil')).toMatchObject({ isGroupContainer: true, groupTrusted: false });
+    });
+
     it('does not let a refused container lock the operator out', async () => {
       await seedChild('ezs-web', 'ezs', { groupContainer: 'ezs' });
       await registerTenantContainer();

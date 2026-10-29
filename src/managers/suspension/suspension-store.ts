@@ -51,17 +51,6 @@ export interface SuspensionRecord {
  */
 export type SuspensionRefusal = 'record' | 'store-unreadable' | 'not-loaded';
 
-/**
- * The answer to "is this app refused, and why?" (see `refusalForApp` in
- * core/suspension-policy). `via` names the OTHER app whose record is the
- * cause (its monorepo container, or a member of its group); absent when the
- * app's own record, or the store's own state, is.
- */
-export interface SuspensionVerdict {
-  reason: SuspensionRefusal;
-  via?: string;
-}
-
 /** Refused because the suspension store cannot be trusted; see the module doc. */
 export class SuspensionStoreCorruptError extends Error {
   constructor() {
@@ -166,11 +155,6 @@ export class SuspensionStore {
     if (!this.loaded) return 'not-loaded';
     if (this.corrupt) return 'store-unreadable';
     return this.records.has(keyOf(appName)) ? 'record' : null;
-  }
-
-  /** Whether starts and builds of the app must be refused (see `refusalFor`). */
-  isSuspended(appName: string): boolean {
-    return this.refusalFor(appName) !== null;
   }
 
   /** The app's record, or undefined (also undefined while unavailable: there is nothing to report). */
