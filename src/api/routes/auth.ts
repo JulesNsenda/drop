@@ -34,7 +34,7 @@ import {
   AuthContext,
 } from '../middleware/auth';
 import { tryLogActivity, logActivityFor } from '../../managers/activity';
-import { getStateManager } from '../../managers/app/state-manager';
+import { getStateManager, clearGroupTrustForUser } from '../../managers/app/state-manager';
 import { canAccess, interactiveSessionOnly } from '../access';
 import { getGitDeployServiceOrNull } from '../../core/git-deploy';
 import { assertMintable } from '../agent-scopes';
@@ -486,6 +486,8 @@ auth.put('/users/:id', authMiddleware('admin'), async c => {
     if (!updated) {
       return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
     }
+    // The monorepo trust decision was made for the owner they were.
+    if (body.role !== undefined || body.enabled === false) await clearGroupTrustForUser(id);
   } catch (err) {
     // updateUser throws a plain Error for exactly one business-rule guard
     // (mirroring deleteUser's own last-admin guard) — match that specific

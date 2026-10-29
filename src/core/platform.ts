@@ -1047,6 +1047,8 @@ export class DropPlatform {
   private objectStorage: ObjectStorageProvisioner | null = null;
   /** The object-storage sweep in flight (single-flight), so `stop()` can wait for it. */
   private storageSweep: Promise<void> | null = null;
+  /** The suspension enforcement pass in flight, if any (single-flight, awaited by stop()). */
+  private suspensionSweep: Promise<void> | null = null;
   /** A sweep was requested while one was running: go round once more, it may have missed the new work. */
   private storageSweepAgain = false;
   /** Set when `stop()` begins: the object-storage sweep starts nothing new and winds down. */
@@ -1595,6 +1597,21 @@ export class DropPlatform {
       if (timer) clearTimeout(timer);
       if (outcome === 'timeout') {
         this.logger.warn('Shutdown proceeding with an object-storage sweep still draining', 'STORAGE');
+      }
+    }
+    // Same for the suspension pass: it reserves names in appsInProgress.
+    if (this.suspensionSweep) {
+      let timer: NodeJS.Timeout | undefined;
+      const outcome = await Promise.race([
+        this.suspensionSweep.then(() => 'done' as const),
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), 30_000);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (outcome === 'timeout') {
+        this.logger.warn('Shutdown proceeding with a suspension pass still running', 'SUSPEND');
       }
     }
     this.appsInProgress.clear();
@@ -10208,14 +10225,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     const record = await getSuspensionStore().suspend(appName, by, reason);
 
-    const stopErrors = await this.takeAppDown(appName, { revokeKey: true });
-
-    await state.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
-
-    for (const child of childrenOf(appName)) {
-      const childErrors = await this.takeAppDown(child, { revokeKey: true });
-      stopErrors.push(...childErrors.map((e) => `${child}: ${e}`));
-      if (state.getApp(child)) await state.setAppStatus(child, 'stopped', { error: 'Suspended by admin' });
+    // Only the record write above may throw: each app is isolated, so one that
+    // fails is reported and the rest still go down.
+    const stopErrors: string[] = [];
+    for (const target of [appName, ...childrenOf(appName)]) {
+      try {
+        const errors = await this.takeSuspendedDown(target);
+        // takeAppDown already names the instance it speaks of ('site.a: ...');
+        // only a message that does not start with the app's name gets it. The
+        // app's own are reported as they are.
+        stopErrors.push(
+          ...errors.map((e) => (target === appName || e.startsWith(`${target}:`) || e.startsWith(`${target}.`) ? e : `${target}: ${e}`))
+        );
+      } catch (err) {
+        stopErrors.push(`${target}: ${err instanceof Error ? err.message : 'take-down failed'}`);
+      }
     }
 
     return { suspended: true, at: record.at, ...(stopErrors.length > 0 ? { stopErrors } : {}) };
@@ -10240,9 +10264,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     if (lifted && this.stateManager) {
       for (const child of childrenOf(appName)) {
-        if (this.stateManager.getApp(child) && refusalForApp(child) === null) {
-          await this.stateManager.setAppStatus(child, 'stopped', { error: undefined });
+        if (!this.stateManager.getApp(child) || refusalForApp(child) !== null) continue;
+        // A child that is somehow still up keeps its real status: writing
+        // 'stopped' over it would hide a running instance.
+        let up = true;
+        try {
+          up = (await this.runtimeInstancesOf(child)).length > 0;
+        } catch {
+          // Unreadable: treated as up, the safe reading.
         }
+        if (up) {
+          this.logger.warn(`Unsuspended '${child}' has a live instance (or the runtime is unreadable): status left alone`, 'SUSPEND');
+          continue;
+        }
+        await this.stateManager.setAppStatus(child, 'stopped', { error: undefined });
       }
     }
     return { unsuspended: lifted };
@@ -12350,49 +12385,108 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       void this.sweepRetiredObjectStorage();
       // Its own chain too: retries a take-down that failed, and finds an
       // instance a suspension missed.
-      void this.reconcileSuspensions();
+      void this.enforceSuspensions({ skipBusy: true });
     }, 15 * 60 * 1000);
     this.idleSweepTimer.unref?.();
   }
 
   /**
-   * Idempotent: every app a suspension RECORD refuses (its own, or its
-   * container's) has no live instance and is 'stopped'. Retries what
-   * `suspendApp` could not finish. Acts on the `record` reason only, so an
-   * unreadable store never takes anything down, and by the DESTRUCTIVE
-   * attribution (`childrenOf`) for a container's record, so a case-insensitive
-   * gate reading never reaches an app the container does not own. Skips apps
-   * mid-operation; they are caught on the next pass. Not run at boot.
+   * Make every suspension RECORD true, idempotently: the app it names (if an
+   * app or runtime instance exists under exactly that name) and each of its
+   * `childrenOf` have nothing live, no route, no minted key, and are 'stopped'.
+   * Retries whatever `suspendApp` could not finish, and finds runtime-only
+   * instances (the runtime is listed once per pass). Driven by the records, so
+   * an unreadable store (an empty list) does nothing, and by the DESTRUCTIVE
+   * attribution, so a case-insensitive gate reading never reaches an app the
+   * container does not own. Single-flight; one target failing never stops the
+   * next. `skipBusy`: leave an app mid-operation for the next pass (the sweep);
+   * without it the name is reserved for the take-down (a boot, where nothing
+   * else is running yet).
    */
-  private async reconcileSuspensions(): Promise<void> {
+  private enforceSuspensions(opts: { skipBusy: boolean }): Promise<void> {
+    if (this.suspensionSweep) return this.suspensionSweep;
+    const run = this.runSuspensionEnforcement(opts).finally(() => {
+      this.suspensionSweep = null;
+    });
+    this.suspensionSweep = run;
+    return run;
+  }
+
+  private async runSuspensionEnforcement(opts: { skipBusy: boolean }): Promise<void> {
     const state = this.stateManager;
-    if (!this.runtime || !state) return;
-    for (const app of state.getAllApps()) {
-      const name = app.name;
+    const runtime = this.runtime;
+    if (!runtime || !state) return;
+    const records = getSuspensionStore().list().map((r) => r.name);
+    if (records.length === 0) return;
+
+    const live = new Set<string>();
+    try {
+      for (const p of await runtime.getAllStatus()) live.add(appNameOfInstance(p.instance ?? p.name));
+    } catch (err) {
+      this.logger.warn(
+        `Could not list the runtime to enforce suspensions: ${err instanceof Error ? err.message : String(err)}`,
+        'SUSPEND'
+      );
+    }
+
+    const targets = new Map<string, string>();
+    for (const record of records) {
+      if (state.getApp(record) || live.has(record)) targets.set(record, record);
+      for (const child of childrenOf(record)) if (!targets.has(child)) targets.set(child, record);
+    }
+
+    for (const [name, record] of targets) {
+      if (this.stopping) return;
       try {
-        if (this.appsInProgress.has(name)) continue;
-        const verdict = refusalForApp(name);
-        if (verdict?.reason !== 'record') continue;
-        if (verdict.via !== undefined && !childrenOf(verdict.via).includes(name)) continue;
-        const live = await this.runtimeInstancesOf(name);
-        const current = state.getApp(name);
-        if (live.length === 0 && (!current || current.status === 'stopped')) continue;
-        this.logger.warn(
-          `Suspended app '${name}' was still up (${live.length} instance(s), status '${current?.status}'): taking it down`,
-          'SUSPEND'
-        );
-        const errors = await this.takeAppDown(name, { revokeKey: true });
-        if (errors.length > 0) {
-          this.logger.warn(`Suspended app '${name}' is NOT fully down: ${errors.join('; ')}`, 'SUSPEND');
+        if (opts.skipBusy && this.isBusy(name)) continue;
+        // Reserve for the take-down. Everything from here to it is synchronous:
+        // the record and the target's membership are re-checked on the line before.
+        const reserved = !this.appsInProgress.has(name);
+        if (reserved) this.appsInProgress.add(name);
+        try {
+          const stillHeld =
+            getSuspensionStore().list().some((r) => r.name === record) &&
+            (name === record || childrenOf(record).includes(name));
+          if (!stillHeld) continue;
+          const wasLive = live.has(name) || (state.getApp(name) !== undefined && state.getApp(name)!.status !== 'stopped');
+          const errors = await this.takeSuspendedDown(name);
+          if (wasLive || errors.length > 0) {
+            this.logger.warn(
+              `Suspended app '${name}' (${record === name ? 'its own record' : `via '${record}'`}) ` +
+                (wasLive ? 'was still up: taken down' : 'was checked') +
+                (errors.length > 0 ? `; NOT fully down: ${errors.join('; ')}` : ''),
+              'SUSPEND'
+            );
+          }
+        } finally {
+          if (reserved) this.appsInProgress.delete(name);
         }
-        if (state.getApp(name)) await state.setAppStatus(name, 'stopped', { error: 'Suspended by admin' });
       } catch (err) {
         this.logger.warn(
-          `Could not reconcile the suspension of '${name}': ${err instanceof Error ? err.message : String(err)}`,
+          `Could not enforce the suspension of '${name}': ${err instanceof Error ? err.message : String(err)}`,
           'SUSPEND'
         );
       }
     }
+  }
+
+  /**
+   * The ONE take-down of a suspended app: `takeAppDown` (idempotent, so it
+   * always runs, revoke and route removal included) and the 'stopped' status
+   * the suspension leaves. Returns what did not work; shared by `suspendApp`
+   * and the enforcement pass.
+   */
+  private async takeSuspendedDown(name: string): Promise<string[]> {
+    const errors = await this.takeAppDown(name, { revokeKey: true });
+    const state = this.stateManager;
+    if (state?.getApp(name)) {
+      try {
+        await state.setAppStatus(name, 'stopped', { error: 'Suspended by admin' });
+      } catch (err) {
+        errors.push(`status: ${err instanceof Error ? err.message : 'write failed'}`);
+      }
+    }
+    return errors;
   }
 
   /**

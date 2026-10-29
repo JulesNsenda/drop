@@ -150,10 +150,11 @@ export const sameNameIgnoringCase: NameMatch = (x, y) =>
 
 /** How `container` compares group names for this use (see the module doc). */
 function sameNameFor(container: string, use: Use, deps: SuspensionPolicyDeps): NameMatch {
+  // Something that DESTROYS never reads a group name loosely, trusted or not.
+  if (use === 'destructive') return exact;
   const trusted = deps.state?.getApp(container)?.groupTrusted;
   if (trusted === true) return exact;
-  if (trusted === false) return sameNameIgnoringCase;
-  return use === 'destructive' ? exact : sameNameIgnoringCase;
+  return sameNameIgnoringCase;
 }
 
 function isStateContainer(name: string, deps: SuspensionPolicyDeps): boolean {
@@ -227,8 +228,12 @@ function containersOf(name: string, use: Use, deps: SuspensionPolicyDeps): strin
   // A child that matches a TRUSTED container exactly is that container's alone: it
   // narrows the containers found by GROUP NAME, never the one explicitly stamped.
   const exactlyTrusted = new Set([...found].filter(([, v]) => v.trusted && v.exactly).map(([c]) => c));
+  // For something destructive a child with a current stamp belongs ONLY to its stamped container.
+  const stampOnly = use === 'destructive' && [...found.values()].some((v) => v.stamped);
   return [...found]
-    .filter(([container, v]) => v.stamped || exactlyTrusted.size === 0 || exactlyTrusted.has(container))
+    .filter(([container, v]) =>
+      stampOnly ? v.stamped : v.stamped || exactlyTrusted.size === 0 || exactlyTrusted.has(container)
+    )
     .map(([container]) => container);
 }
 

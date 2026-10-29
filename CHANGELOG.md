@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Suspending a monorepo container now takes all of its services down (and revokes their keys), and lifting it leaves them stopped. It used to be refused with a 409 telling the caller to suspend the services one by one.
+
 ## [1.8.0] - 2026-10-29
 
 ### Security

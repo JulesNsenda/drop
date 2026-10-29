@@ -18,7 +18,7 @@ import {
   AuthContext,
 } from '../middleware/auth';
 import { interactiveSessionOnly } from '../access';
-import { getStateManager } from '../../managers/app/state-manager';
+import { getStateManager, clearGroupTrustForUser } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
 import { logActivityFor } from '../../managers/activity';
 import { getDiskFreeMb } from '../../utils/disk';
@@ -29,7 +29,7 @@ import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } fro
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
 import { getPlatformOps } from '../platform-ops';
-import { refusalForApp } from '../../core/suspension-policy';
+import { refusalForApp, childrenOf } from '../../core/suspension-policy';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import {
   getObjectStorageProvisioner,
@@ -210,6 +210,7 @@ admin.post('/users/:id/suspend', async (c) => {
     if (!suspended) {
       return c.json(error(ErrorCodes.NOT_FOUND, 'User not found'), 404);
     }
+    await clearGroupTrustForUser(userId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Suspend failed';
     return c.json(error(ErrorCodes.BAD_REQUEST, msg), 400);
@@ -315,7 +316,8 @@ admin.post('/apps/:name/suspend', async (c) => {
   const stateManager = getStateManager();
   const app = stateManager.getApp(appName);
 
-  if (!app) {
+  // A folder-dropped container has no state entry of its own, only children.
+  if (!app && childrenOf(appName).length === 0) {
     return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' not found`), 404);
   }
 

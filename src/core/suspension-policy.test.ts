@@ -406,6 +406,20 @@ describe('suspension policy: refusalForApp', () => {
     });
   });
 
+  describe('childrenOf is exact for anything destructive', () => {
+    it('an untrusted container still does not reach a case-variant group, and a stamped child is its stamp\'s alone', () => {
+      const apps = [
+        { ...container('Mono'), groupTrusted: false },
+        { name: 'theirs', group: 'mono' },
+        { name: 'mine', group: 'Mono' },
+        container('Mono2', { group: 'Mono' }),
+        { name: 'stamped', group: 'Mono', groupContainer: 'Mono2', cfgGroup: 'Mono' },
+      ];
+      expect(childrenOf('Mono', depsOf(apps))).toEqual(['mine']);
+      expect(childrenOf('Mono2', depsOf(apps))).toContain('stamped');
+    });
+  });
+
   describe('hostClaims', () => {
     const holders = (claims: Map<string, Set<string>>, host: string): string[] => [...(claims.get(host) ?? [])].sort();
 
@@ -595,7 +609,7 @@ describe('suspension policy: pins', () => {
 
   it('the platform only writes records and loads the store; apps.ts only reads the record detail', () => {
     const platformCalls = new Set(storeCallsIn(path.join(srcRoot, 'core/platform.ts')));
-    expect([...platformCalls].sort()).toEqual(['load', 'suspend', 'unsuspend']);
+    expect([...platformCalls].sort()).toEqual(['list', 'load', 'suspend', 'unsuspend']);
     expect(storeCallsIn(path.join(srcRoot, 'api/routes/apps.ts'))).toEqual(['get']);
   });
 
