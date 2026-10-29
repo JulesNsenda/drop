@@ -129,6 +129,7 @@ import { getStateManager } from '../managers/app/state-manager';
 import { getAppConfigService } from '../managers/app/app-config';
 import { getDeployTracker, getDeployDetailStore } from '../managers/deploy-tracker';
 import { getDeployBreaker } from '../managers/guardrail/deploy-breaker';
+import { getSuspensionStore } from '../managers/suspension';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 10000, intervalMs = 25): Promise<void> {
   const started = Date.now();
@@ -438,6 +439,76 @@ describe('zero-downtime cutover (#298 step 5)', () => {
     expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
     expect(recordFailure).not.toHaveBeenCalled();
   }, 30000);
+
+  describe('a suspension landing after the new instance started', () => {
+    type CutoverInternals = {
+      awaitStrictReadiness: (...a: unknown[]) => Promise<unknown>;
+      cutovers: Set<string>;
+      router: { setUpstream: (...a: unknown[]) => unknown };
+    };
+
+    async function expectNothingSwitched(oldPort: number, setUpstream: jest.SpyInstance): Promise<void> {
+      expect(setUpstream).not.toHaveBeenCalled();
+      // The new instance was deleted, the old one never was, and the slot did not move.
+      expect(log).toContain('delete site.b');
+      expect(log).not.toContain('delete site');
+      expect(fakeRuntime.getLiveInstance('site')).toBe('a');
+      expect(cfg('site')?.port).toBe(oldPort);
+      expect((platform as unknown as CutoverInternals).cutovers.has('site')).toBe(false);
+      const [episode] = getDeployTracker().getEpisodes('site');
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+    }
+
+    it('after readiness, before anything is persisted: nothing is persisted and traffic does not move', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const oldPort = getStateManager().getApp('site')!.port!;
+      const internals = platform as unknown as CutoverInternals;
+      const setUpstream = jest.spyOn(internals.router, 'setUpstream');
+      const ready = internals.awaitStrictReadiness.bind(platform);
+      jest.spyOn(internals, 'awaitStrictReadiness').mockImplementationOnce(async (...a: unknown[]) => {
+        const result = await ready(...a);
+        await getSuspensionStore().suspend('site', 'admin-1');
+        return result;
+      });
+      log.length = 0;
+
+      await redeploy('site', appPath, 'v2');
+
+      await expectNothingSwitched(oldPort, setUpstream);
+      expect(cfg('site')?.runtimeSlot).toBeUndefined();
+    }, 30000);
+
+    it('after the config writes, before the traffic switch: the config is put back and traffic does not move', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deployV1('site');
+      const oldPort = getStateManager().getApp('site')!.port!;
+      const internals = platform as unknown as CutoverInternals;
+      const setUpstream = jest.spyOn(internals.router, 'setUpstream');
+      const acs = getAppConfigService();
+      const updateConfig = acs.updateConfig.bind(acs);
+      let suspended = false;
+      jest.spyOn(acs, 'updateConfig').mockImplementation(async (...a: Parameters<typeof updateConfig>) => {
+        const result = await updateConfig(...a);
+        // The cutover's own write of the new port (not the earlier bookkeeping, nor the rollback's).
+        const port = (a[1] as { port?: number }).port;
+        if (!suspended && port !== undefined && port !== oldPort) {
+          suspended = true;
+          await getSuspensionStore().suspend('site', 'admin-1');
+        }
+        return result;
+      });
+      log.length = 0;
+
+      await redeploy('site', appPath, 'v2');
+
+      await expectNothingSwitched(oldPort, setUpstream);
+      expect(cfg('site')?.runtimeSlot).toBe('a');
+    }, 30000);
+  });
 
   it('never routes traffic to the new instance on its start event', async () => {
     platform = makePlatform();

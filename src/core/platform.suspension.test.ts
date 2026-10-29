@@ -886,7 +886,8 @@ describe('app suspension (platform, Item 1)', () => {
         await deployed();
         fakeRuntime.reset();
         jest.spyOn(internals(), 'noteRuntimeLogEnd').mockRejectedValue(new Error('disk gone'));
-        await expect(settle(new AppSuspendedError('site', 'record'))).resolves.toBeUndefined();
+        // The closer answers with the episode code it closed (or would have closed) with.
+        await expect(settle(new AppSuspendedError('site', 'record'))).resolves.toBe('DEPLOY_STOPPED');
         expect(getStateManager().getApp('site')?.status).toBe('stopped');
       });
 
