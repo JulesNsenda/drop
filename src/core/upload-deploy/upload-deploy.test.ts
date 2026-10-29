@@ -920,6 +920,31 @@ describe('UploadDeployService', () => {
       expect(fssync.existsSync(path.join(appsDir, 'late'))).toBe(false);
     });
 
+    it("refuses an upload to a CHILD of a suspended container, naming the container, and leaves the tree unchanged", async () => {
+      await service.deploy({
+        appName: 'kid',
+        archivePath: await buildArchive('kid-v1', { 'index.js': 'v1', 'keep.js': 'keep' }),
+        userId: 'user-1',
+      });
+      const state = getStateManager();
+      await state.registerApp('kid-site', path.join(appsDir, 'kid-site'), 'unknown');
+      await state.updateApp('kid-site', { isGroupContainer: true, group: 'kid-site' } as never);
+      await state.updateApp('kid', { group: 'kid-site' } as never);
+      const before = await snapshotTree(path.join(appsDir, 'kid'));
+      await getSuspensionStore().suspend('kid-site', 'admin-1');
+
+      await expect(
+        service.deploy({
+          appName: 'kid',
+          archivePath: await buildArchive('kid-v2', { 'index.js': 'v2 tenant' }),
+          userId: 'user-1',
+        })
+      ).rejects.toMatchObject({ code: 'APP_SUSPENDED', reason: 'record', via: 'kid-site' });
+
+      expect(await snapshotTree(path.join(appsDir, 'kid'))).toEqual(before);
+      expect(service.isUploading('kid')).toBe(false);
+    });
+
     it('refuses an admin upload the same way: suspension is not an ownership question', async () => {
       await service.deploy({ appName: 'frozen', archivePath: await buildArchive('f1', { 'index.js': 'v1' }) });
       await getSuspensionStore().suspend('frozen', 'admin-1');

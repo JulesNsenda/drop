@@ -34,7 +34,7 @@ import { setApiRuntimeConfig } from '../runtime-config';
 import { setPlatformOps, resetPlatformOps, PlatformOps, AppInProgressError, AppSuspendedError, StaleDependenciesError } from '../platform-ops';
 import * as activityModule from '../../managers/activity';
 import { makePlatformOpsStub } from '../__testutils__/platform-ops';
-import { getSuspensionStore } from '../../managers/suspension';
+import { getSuspensionStore, resetSuspensionStore } from '../../managers/suspension';
 import { resetUploadPreflightState } from '../upload-preflight';
 import * as diskUtils from '../../utils/disk';
 import * as runtimeConfigModule from '../runtime-config';
@@ -739,6 +739,63 @@ describe('MCP tool handlers', () => {
       expect(result.isError).toBeFalsy();
       expect(firstText(result)).toContain('name: alice-app');
       expect(firstText(result)).toContain('status:');
+    });
+
+    describe('suspension in the status tools', () => {
+      const admin: AuthContext = { userId: 'admin-id', username: 'admin', role: 'admin', authMethod: 'apikey' };
+
+      /** alice-site is a monorepo container, alice-kid a child of its group. */
+      async function containerWithChild(): Promise<void> {
+        const state = getStateManager();
+        await state.registerApp('alice-site', path.join(tempDir, 'alice-site'));
+        await state.updateApp('alice-site', { userId: alice.userId, isGroupContainer: true, group: 'alice-site' } as never);
+        await state.registerApp('alice-kid', path.join(tempDir, 'alice-kid'));
+        await state.updateApp('alice-kid', { userId: alice.userId, group: 'alice-site' } as never);
+      }
+
+      it('list_apps and app_status mark a suspended app, and verify_deployment reports it beside "not running"', async () => {
+        await getSuspensionStore().suspend('alice-app', 'admin-1');
+        await getStateManager().setAppStatus('alice-app', 'stopped');
+
+        expect(firstText(handleListApps(alice))).toContain('alice-app  status=stopped');
+        expect(firstText(handleListApps(alice))).toContain('suspended=record');
+        expect(firstText(await handleAppStatus(alice, { name: 'alice-app' }))).toContain('suspended: record');
+        const verify = await handleVerifyDeployment(alice, { name: 'alice-app' });
+        expect(firstText(verify)).toContain('It is suspended: record');
+        expect(verify.structuredContent).toMatchObject({ ok: false, suspended: 'record' });
+      });
+
+      it('an app that is not suspended carries no suspended field anywhere', async () => {
+        expect(firstText(handleListApps(alice))).not.toContain('suspended');
+        expect(firstText(await handleAppStatus(alice, { name: 'alice-app' }))).not.toContain('suspended');
+        expect((await handleVerifyDeployment(alice, { name: 'alice-app' })).structuredContent).not.toHaveProperty('suspended');
+      });
+
+      it("a child of a suspended container reads suspended, naming the container, in all three", async () => {
+        await containerWithChild();
+        await getSuspensionStore().suspend('alice-site', 'admin-1');
+
+        expect(firstText(handleListApps(alice))).toContain('alice-kid  status=');
+        expect(firstText(handleListApps(alice))).toContain('suspended=record (via alice-site)');
+        expect(firstText(await handleAppStatus(alice, { name: 'alice-kid' }))).toContain(
+          'suspended: record (via alice-site)'
+        );
+        expect((await handleVerifyDeployment(alice, { name: 'alice-kid' })).structuredContent).toMatchObject({
+          suspended: 'record (via alice-site)',
+        });
+      });
+
+      it("the suspension store's own state is for an admin; anyone else sees a plain record", async () => {
+        const storeFile = path.join(tempDir, 'unreadable-suspensions.json');
+        await fs.writeFile(storeFile, '{ broken');
+        resetSuspensionStore();
+        await getSuspensionStore(storeFile).load();
+
+        expect(firstText(await handleAppStatus(admin, { name: 'alice-app' }))).toContain('suspended: store-unreadable');
+        const asOwner = firstText(await handleAppStatus(alice, { name: 'alice-app' }));
+        expect(asOwner).toContain('suspended: record');
+        expect(asOwner).not.toContain('store-unreadable');
+      });
     });
 
     describe('app_status resource figures (#294)', () => {

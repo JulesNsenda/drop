@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { SuspensionStore } from '../managers/suspension';
+import { suspensionEpisodeCode, type StartRefusalCause } from '../api/platform-ops';
 import { resetStateManager } from '../managers/app/state-manager';
 import { resetAppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
@@ -286,6 +287,29 @@ describe('suspension policy: refusalForApp', () => {
       await store.load();
       expect(claimedHostsAgainst('evil', 'dropkit.sh', depsOf([{ name: 'evil' }])).size).toBe(0);
     });
+  });
+});
+
+describe('suspensionEpisodeCode: the one rule', () => {
+  const record: StartRefusalCause = { kind: 'suspended', reason: 'record' };
+  const unreadable: StartRefusalCause = { kind: 'suspended', reason: 'store-unreadable' };
+
+  it('a record or a user stop is DEPLOY_STOPPED whatever the runtime shows', () => {
+    for (const live of [true, false, null, undefined]) {
+      expect(suspensionEpisodeCode(record, live)).toBe('DEPLOY_STOPPED');
+      expect(suspensionEpisodeCode({ kind: 'stopped' }, live)).toBe('DEPLOY_STOPPED');
+    }
+  });
+
+  it('a store that cannot answer is DEPLOY_STOPPED only when nothing is live', () => {
+    expect(suspensionEpisodeCode(unreadable, false)).toBe('DEPLOY_STOPPED');
+    expect(suspensionEpisodeCode({ kind: 'suspended', reason: 'not-loaded' }, false)).toBe('DEPLOY_STOPPED');
+  });
+
+  it('otherwise (something live, or nobody looked) it is DEPLOY_REFUSED', () => {
+    expect(suspensionEpisodeCode(unreadable, true)).toBe('DEPLOY_REFUSED');
+    expect(suspensionEpisodeCode(unreadable, null)).toBe('DEPLOY_REFUSED');
+    expect(suspensionEpisodeCode(unreadable)).toBe('DEPLOY_REFUSED');
   });
 });
 
