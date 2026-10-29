@@ -324,6 +324,10 @@ const SUSPENDED_FOR_AGENTS = (err: AppSuspendedError): string =>
       ? `The suspension store is not loaded yet, so '${err.appName}' cannot be started; retry shortly.`
       : `The suspension store is unreadable, so '${err.appName}' cannot be started until an operator repairs it; do not retry.`;
 
+/** The store's own state (unreadable, not loaded) is for admins; anyone else gets the generic refusal. */
+const suspendedFor = (err: AppSuspendedError, isAdmin: boolean): string =>
+  err.reason !== 'record' && !isAdmin ? err.tenantMessage : SUSPENDED_FOR_AGENTS(err);
+
 /** Stamp a known deploy id on a result: in the text and as `deploy_id`, so every answer can reach get_deploy_logs. */
 function withDeployId(result: CallToolResult, deployId: string): CallToolResult {
   const [first, ...rest] = result.content;
@@ -1165,7 +1169,7 @@ export async function handleRollbackApp(
         `${err.message} A snapshot is taken only when deploy_files or a git redeploy replaces a running app.`
       );
     }
-    if (err instanceof AppSuspendedError) return toolError(SUSPENDED_FOR_AGENTS(err));
+    if (err instanceof AppSuspendedError) return toolError(suspendedFor(err, auth?.role === 'admin'));
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return toolError(err.message);
     }
@@ -1267,7 +1271,7 @@ export async function handleRestartApp(
     await auditToolAction(auth, 'restart', args.name, 'restart_app');
     return toolText(`Application '${args.name}' restarted.`);
   } catch (err) {
-    if (err instanceof AppSuspendedError) return toolError(SUSPENDED_FOR_AGENTS(err));
+    if (err instanceof AppSuspendedError) return toolError(suspendedFor(err, auth?.role === 'admin'));
     if (err instanceof AppInProgressError) return toolError(err.message);
     if (err instanceof StaleDependenciesError) return toolError(`${err.message} ${STALE_FOR_AGENTS}`);
     return toolError(

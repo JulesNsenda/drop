@@ -1329,15 +1329,39 @@ describe('MCP tool handlers', () => {
       expect(firstText(result)).not.toContain('restart_app starts it');
     });
 
-    it('restart_app names an unreadable suspension store as the reason, not an administrator', async () => {
+    it.each(['store-unreadable', 'not-loaded'] as const)(
+      'rollback_app does not describe a %s suspension store to a non-admin: the generic refusal only',
+      async (reason) => {
+        setPlatformOps(makeOps({ rollbackApp: jest.fn().mockRejectedValue(new AppSuspendedError('alice-app', reason)) }));
+
+        const result = await handleRollbackApp(alice, { name: 'alice-app' });
+
+        expect(result.isError).toBe(true);
+        expect(firstText(result)).toBe("Starting 'alice-app' is refused right now; contact your administrator");
+      }
+    );
+
+    it('restart_app names an unreadable suspension store as the reason to an admin, not an administrator', async () => {
       setPlatformOps(makeOps({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('alice-app', 'store-unreadable')) }));
 
-      const result = await handleRestartApp(alice, { name: 'alice-app' });
+      const result = await handleRestartApp({ ...bob, role: 'admin' }, { name: 'alice-app' });
 
       expect(result.isError).toBe(true);
       expect(firstText(result)).toContain('suspension store is unreadable');
       expect(firstText(result)).not.toContain('by an administrator');
     });
+
+    it.each(['store-unreadable', 'not-loaded'] as const)(
+      'restart_app does not describe a %s suspension store to a non-admin: the generic refusal only',
+      async (reason) => {
+        setPlatformOps(makeOps({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('alice-app', reason)) }));
+
+        const result = await handleRestartApp(alice, { name: 'alice-app' });
+
+        expect(result.isError).toBe(true);
+        expect(firstText(result)).toBe("Starting 'alice-app' is refused right now; contact your administrator");
+      }
+    );
 
     it('waits for a started redeploy by its deploy id, not the newest episode, and stamps the id on the answer', async () => {
       setPlatformOps(makeOps({ redeployApp: jest.fn().mockResolvedValue({ started: 'mine' }) }));

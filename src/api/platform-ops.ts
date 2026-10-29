@@ -15,6 +15,7 @@
 
 import { AppProcessInfo } from '../managers/runtime';
 import type { RollbackSnapshotMeta } from '../managers/rollback';
+import type { SuspensionRefusal } from '../managers/suspension/suspension-store';
 // Only the three the PlatformOps interface below actually references —
 // DetachServiceOutcome/DetachServiceRestartOutcome are re-exported (below)
 // but not used in this file's own signatures.
@@ -60,7 +61,7 @@ export class AppInProgressError extends Error {
  * not be conflated, or an operator hunts for an administrator who suspended an
  * app that nobody suspended.
  */
-export type AppSuspendedReason = 'record' | 'store-unreadable' | 'not-loaded';
+export type AppSuspendedReason = SuspensionRefusal;
 
 export class AppSuspendedError extends Error {
   readonly code = 'APP_SUSPENDED';
@@ -77,6 +78,18 @@ export class AppSuspendedError extends Error {
           : `The suspension store is unreadable, so starting '${appName}' is refused until it is repaired`
     );
     this.name = 'AppSuspendedError';
+  }
+
+  /**
+   * What a caller who is not an administrator may be told. A `record` is an
+   * administrator's act and already shows on the app; the suspension store's own
+   * state (unreadable, not loaded) is the platform's, and is for admins and the
+   * server log only.
+   */
+  get tenantMessage(): string {
+    return this.reason === 'record'
+      ? this.message
+      : `Starting '${this.appName}' is refused right now; contact your administrator`;
   }
 }
 

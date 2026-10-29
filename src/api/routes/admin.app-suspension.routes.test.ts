@@ -10,7 +10,7 @@
  */
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { createUser, createApiKey } from '../middleware/auth';
+import { createUser, createApiKey, listApiKeys, appProvisionKeyName } from '../middleware/auth';
 import * as appConfigModule from '../../managers/app/app-config';
 import { getTestToken } from '../__testutils__/auth';
 import { createTestApiServer, teardownTestApiServer, type TestApiServer } from '../__testutils__/api-server';
@@ -213,15 +213,37 @@ describe('app suspension routes', () => {
       expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
     });
 
-    it('an unreadable store is reported as the store, not as an administrator', async () => {
+    it('an unreadable store is reported to an admin as the store, not as an administrator', async () => {
       ops({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('shop', 'store-unreadable')) });
 
-      const res = await post('/api/v1/apps/shop/restart', ownerToken);
+      const res = await post('/api/v1/apps/shop/restart', adminToken);
 
       expect(res.status).toBe(409);
       const body = (await res.json()) as { error: { message: string } };
       expect(body.error.message).toContain('suspension store is unreadable');
       expect(body.error.message).not.toContain('administrator');
+    });
+
+    it.each(['store-unreadable', 'not-loaded'] as const)(
+      'a %s store is not described to the owner: only the generic refusal',
+      async (reason) => {
+        ops({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('shop', reason)) });
+
+        const res = await post('/api/v1/apps/shop/restart', ownerToken);
+
+        expect(res.status).toBe(409);
+        const body = (await res.json()) as { error: { code: string; message: string } };
+        expect(body.error.code).toBe('APP_SUSPENDED');
+        expect(body.error.message).toBe("Starting 'shop' is refused right now; contact your administrator");
+      }
+    );
+
+    it('a real suspension is still described to the owner as one', async () => {
+      ops({ restartApp: jest.fn().mockRejectedValue(new AppSuspendedError('shop', 'record')) });
+
+      const res = await post('/api/v1/apps/shop/restart', ownerToken);
+
+      expect(((await res.json()) as { error: { message: string } }).error.message).toContain('suspended by an administrator');
     });
   });
 
@@ -266,6 +288,72 @@ describe('app suspension routes', () => {
       expect(res.status).toBe(200);
       expect(updateSystemConfig).toHaveBeenCalledWith('shop', { grantedApiScopes: [] });
       expect(ops_.restartApp).not.toHaveBeenCalled();
+    });
+
+    it('revokes the app\'s minted DROP_API_KEY when it narrows the grant, since no restart will re-mint it', async () => {
+      ops();
+      await getSuspensionStore().suspend('shop', adminId);
+      storedGrant(['users:create']);
+      await createApiKey(appProvisionKeyName('shop'), 'none', undefined, ['users:create']);
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(true);
+
+      const res = await putScopes([]);
+
+      expect(res.status).toBe(200);
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(false);
+    });
+
+    it('keeps the key on an unchanged PUT while the store (not a suspension) is what refuses', async () => {
+      const ops_ = ops();
+      jest.spyOn(console, 'error').mockImplementation();
+      await fs.writeFile(path.join(t.tempDir, 'suspensions.json'), '{ broken');
+      await getSuspensionStore().load();
+      storedGrant(['users:create']);
+      await createApiKey(appProvisionKeyName('shop'), 'none', undefined, ['users:create']);
+
+      const res = await putScopes(['users:create']);
+
+      expect(res.status).toBe(200);
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(true);
+      expect(ops_.restartApp).not.toHaveBeenCalled();
+    });
+
+    it('revokes the key on a narrowing PUT while the store is what refuses, without a restart', async () => {
+      const ops_ = ops();
+      jest.spyOn(console, 'error').mockImplementation();
+      await fs.writeFile(path.join(t.tempDir, 'suspensions.json'), '{ broken');
+      await getSuspensionStore().load();
+      storedGrant(['users:create']);
+      await createApiKey(appProvisionKeyName('shop'), 'none', undefined, ['users:create']);
+
+      const res = await putScopes([]);
+
+      expect(res.status).toBe(200);
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(false);
+      expect(ops_.restartApp).not.toHaveBeenCalled();
+    });
+
+    it('keeps the key on an unchanged PUT for a real suspension too (nothing narrowed)', async () => {
+      ops();
+      await getSuspensionStore().suspend('shop', adminId);
+      storedGrant(['users:create']);
+      await createApiKey(appProvisionKeyName('shop'), 'none', undefined, ['users:create']);
+
+      await putScopes(['users:create']);
+
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(true);
+    });
+
+    it('revokes the key before the grant is written or the ops check', async () => {
+      resetPlatformOps();
+      await getSuspensionStore().suspend('shop', adminId);
+      const updateSystemConfig = storedGrant(['users:create']);
+      updateSystemConfig.mockRejectedValue(new Error('disk full'));
+      await createApiKey(appProvisionKeyName('shop'), 'none', undefined, ['users:create']);
+
+      await putScopes([]);
+
+      expect(listApiKeys().some((k) => k.name === appProvisionKeyName('shop'))).toBe(false);
     });
 
     it('lets an unchanged grant through too (nothing widens), still without a restart', async () => {

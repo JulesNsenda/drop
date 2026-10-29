@@ -45,6 +45,12 @@ export interface SuspensionRecord {
   app?: string;
 }
 
+/**
+ * Why a start must be refused (see `refusalFor`): `record` is one app's own
+ * suspension; the other two mean the store cannot answer for ANY app.
+ */
+export type SuspensionRefusal = 'record' | 'store-unreadable' | 'not-loaded';
+
 /** Refused because the suspension store cannot be trusted; see the module doc. */
 export class SuspensionStoreCorruptError extends Error {
   constructor() {
@@ -144,7 +150,7 @@ export class SuspensionStore {
    * either way); `record` is one app's own suspension. Everything that decides
    * "refuse?" reads this, so no caller can disagree about what the cases are.
    */
-  refusalFor(appName: string): null | 'record' | 'store-unreadable' | 'not-loaded' {
+  refusalFor(appName: string): SuspensionRefusal | null {
     if (!this.loaded) return 'not-loaded';
     if (this.corrupt) return 'store-unreadable';
     return this.records.has(keyOf(appName)) ? 'record' : null;

@@ -2595,6 +2595,11 @@ export async function deleteApiKey(keyId: string): Promise<boolean> {
   return true;
 }
 
+/** The name of an app's minted provisioning key (its DROP_API_KEY): minted, and revoked, under this name. */
+export function appProvisionKeyName(appName: string): string {
+  return `app:${appName}:provision`;
+}
+
 /**
  * Delete all API keys with a given name (used to rotate the CLI local key on restart).
  */

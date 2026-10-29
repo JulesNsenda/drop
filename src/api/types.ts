@@ -6,6 +6,7 @@
 
 import { AppStatus, AppType } from '../managers/app/state-manager';
 import type { GitSource } from '../core/git-deploy/git-deploy.types';
+import type { SuspensionRefusal } from '../managers/suspension/suspension-store';
 import type { DeployStageName, DeployStatus } from '../managers/deploy-tracker';
 
 // API Response wrapper
@@ -41,8 +42,7 @@ export interface ApiMeta {
  */
 export type AppSuspensionDto =
   | { kind: 'record'; at?: string; by?: string; reason?: string }
-  | { kind: 'store-unreadable' }
-  | { kind: 'not-loaded' };
+  | { kind: Exclude<SuspensionRefusal, 'record'> };
 
 export interface AppDto {
   name: string;

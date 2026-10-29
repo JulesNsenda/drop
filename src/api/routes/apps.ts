@@ -12,7 +12,7 @@ import { Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, listUsers, getUserById } from '../middleware/auth';
+import { AuthContext, listUsers, getUserById, deleteApiKeysByName, appProvisionKeyName } from '../middleware/auth';
 import { canAccess, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
@@ -177,9 +177,11 @@ function sanitizeRepoUrl(repoUrl: string): string {
 /**
  * 409 for a start the suspension refused. `APP_SUSPENDED` is its own code so a
  * client can tell it from a busy app: retrying will not help until an admin acts.
+ * Only an admin is told the suspension store is the reason (as in `suspendedDto`).
  */
 function appSuspendedResponse(c: Context, err: AppSuspendedError) {
-  return c.json(error(err.code, err.message), 409);
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  return c.json(error(err.code, auth?.role === 'admin' ? err.message : err.tenantMessage), 409);
 }
 
 /**
@@ -2032,6 +2034,12 @@ apps.put('/:name/capabilities', async c => {
   if (suspended) {
     const stored = getAppConfigService().getConfig(name)?.grantedApiScopes ?? [];
     if (scopes.some(s => !stored.includes(s))) return appSuspendedResponse(c, suspended);
+    // The key the app was last started with carries the old, wider scopes, and nothing
+    // restarts to re-mint it: a narrowing revokes it, whatever refused the start, before
+    // anything else can fail. An unchanged PUT keeps a working key.
+    if (stored.some(s => !scopes.includes(s))) {
+      await deleteApiKeysByName(appProvisionKeyName(name));
+    }
   }
 
   // grantedApiScopes is a SYSTEM_CONFIG_FIELD — updateConfig strips it, so
