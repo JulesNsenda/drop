@@ -14,6 +14,7 @@ import { pathTaken } from '../utils/paths';
 import type { AppStateManager } from '../managers/app/state-manager';
 import type { AppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore } from '../managers/suspension';
+import { DROP_SERVICE_NAME } from '../utils/service-name';
 
 /**
  * Existing APP names (state and config) that equal `name` ignoring case but are
@@ -63,7 +64,7 @@ export function isNameTaken(
   if (!deps.appConfigService) return true;
   // The platform's own process name in the runtime: an app by that name would be
   // indistinguishable from it to anything that matches runtime processes by name.
-  if (name.toLowerCase() === 'drop-platform') return true;
+  if (name.toLowerCase() === DROP_SERVICE_NAME) return true;
   // An unreadable suspension store cannot say which names it holds. (An UNLOADED one is not
   // treated the same: it is an early-boot state, and every test that never loads it would refuse.)
   if (getSuspensionStore().refusalFor(name) === 'store-unreadable') return true;

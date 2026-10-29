@@ -208,7 +208,7 @@ function containersOf(name: string, use: Use, deps: SuspensionPolicyDeps): strin
       // No state entry at all: a folder-dropped (or unregistered) container, the operator's
       // own. Nothing to compare: it is trusted and its stamp is exact.
       add(stamp, true, true, true);
-      stampStateless = true;
+      stampStateless = isFolderDroppedContainer(stamp, deps);
     } else if (entry.isGroupContainer) {
       // For THAT group: with no group to compare (a child mid-materialisation) the
       // stamp stands, because "cannot tell" must not read as "not a member".
@@ -326,14 +326,24 @@ export function enforcementTargets(deps: SuspensionPolicyDeps = defaultDeps()): 
   return targets;
 }
 
-/** Whether `target` is still held by `record` (the pass re-asks on the line before it acts). */
-export function isStillEnforced(
-  target: string,
-  record: string,
-  deps: SuspensionPolicyDeps = defaultDeps()
-): boolean {
-  if (!deps.store.list().some((r) => r.name === record)) return false;
-  return target === record ? knowsApp(target, deps) : childrenOf(record, deps).includes(target);
+/**
+ * Whether ANY record still holds `target` (the pass re-asks on the line before it
+ * acts): its own record, if an app by that name is known, or a container's record.
+ */
+export function isStillEnforced(target: string, deps: SuspensionPolicyDeps = defaultDeps()): boolean {
+  return deps.store
+    .list()
+    .some((r) => (r.name === target ? knowsApp(target, deps) : childrenOf(r.name, deps).includes(target)));
+}
+
+/**
+ * The apps whose standing may have changed when `name`'s record is lifted: the
+ * app itself, what runs under it, and the container it is a member of (a member's
+ * record freezes its container, so lifting it can free the container). Candidates
+ * only: the caller settles each one that is no longer refused.
+ */
+export function settleSetFor(name: string, deps: SuspensionPolicyDeps = defaultDeps()): string[] {
+  return [...new Set([name, ...childrenOf(name, deps), ...containersOf(name, 'destructive', deps)])];
 }
 
 /**

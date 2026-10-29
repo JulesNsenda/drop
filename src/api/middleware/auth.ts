@@ -2610,8 +2610,10 @@ export async function deleteApiKey(keyId: string): Promise<boolean> {
     return false;
   }
 
-  credentials.apiKeys.splice(index, 1);
+  const [removed] = credentials.apiKeys.splice(index, 1);
   await saveCredentials(config.credentialsPath, credentials);
+  // An ownerless key is itself a principal (it may have been the admin that vouched for a container).
+  if (!removed.ownerUserId) await forgetGroupTrustOf(removed.id);
 
   return true;
 }

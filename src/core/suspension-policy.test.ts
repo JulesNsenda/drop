@@ -18,6 +18,7 @@ import {
   childrenOf,
   enforcementTargets,
   isStillEnforced,
+  settleSetFor,
   claimedAgainst,
   hostClaims,
   refusalCauseOf,
@@ -464,12 +465,24 @@ describe('suspension policy: refusalForApp', () => {
       await store.suspend('site', 'admin');
       const deps = depsOf(apps);
 
-      expect(isStillEnforced('site', 'site', deps)).toBe(true);
-      expect(isStillEnforced('site-web', 'site', deps)).toBe(true);
-      expect(isStillEnforced('other', 'site', deps)).toBe(false);
-      expect(isStillEnforced('site-web', 'gone', deps)).toBe(false);
+      expect(isStillEnforced('site', deps)).toBe(true);
+      expect(isStillEnforced('site-web', deps)).toBe(true);
+      expect(isStillEnforced('other', deps)).toBe(false);
+      // Held by a second record too: lifting one leaves it enforced.
+      await store.suspend('site-web', 'admin');
       await store.unsuspend('site');
-      expect(isStillEnforced('site-web', 'site', deps)).toBe(false);
+      expect(isStillEnforced('site-web', deps)).toBe(true);
+      await store.unsuspend('site-web');
+      expect(isStillEnforced('site-web', deps)).toBe(false);
+    });
+
+    it('settleSetFor: the app, what runs under it, and its container', () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'other' }];
+      const deps = depsOf(apps);
+
+      expect(settleSetFor('site', deps).sort()).toEqual(['site', 'site-web']);
+      expect(settleSetFor('site-web', deps).sort()).toEqual(['site', 'site-web']);
+      expect(settleSetFor('other', deps)).toEqual(['other']);
     });
   });
 

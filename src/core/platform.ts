@@ -238,6 +238,7 @@ import {
   childrenOf,
   enforcementTargets,
   isStillEnforced,
+  settleSetFor,
   claimedAgainst,
   refusalCauseOf,
   refusalEpisodeCode,
@@ -1051,9 +1052,8 @@ export class DropPlatform {
   private storageSweep: Promise<void> | null = null;
   /** The suspension enforcement pass in flight, if any (single-flight, awaited by stop()). */
   private suspensionSweep: Promise<void> | null = null;
-  /** Whether the pass in flight leaves busy apps alone, and whether a stricter call is waiting behind it. */
-  private suspensionPassSkipsBusy = true;
-  private suspensionStrictAgain = false;
+  /** A call arrived while the pass was running: it earns exactly one more. */
+  private suspensionAgain = false;
   /** A sweep was requested while one was running: go round once more, it may have missed the new work. */
   private storageSweepAgain = false;
   /** Set when `stop()` begins: the object-storage sweep starts nothing new and winds down. */
@@ -4994,6 +4994,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // or disabled during the awaits): ask once more, right before it is persisted.
     const ownerNow = this.stateManager?.getApp(repoName)?.userId;
     const trustedNow = containerTrusted && (!ownerNow || (await isAdminPrincipalId(ownerNow, this.credentialsStorePath())));
+    if (trustedNow !== containerTrusted) {
+      this.logger.warn(
+        `Not expanding '${repoName}': its owner's standing changed during the expansion, so the trust decision it ` +
+          'was run under no longer holds; the next deploy decides afresh',
+        'MONOREPO'
+      );
+      return;
+    }
     const stoppedBeforeTag = containerStopped();
     if (stoppedBeforeTag) {
       this.logger.info(`Not expanding '${repoName}': app was suspended during the expansion`, 'MONOREPO');
@@ -10181,7 +10189,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     try {
       for (const left of await this.runtimeInstancesOf(appName)) {
-        errors.push(`${left.instance ?? left.name}: still present after delete`);
+        const instance = left.instance ?? left.name;
+        const slot = instance !== appName && instance.endsWith('.b') ? 'b' : 'a';
+        errors.push(`${instanceRef(appName, slot)}: still present after delete`);
       }
     } catch (err) {
       errors.push(`runtime: could not verify the removal (${err instanceof Error ? err.message : 'unreadable'})`);
@@ -10272,7 +10282,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     const lifted = await getSuspensionStore().unsuspend(appName);
     if (lifted) {
-      for (const name of [appName, ...childrenOf(appName)]) {
+      for (const name of settleSetFor(appName)) {
         if (refusalForApp(name) === null) await this.settleUnsuspended(name);
       }
     }
@@ -10287,14 +10297,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    */
   private async settleUnsuspended(name: string): Promise<void> {
     const state = this.stateManager;
-    const app = state?.getApp(name);
-    if (!state || !app) return;
+    const snapshot = state?.getApp(name);
+    if (!state || !snapshot) return;
+    const { status, error } = snapshot;
     let up = true;
     try {
       up = (await this.runtimeInstancesOf(name)).length > 0;
     } catch {
       // Unreadable: treated as up, the safe reading.
     }
+    // The await above can outlive someone else's write: act only on what was read.
+    const app = state.getApp(name);
+    if (!app || app.status !== status || app.error !== error || this.isBusy(name)) return;
     if (up) {
       this.logger.warn(`Unsuspended '${name}' has a live instance (or the runtime is unreadable): status left alone`, 'SUSPEND');
       if (app.error !== undefined) await state.updateApp(name, { error: undefined });
@@ -12405,7 +12419,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       void this.sweepRetiredObjectStorage();
       // Its own chain too: retries a take-down that failed, and finds an
       // instance a suspension missed.
-      void this.enforceSuspensions({ skipBusy: true });
+      void this.enforceSuspensions({ quiet: true });
     }, 15 * 60 * 1000);
     this.idleSweepTimer.unref?.();
   }
@@ -12417,38 +12431,34 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * minted key, and is 'stopped'. Retries whatever `suspendApp` could not
    * finish. Record-driven, so an unreadable store (an empty list) does nothing;
    * and the runtime is only consulted per target, never as a source of targets
-   * (it holds processes that are not DROP's). Single-flight; a call that asks for
-   * more than the pass in flight (`skipBusy: false`) earns exactly one more pass.
+   * (it holds processes that are not DROP's). Single-flight; a call that arrives
+   * during a pass earns exactly one more.
    *
    * ONE concurrency rule: a target is acted on only while this pass holds its
-   * name in `appsInProgress`. A busy target is skipped (debug under `skipBusy`,
-   * a warning without it: the caller expected it to be free) and caught by the
+   * name in `appsInProgress`. A busy target is skipped (debug when `quiet`, a
+   * warning otherwise: the caller expected it to be free) and caught by the
    * next pass; the pass never acts unreserved. (`suspendApp`'s own immediate
    * take-down is the one exception: it acts directly, under the record it has
    * just written.)
    */
-  private enforceSuspensions(opts: { skipBusy: boolean }): Promise<void> {
+  private enforceSuspensions(opts: { quiet: boolean }): Promise<void> {
     if (this.suspensionSweep) {
-      if (!opts.skipBusy && this.suspensionPassSkipsBusy) this.suspensionStrictAgain = true;
+      this.suspensionAgain = true;
       return this.suspensionSweep;
     }
     const run = (async () => {
-      this.suspensionPassSkipsBusy = opts.skipBusy;
-      await this.runSuspensionEnforcement(opts);
-      while (this.suspensionStrictAgain && !this.stopping) {
-        this.suspensionStrictAgain = false;
-        this.suspensionPassSkipsBusy = false;
-        await this.runSuspensionEnforcement({ skipBusy: false });
-      }
+      do {
+        this.suspensionAgain = false;
+        await this.runSuspensionEnforcement(opts);
+      } while (this.suspensionAgain && !this.stopping);
     })().finally(() => {
       this.suspensionSweep = null;
-      this.suspensionStrictAgain = false;
     });
     this.suspensionSweep = run;
     return run;
   }
 
-  private async runSuspensionEnforcement(opts: { skipBusy: boolean }): Promise<void> {
+  private async runSuspensionEnforcement(opts: { quiet: boolean }): Promise<void> {
     const state = this.stateManager;
     const runtime = this.runtime;
     if (!runtime || !state) return;
@@ -12478,14 +12488,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (this.stopping) return;
       try {
         if (this.isBusy(name)) {
-          if (opts.skipBusy) this.logger.debug(`Suspended app '${name}' is busy: left for the next pass`, 'SUSPEND');
+          if (opts.quiet) this.logger.debug(`Suspended app '${name}' is busy: left for the next pass`, 'SUSPEND');
           else this.logger.warn(`Suspended app '${name}' is busy and could not be enforced now`, 'SUSPEND');
           continue;
         }
         // Reserved from here; the policy is re-asked on the line before the take-down.
         this.appsInProgress.add(name);
         try {
-          if (!isStillEnforced(name, record)) continue;
+          if (!isStillEnforced(name)) continue;
           const current = state.getApp(name);
           const wasLive = live.has(name) || (current !== undefined && current.status !== 'stopped');
           const errors = await this.takeSuspendedDown(name);

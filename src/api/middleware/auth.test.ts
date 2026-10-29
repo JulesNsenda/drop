@@ -13,6 +13,7 @@ import {
   createApiKey,
   verifyApiKey,
   deleteApiKey,
+  deleteApiKeysByName,
   listApiKeys,
   listUsers,
   isAuthEnabled,
@@ -23,6 +24,8 @@ import {
   roleHierarchy,
 } from './auth';
 import { getTestToken } from '../__testutils__/auth';
+import * as atomicWrite from '../../utils/atomic-write';
+import * as stateManagerModule from '../../managers/app/state-manager';
 
 describe('Auth Middleware', () => {
   let tempDir: string;
@@ -600,6 +603,46 @@ describe('Auth Middleware', () => {
  * dissolve the SEC-5 fence. Only a genuine "lower of the two, in either
  * argument order" implementation is safe to build Item 3 on.
  */
+describe('deleteApiKeysByName and deleteApiKey', () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'drop-auth-keys-test-'));
+    jest.spyOn(console, 'log').mockImplementation();
+    await initializeAuth({ credentialsPath: path.join(tempDir, 'credentials.json'), enableJwt: true, enableApiKeys: true });
+  });
+
+  afterEach(async () => {
+    resetAuth();
+    jest.restoreAllMocks();
+    await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('writes nothing when no key has that name', async () => {
+    await createApiKey('kept', 'admin');
+    const write = jest.spyOn(atomicWrite, 'writeJsonAtomic');
+
+    await deleteApiKeysByName('absent');
+    expect(write).not.toHaveBeenCalled();
+
+    await deleteApiKeysByName('kept');
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it('an ownerless key that is deleted takes the trust it vouched for with it; an owned one does not', async () => {
+    const clear = jest.spyOn(stateManagerModule, 'clearGroupTrustForUser').mockResolvedValue([]);
+    const ownerless = await createApiKey('ci', 'admin');
+    const user = await createUser({ username: 'u', role: 'user', credential: { password: 'password123' } });
+    const owned = await createApiKey('mine', 'user', undefined, undefined, user.id);
+
+    await deleteApiKey(owned.apiKey.id);
+    expect(clear).not.toHaveBeenCalled();
+
+    await deleteApiKey(ownerless.apiKey.id);
+    expect(clear).toHaveBeenCalledWith(ownerless.apiKey.id);
+  });
+});
+
 describe('minRole', () => {
   it('clamps a HIGH-standing key down to its LOW-standing owner', () => {
     expect(minRole('admin', 'readonly')).toBe('readonly');

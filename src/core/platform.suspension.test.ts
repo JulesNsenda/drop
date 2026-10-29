@@ -242,7 +242,7 @@ describe('app suspension (platform, Item 1)', () => {
       const result = await platform.suspendApp('site', 'admin-1');
 
       expect(result).toMatchObject({ suspended: true });
-      expect((result as { stopErrors?: string[] }).stopErrors).toEqual(['site: still present after delete']);
+      expect((result as { stopErrors?: string[] }).stopErrors).toEqual(['site.a: still present after delete']);
       // The suspension holds regardless.
       expect(getSuspensionStore().refusalFor('site') !== null).toBe(true);
     }, 20000);
@@ -259,7 +259,7 @@ describe('app suspension (platform, Item 1)', () => {
       expect((result as { stopErrors?: string[] }).stopErrors).toEqual([
         'site.a: pm2 down',
         'site.b: pm2 down',
-        'site: still present after delete',
+        'site.a: still present after delete',
       ]);
     }, 20000);
 
@@ -308,8 +308,8 @@ describe('app suspension (platform, Item 1)', () => {
       const result = await platform.suspendApp('mono', 'admin-1');
 
       expect((result as { stopErrors?: string[] }).stopErrors).toEqual([
-        'mono-api: mono-api: still present after delete',
-        'mono-web: mono-web: still present after delete',
+        'mono-api.a: still present after delete',
+        'mono-web.a: still present after delete',
       ]);
     }, 30000);
 
@@ -388,6 +388,19 @@ describe('app suspension (platform, Item 1)', () => {
       expect(fakeRuntime.startCount).toBe(starts);
     }, 30000);
 
+    it("lifting a service's record settles its container too, once nothing else holds it", async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deployGroup();
+      await platform.suspendApp('mono-api', 'admin-1');
+      await getStateManager().setAppStatus('mono', 'stopped', { error: 'Suspended by admin' });
+
+      await platform.unsuspendApp('mono-api');
+
+      expect(getStateManager().getApp('mono')?.error).toBeUndefined();
+      expect(getStateManager().getApp('mono-api')?.error).toBeUndefined();
+    }, 30000);
+
     it('unsuspending leaves the state of a service that is somehow still live alone', async () => {
       platform = makePlatform();
       await platform.start();
@@ -406,8 +419,8 @@ describe('app suspension (platform, Item 1)', () => {
 
     describe('the periodic reconcile', () => {
       const reconcile = (): Promise<void> =>
-        (platform as unknown as { enforceSuspensions: (o: { skipBusy: boolean }) => Promise<void> }).enforceSuspensions({
-          skipBusy: true,
+        (platform as unknown as { enforceSuspensions: (o: { quiet: boolean }) => Promise<void> }).enforceSuspensions({
+          quiet: true,
         });
 
       it('retries a revoke that failed during the suspension', async () => {
@@ -486,14 +499,14 @@ describe('app suspension (platform, Item 1)', () => {
         expect(stopped).toBe(true);
       }, 30000);
 
-      it('a stricter call behind a running pass earns exactly one more pass', async () => {
+      it('a call during a running pass earns exactly one more pass', async () => {
         platform = makePlatform();
         await platform.start();
         await deploy('site');
         await getSuspensionStore().suspend('site', 'admin-1');
         const priv = platform as unknown as {
           takeAppDown: (n: string, o: object) => Promise<string[]>;
-          enforceSuspensions: (o: { skipBusy: boolean }) => Promise<void>;
+          enforceSuspensions: (o: { quiet: boolean }) => Promise<void>;
         };
         const original = priv.takeAppDown.bind(platform);
         let release: () => void = () => undefined;
@@ -506,9 +519,9 @@ describe('app suspension (platform, Item 1)', () => {
           if (calls === 1) await gate;
           return original(n, o);
         });
-        const first = priv.enforceSuspensions({ skipBusy: true });
+        const first = priv.enforceSuspensions({ quiet: true });
         await waitFor(() => calls === 1);
-        const second = priv.enforceSuspensions({ skipBusy: false });
+        const second = priv.enforceSuspensions({ quiet: true });
         expect(second).toBe(first);
         release();
         await second;
@@ -522,9 +535,9 @@ describe('app suspension (platform, Item 1)', () => {
         await deploy('site');
         await getSuspensionStore().suspend('site', 'admin-1');
         (platform as unknown as { appsInProgress: Set<string> }).appsInProgress.add('site');
-        const priv = platform as unknown as { enforceSuspensions: (o: { skipBusy: boolean }) => Promise<void> };
+        const priv = platform as unknown as { enforceSuspensions: (o: { quiet: boolean }) => Promise<void> };
 
-        await priv.enforceSuspensions({ skipBusy: false });
+        await priv.enforceSuspensions({ quiet: false });
 
         expect(fakeRuntime.runningNames()).toEqual(['site']);
         (platform as unknown as { appsInProgress: Set<string> }).appsInProgress.delete('site');
