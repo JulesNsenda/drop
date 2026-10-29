@@ -1371,7 +1371,11 @@ describe('MCP tool handlers', () => {
       setPlatformOps(
         makeOps({
           redeployApp: jest.fn().mockResolvedValue({
-            refused: { code: 'APP_SUSPENDED', message: "Application 'alice-app' is suspended by an administrator" },
+            refused: {
+              code: 'APP_SUSPENDED',
+              message: "Application 'alice-app' is suspended by an administrator",
+              suspension: 'record',
+            },
           }),
         })
       );

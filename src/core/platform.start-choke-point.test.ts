@@ -175,6 +175,17 @@ describe('the suspension start choke point', () => {
     expect(unguarded.map((i) => `${i + 1}: ${platformLines[i].trim()}`)).toEqual([]);
   });
 
+  it('every builder.build( in platform.ts runs on a slot the caller reserved (slotReserved: true)', () => {
+    const calls = builderBuildCalls(platformLines.join('\n'));
+    // The guard comes after the slot wait; a build that waited for its own slot would
+    // put the wait (an await a suspension can land in) back between the guard and the build.
+    const ownSlot = calls.filter((i) => {
+      const end = platformLines.findIndex((l, j) => j > i && /^\s*\}\);/.test(l));
+      return !platformLines.slice(i, end + 1).some((l) => /slotReserved:\s*true/.test(l));
+    });
+    expect(ownSlot.map((i) => `${i + 1}: ${platformLines[i].trim()}`)).toEqual([]);
+  });
+
   it('no other source file builds an app on the builder', () => {
     const offenders: string[] = [];
     for (const file of sourceFiles(SRC)) {

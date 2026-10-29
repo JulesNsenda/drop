@@ -296,7 +296,7 @@ describe('POST /apps/:name/redeploy', () => {
   });
 
   describe('refusals', () => {
-    const cases: Array<[RedeployRefusal['code'], number, string]> = [
+    const cases: Array<[Exclude<RedeployRefusal['code'], 'APP_SUSPENDED'>, number, string]> = [
       ['NOT_FOUND', 404, 'NOT_FOUND'],
       ['APP_SOURCE_MISSING', 409, 'APP_SOURCE_MISSING'],
       ['APP_BUSY', 409, 'APP_BUSY'],
@@ -326,11 +326,20 @@ describe('POST /apps/:name/redeploy', () => {
 
       refuse({ code: 'APP_SUSPENDED', message: 'x', suspension: 'store-unreadable' });
       const admin = await redeploy('site', bearer(adminToken));
-      expect((await body(admin)).error.message).toContain('suspension store is unreadable');
+      expect(admin.status).toBe(409);
+      const adminError = (await body(admin)).error;
+      expect(adminError).toMatchObject({ code: 'APP_SUSPENDED' });
+      expect(adminError.message).toContain('suspension store is unreadable');
 
-      refuse({ code: 'APP_SUSPENDED', message: 'x' });
+      refuse({ code: 'APP_SUSPENDED', message: 'x', suspension: 'record' });
       const record = await redeploy('site', bearer(ownerToken));
-      expect((await body(record)).error.message).toBe("Application 'site' is suspended by an administrator");
+      expect(record.status).toBe(409);
+      expect((await body(record)).error).toMatchObject({
+        code: 'APP_SUSPENDED',
+        message: "Application 'site' is suspended by an administrator",
+      });
+      // A refusal is not an action: nothing is logged (the row this replaces asserted the same).
+      expect(logSpy).not.toHaveBeenCalled();
     });
 
     it('carries the retry hint as Retry-After and in the body', async () => {

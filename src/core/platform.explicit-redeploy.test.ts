@@ -1163,10 +1163,13 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       expectNothingHeld();
     });
 
-    it('a suspension landing during the land (continueRedeploy) is a stopped deploy: uncharged, the tenant text, and rethrown', async () => {
+    it.each([
+      ['record', 'DEPLOY_STOPPED'],
+      ['store-unreadable', 'DEPLOY_REFUSED'],
+    ] as const)('a suspension (%s) landing during the land (continueRedeploy) is %s: uncharged, the tenant text, and rethrown', async (reason, code) => {
       const url = 'https://github.com/user/repo';
       appState = { ...appState, gitSource: { repoUrl: url, branch: 'main' } };
-      const land = jest.fn().mockRejectedValue(new AppSuspendedError(appName, 'store-unreadable'));
+      const land = jest.fn().mockRejectedValue(new AppSuspendedError(appName, reason));
       p().gitDeployService = {
         isAvailable: () => true,
         isCloning: () => false,
@@ -1189,7 +1192,7 @@ describe('explicit redeploy: reservation, group rule, redeployApp', () => {
       const [episode] = getDeployTracker().getEpisodes(appName);
       expect(episode.status).toBe('failed');
       const detail = getDeployDetailStore().getDetail(episode.deployId);
-      expect(detail?.errorCode).toBe('DEPLOY_STOPPED');
+      expect(detail?.errorCode).toBe(code);
       // Never the store's own state.
       expect(JSON.stringify(detail)).not.toContain('unreadable');
       expectNothingHeld();

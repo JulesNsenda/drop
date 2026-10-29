@@ -1210,13 +1210,13 @@ export async function handleRedeployApp(
 
     const { target, acceptedAt, result } = outcome;
     if ('refused' in result) {
-      const { code, message, retryAfterSeconds, suspension } = result.refused;
+      const { code, message, retryAfterSeconds } = result.refused;
       // The recorded git URL is tenant-controlled and rides in this one message.
       let text = code === 'INVALID_GIT_SOURCE' ? wrapUntrusted(`GIT SOURCE: ${target}`, message) : message;
-      if (code === 'APP_SUSPENDED') {
+      if (result.refused.code === 'APP_SUSPENDED') {
         // Not the APP_STOPPED hint below: restart_app is refused too, and only an administrator lifts it.
         // Rendered as every other suspended refusal is, by reason and by role.
-        text = suspendedFor(new AppSuspendedError(target, suspension ?? 'record'), auth?.role === 'admin');
+        text = suspendedFor(new AppSuspendedError(target, result.refused.suspension), auth?.role === 'admin');
       }
       if (code === 'APP_STOPPED') {
         // An agent never rebuilds a stopped app, so do not send it round restart_app and back:

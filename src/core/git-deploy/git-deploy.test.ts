@@ -2170,27 +2170,31 @@ describe('GitDeployService', () => {
       expect((service as unknown as { pending: Map<string, unknown> }).pending.has(appName)).toBe(true);
     });
 
-    it('a queued redeploy refused after the entry check is recorded as a stopped deploy with the tenant text', async () => {
-      resetDeployTracker();
-      getDeployTracker(path.join(tempDir, 'deploys.json'));
-      const events: Array<{ code?: string; message: string }> = [];
-      const unsub = eventBus.subscribe('build:failed', (p) => {
-        events.push({ code: (p as { code?: string }).code, message: p.error.message });
-      });
+    it.each([
+      ['record', 'DEPLOY_STOPPED', "Application 'frozen-rec' is suspended by an administrator"],
+      ['store-unreadable', 'DEPLOY_REFUSED', "Starting 'frozen-rec' is refused right now; contact your administrator"],
+    ] as const)(
+      'a queued redeploy refused after the entry check (%s) is recorded as %s with the tenant text',
+      async (reason, code, message) => {
+        resetDeployTracker();
+        getDeployTracker(path.join(tempDir, 'deploys.json'));
+        const events: Array<{ code?: string; message: string }> = [];
+        const unsub = eventBus.subscribe('build:failed', (p) => {
+          events.push({ code: (p as { code?: string }).code, message: p.error.message });
+        });
 
-      try {
-        await (service as unknown as { recordQueuedFailure(a: string, e: unknown): Promise<void> }).recordQueuedFailure(
-          'frozen-rec',
-          new AppSuspendedError('frozen-rec', 'store-unreadable')
-        );
-      } finally {
-        unsub();
+        try {
+          await (service as unknown as { recordQueuedFailure(a: string, e: unknown): Promise<void> }).recordQueuedFailure(
+            'frozen-rec',
+            new AppSuspendedError('frozen-rec', reason)
+          );
+        } finally {
+          unsub();
+        }
+
+        expect(events).toEqual([{ code, message }]);
       }
-
-      expect(events).toEqual([
-        { code: 'DEPLOY_STOPPED', message: "Starting 'frozen-rec' is refused right now; contact your administrator" },
-      ]);
-    });
+    );
 
     it('webhook matching skips it, and matches again once the suspension is lifted', async () => {
       const appName = 'frozen-hook';

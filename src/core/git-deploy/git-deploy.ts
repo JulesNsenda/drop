@@ -320,7 +320,8 @@ export class GitDeployService {
         buildId,
         error: suspended || !(err instanceof Error) ? new Error(message) : err,
         stage: 'pre-build',
-        ...(suspended ? { code: 'DEPLOY_STOPPED' as const } : {}),
+        // STOPPED only for an administrator's record; a store that cannot answer stopped nothing.
+        ...(suspended ? { code: err.reason === 'record' ? ('DEPLOY_STOPPED' as const) : ('DEPLOY_REFUSED' as const) } : {}),
       });
     } catch {
       // Tracker not initialised (isolated tests): observability only.
@@ -768,10 +769,6 @@ export class GitDeployService {
         maxEntries: this.config.maxEntries ?? envDefaultCaps().maxEntries,
       };
       const info = await gitClone({ url, dest: cloneDir, branch, token, ...caps });
-      // A redeploy's clone is the long await a suspension lands in: re-checked
-      // before the tracked files are landed over the serving tree. A first deploy
-      // is exempt: it also runs in the CLI, which never loads the store.
-      if (!firstDeploy) this.assertNotSuspended(appName);
       if (info.symlinks.length > 0) {
         const shown = info.symlinks.slice(0, 5).join(', ');
         logger.warn(
@@ -817,6 +814,11 @@ export class GitDeployService {
         return info.commitSha;
       }
       const previous = await readManifest(this.manifestDir, appName);
+      // A redeploy's clone and the manifest read are awaits a suspension lands in:
+      // re-checked directly before the tracked files are landed over the serving
+      // tree. (A first deploy is exempt above: it also runs in the CLI, which
+      // never loads the store.)
+      this.assertNotSuspended(appName);
       const landed = await landTracked({
         cloneDir,
         appDir: destPath,

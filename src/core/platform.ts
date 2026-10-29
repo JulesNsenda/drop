@@ -887,7 +887,18 @@ type UpdateRefusal =
  * a tripped breaker, and (for `suspended`) the store's own reason, which decides
  * how much of it a tenant may be told.
  */
-type UpdateRefused = { refused: UpdateRefusal; retryAfterSeconds?: number; suspension?: SuspensionRefusal };
+type UpdateRefused =
+  | { refused: Exclude<UpdateRefusal, 'suspended'>; retryAfterSeconds?: number; suspension?: undefined }
+  | { refused: 'suspended'; suspension: SuspensionRefusal; retryAfterSeconds?: undefined };
+
+/**
+ * The episode code for a suspended refusal: DEPLOY_STOPPED only for an
+ * administrator's record. When the store merely cannot answer, nobody stopped
+ * anything and the old instance may still be serving, so it is a refusal.
+ */
+function suspensionEpisodeCode(reason: SuspensionRefusal): 'DEPLOY_STOPPED' | 'DEPLOY_REFUSED' {
+  return reason === 'record' ? 'DEPLOY_STOPPED' : 'DEPLOY_REFUSED';
+}
 
 /**
  * The refusal a suspended app's update or redeploy meets, or null. FIRST at
@@ -944,7 +955,7 @@ function redeployStartWaitMs(): number {
 const TIMED_OUT = Symbol('timed-out');
 
 function redeployRefusal(
-  code: RedeployRefusal['code'],
+  code: Exclude<RedeployRefusal['code'], 'APP_SUSPENDED'>,
   message: string,
   retryAfterSeconds?: number
 ): { refused: RedeployRefusal } {
@@ -975,12 +986,11 @@ function redeployRefusalOf(appName: string, refused: UpdateRefused): { refused: 
     case 'suspended': {
       // The message is the tenant-safe one (the store's own state is not for a
       // tenant); a surface that may say more renders `suspension` itself.
-      const suspension = refused.suspension ?? 'record';
       return {
         refused: {
           code: 'APP_SUSPENDED',
-          message: new AppSuspendedError(appName, suspension).tenantMessage,
-          suspension,
+          message: new AppSuspendedError(appName, refused.suspension).tenantMessage,
+          suspension: refused.suspension,
         },
       };
     }
@@ -4715,14 +4725,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     actor?: DeployActorInfo,
     /** True only for the watcher's ready scan at boot; see bootCurrentChildren. */
     incidentalFirstSight = false
-  ): Promise<void> {
+  ): Promise<void | { suspended: SuspensionRefusal }> {
     // A container cannot be suspended, so a suspended `repoName` is a plain app
     // whose tree now looks like one: expanding it would create, build and start
     // children the suspension never named. Covers every caller (the watcher,
-    // reExpandContainer, a redeploy's re-classification and boot).
-    if (suspendedUpdateRefusal(repoName)) {
+    // reExpandContainer, a redeploy's re-classification and boot). It is
+    // REPORTED, not a silent return: a caller that holds an episode must not
+    // record the expansion as a success. Checked again at each point below
+    // where an await has passed, because a suspension can land mid-expansion.
+    const containerStopped = (): { suspended: SuspensionRefusal } | null => {
+      const refusal = suspendedUpdateRefusal(repoName);
+      return refusal ? { suspended: refusal.suspension! } : null;
+    };
+    const stoppedAtEntry = containerStopped();
+    if (stoppedAtEntry) {
       this.logger.info(`Not expanding '${repoName}': app is suspended`, 'MONOREPO');
-      return;
+      return stoppedAtEntry;
     }
     const group = (config.group || config.name || repoName).trim();
     const services = config.services ?? {};
@@ -4908,6 +4926,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
     }
 
+    // Synchronously before the write: the awaits above can outlive a suspension,
+    // and this tags the plain app as a container.
+    const stoppedBeforeTag = containerStopped();
+    if (stoppedBeforeTag) {
+      this.logger.info(`Not expanding '${repoName}': app was suspended during the expansion`, 'MONOREPO');
+      return stoppedBeforeTag;
+    }
     if (this.stateManager?.hasApp(repoName)) {
       await this.stateManager.updateApp(repoName, { group, isGroupContainer: true });
     }
@@ -5091,6 +5116,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         }
         // Same, for a suspended child: nothing is copied over it, so a lifted
         // suspension does not leave new, unbuilt source behind.
+        const stoppedBeforeCopy = containerStopped();
+        if (stoppedBeforeCopy) {
+          this.logger.info(`Not expanding '${repoName}': app was suspended during the expansion`, 'MONOREPO');
+          return stoppedBeforeCopy;
+        }
         if (suspendedUpdateRefusal(childName)) {
           this.logger.info(`Skipping service '${svcName}': '${childName}' is suspended`, 'MONOREPO');
           continue;
@@ -5377,6 +5407,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               `Not building service '${svcName}': '${childName}' was stopped during expansion`,
               'MONOREPO'
             );
+          } else if (containerStopped()) {
+            // The container itself was suspended after this child was copied: no
+            // build for it or any later child (the caller is told, below).
+            this.logger.info(
+              `Not building service '${svcName}': '${repoName}' was suspended during expansion`,
+              'MONOREPO'
+            );
+            return containerStopped()!;
           } else if (suspendedUpdateRefusal(childName)) {
             this.logger.info(
               `Not building service '${svcName}': '${childName}' was suspended during expansion`,
@@ -5777,6 +5815,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // used to skip finishBuild entirely — leaking the log's write stream and
       // never running retention for the app.
       let result;
+      // The build slot, reserved just before the build and freed in the finally
+      // (the same pattern as buildAndSwap): the wait for a slot is an await a
+      // suspension can land in, so the check below must come after it.
+      let releaseSlot: () => void = () => undefined;
       try {
         // Fresh deploy — nothing is currently serving this app, so a low-disk
         // abort is a hard failure: throw into the catch below, which marks the
@@ -5793,8 +5835,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         const buildPath = await this.prepareDeployTarget(appName, appPath, deployId);
 
+        releaseSlot = await this.reserveBuildSlot(appName);
         // Re-checked synchronously, nothing awaited before the build starts: a
-        // build runs tenant code, and the awaits above can outlive a suspension.
+        // build runs tenant code, and the awaits above (the slot wait included)
+        // can outlive a suspension.
         this.assertStartable(appName);
         builderEntered = true;
         result = await this.builder.build({
@@ -5812,11 +5856,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           execCommand,
           toolchainId,
           nodeModulesAsideDir,
+          slotReserved: true,
           onBuildLog: logId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(logId, line)
             : undefined,
         });
       } finally {
+        // The slot is for building only; idempotent, so a throw before the build is safe too.
+        releaseSlot();
         await this.closeBuildLog(logId, appName);
       }
 
@@ -5873,7 +5920,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Checked first, as in buildAndSwap: a suspension is closed by the one
       // closer (uncharged, left stopped), not written 'errored' and charged.
       if (error instanceof AppSuspendedError) {
+        const hadEpisode = this.deployEpisodeOpen(appName);
         await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason }, { closeEpisode: true });
+        // A first deploy has no episode before the builder opens one, so a caller
+        // polling for an outcome would wait out its budget: report one under this
+        // deploy's id. After settle, which released the keys, so nothing is charged.
+        if (!builderEntered && !hadEpisode) {
+          this.failDeployEpisode(
+            appName,
+            new Error(error.tenantMessage),
+            deployId,
+            suspensionEpisodeCode(error.reason)
+          );
+        }
         this.appsInProgress.delete(appName);
         return;
       }
@@ -8027,7 +8086,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           appName,
           new Error(redeployRefusalOf(appName, refused).refused.message),
           crypto.randomUUID(),
-          refused.refused === 'suspended' ? 'DEPLOY_STOPPED' : 'DEPLOY_REFUSED',
+          refused.refused === 'suspended' ? suspensionEpisodeCode(refused.suspension) : 'DEPLOY_REFUSED',
           admitted.trigger,
           { newEpisode: true }
         );
@@ -8226,7 +8285,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.appsInProgress.add(appName);
       }
       try {
-        await this.expandMonorepo(appPath, appName, config, actor);
+        const expanded = await this.expandMonorepo(appPath, appName, config, actor);
+        if (expanded && 'suspended' in expanded) {
+          // Not a success and not a failure of the caller: the keys are given
+          // back first so nothing is charged, then a held episode is closed.
+          this.releaseGuardrailKeys(appName);
+          if (held) {
+            this.failDeployEpisode(
+              appName,
+              new Error(new AppSuspendedError(appName, expanded.suspended).tenantMessage),
+              crypto.randomUUID(),
+              suspensionEpisodeCode(expanded.suspended),
+              undefined,
+              { newEpisode: true }
+            );
+          }
+          return;
+        }
         this.recordDeployOutcome(appName, true);
       } catch (err) {
         if (held) {
@@ -8304,7 +8379,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           appName,
           new Error(error.tenantMessage),
           crypto.randomUUID(),
-          'DEPLOY_STOPPED',
+          suspensionEpisodeCode(error.reason),
           'deploy',
           { newEpisode: true }
         );

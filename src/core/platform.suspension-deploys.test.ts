@@ -95,6 +95,8 @@ import { DropPlatform, createPlatform, PlatformConfig } from './platform';
 import { eventBus } from './event-bus';
 import { getStateManager } from '../managers/app/state-manager';
 import { getSuspensionStore } from '../managers/suspension';
+import { getDeployTracker, getDeployDetailStore } from '../managers/deploy-tracker';
+import { getDeployBreaker } from '../managers/guardrail/deploy-breaker';
 import { AppSuspendedError } from '../api/platform-ops';
 import { getAppConfigService } from '../managers/app/app-config';
 import { getDatabaseProvisioner } from '../managers/database';
@@ -122,7 +124,16 @@ interface PlatformInternals {
     buildOutputDir: string | undefined,
     intent: { closeEpisode: boolean; callerOwnsTarget: boolean }
   ) => Promise<void>;
-  expandMonorepo: (repoPath: string, repoName: string, config: unknown) => Promise<void>;
+  expandMonorepo: (repoPath: string, repoName: string, config: unknown) => Promise<void | { suspended: string }>;
+  reExpandContainer: (
+    appName: string,
+    appPath: string,
+    config: unknown,
+    actor: unknown,
+    held?: () => void
+  ) => Promise<void>;
+  entryExists: (p: string) => Promise<boolean>;
+  recordDeployOutcome: (appName: string, ok: boolean) => void;
   gitDeployService: unknown;
   appDatabaseUrlSource: (appName: string, appPath: string) => Promise<string | undefined>;
 }
@@ -343,6 +354,58 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
     }, 30000);
   });
 
+  describe('a suspension of the container landing mid-expansion', () => {
+    it('copies, builds and starts no child, and says so', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('site');
+      await fs.mkdir(path.join(appPath, 'web'), { recursive: true });
+      await fs.writeFile(path.join(appPath, 'web', 'index.html'), '<h1>web</h1>');
+      await getStateManager().registerApp('site', appPath, 'static');
+      // The await just before a child is copied: the suspension lands in it.
+      const original = internals().entryExists.bind(platform);
+      jest.spyOn(internals(), 'entryExists').mockImplementationOnce(async (target: string) => {
+        const exists = await original(target);
+        await getSuspensionStore().suspend('site', 'admin-1');
+        return exists;
+      });
+      const build = jest.spyOn(internals().builder!, 'build');
+
+      const out = await internals().expandMonorepo(appPath, 'site', { services: { web: { path: 'web', type: 'static' } } });
+
+      expect(out).toEqual({ suspended: 'record' });
+      expect(build).not.toHaveBeenCalled();
+      expect(getStateManager().getApp('site-web')).toBeUndefined();
+      await expect(fs.access(path.join(webappsDir, 'site-web'))).rejects.toThrow();
+      expect(fakeRuntime.startCount).toBe(0);
+    }, 20000);
+
+    it('reExpandContainer does not record the refused expansion as a success: uncharged, and a held episode closes as stopped', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deploy('site');
+      jest.spyOn(internals(), 'expandMonorepo').mockResolvedValue({ suspended: 'record' });
+      const outcome = jest.spyOn(internals(), 'recordDeployOutcome');
+      const failure = jest.spyOn(getDeployBreaker(), 'recordFailure');
+      const held = jest.fn();
+
+      await internals().reExpandContainer(
+        'site',
+        appPath,
+        { services: { web: { path: 'web', type: 'static' } } },
+        { principalId: 'p-1' },
+        held
+      );
+
+      expect(outcome).not.toHaveBeenCalledWith('site', true);
+      expect(failure).not.toHaveBeenCalled();
+      expect(held).toHaveBeenCalledTimes(1);
+      const episodes = getDeployTracker().getEpisodes('site');
+      const stopped = episodes.find((e) => getDeployDetailStore().getDetail(e.deployId)?.errorCode === 'DEPLOY_STOPPED');
+      expect(stopped?.status).toBe('failed');
+    }, 20000);
+  });
+
   describe('a re-check right before the build runs tenant code', () => {
     it('a first deploy: a suspension landing after the target is prepared builds nothing and leaves the app stopped, not errored', async () => {
       platform = makePlatform();
@@ -356,6 +419,7 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
         return target;
       });
       const build = jest.spyOn(internals().builder!, 'build');
+      const failure = jest.spyOn(getDeployBreaker(), 'recordFailure');
       const recorded = recordStatuses('fresh');
 
       await internals().handleBuildApp(appPath, 'fresh', 'static');
@@ -366,6 +430,44 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
       expect(getStateManager().getApp('fresh')?.status).toBe('stopped');
       expect(fakeRuntime.startCount).toBe(0);
       expect(internals().appsInProgress.has('fresh')).toBe(false);
+      // A caller polling for an outcome gets one: a stopped deploy under the minted id, uncharged.
+      const [episode] = getDeployTracker().getEpisodes('fresh');
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+      expect(failure).not.toHaveBeenCalled();
+    }, 20000);
+
+    it('a first deploy waiting for a build slot behind a full cap builds nothing when the suspension lands during the wait', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('queued');
+      await getStateManager().registerApp('queued', appPath, 'static');
+      const builder = internals().builder as unknown as {
+        reserveSlot: (name: string) => Promise<() => void>;
+        waitingApps: Set<string>;
+        build: (...args: unknown[]) => Promise<unknown>;
+      };
+      const build = jest.spyOn(builder, 'build');
+      // Fill every slot (the platform's default cap is 3).
+      const held = await Promise.all(['occ1', 'occ2', 'occ3'].map((n) => builder.reserveSlot(n)));
+
+      const run = internals().handleBuildApp(appPath, 'queued', 'static');
+      for (let i = 0; i < 500 && !builder.waitingApps.has('queued'); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(builder.waitingApps.has('queued')).toBe(true);
+      await getSuspensionStore().suspend('queued', 'admin-1');
+      held.forEach((release) => release());
+      await run;
+
+      expect(build).not.toHaveBeenCalled();
+      expect(getStateManager().getApp('queued')?.status).toBe('stopped');
+      expect(fakeRuntime.startCount).toBe(0);
+      expect(internals().appsInProgress.has('queued')).toBe(false);
+      // The slot it waited for was given back.
+      const later = await Promise.race([
+        builder.reserveSlot('later').then((release) => (release(), true)),
+        new Promise<boolean>((r) => setTimeout(() => r(false), 1000)),
+      ]);
+      expect(later).toBe(true);
     }, 20000);
 
     it('a redeploy: the same window builds nothing, and nothing is written errored', async () => {

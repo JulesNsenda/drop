@@ -201,13 +201,15 @@ export type RedeployRefusalCode =
   | 'RATE_LIMITED'
   | 'INSUFFICIENT_DISK';
 
-export interface RedeployRefusal {
-  code: RedeployRefusalCode;
-  message: string;
-  retryAfterSeconds?: number;
-  /** For APP_SUSPENDED: why, so each surface renders it through AppSuspendedError.messageFor. */
-  suspension?: AppSuspendedReason;
-}
+export type RedeployRefusal =
+  | {
+      code: Exclude<RedeployRefusalCode, 'APP_SUSPENDED'>;
+      message: string;
+      retryAfterSeconds?: number;
+      suspension?: undefined;
+    }
+  // Why, so each surface renders it through AppSuspendedError.messageFor.
+  | { code: 'APP_SUSPENDED'; message: string; retryAfterSeconds?: undefined; suspension: AppSuspendedReason };
 
 /**
  * What an explicit redeploy came to: started (it has a builder slot and the

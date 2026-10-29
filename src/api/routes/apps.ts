@@ -1346,7 +1346,7 @@ const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 400 | 404 | 409 |
 
 function redeployRefusalResponse(c: Context, refusal: RedeployRefusal, appName: string) {
   if (refusal.code === 'APP_SUSPENDED') {
-    return appSuspendedResponse(c, new AppSuspendedError(appName, refusal.suspension ?? 'record'));
+    return appSuspendedResponse(c, new AppSuspendedError(appName, refusal.suspension));
   }
   const { status, code } = REDEPLOY_REFUSALS[refusal.code];
   if (refusal.retryAfterSeconds !== undefined) c.header('Retry-After', String(refusal.retryAfterSeconds));
