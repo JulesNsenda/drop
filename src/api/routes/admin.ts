@@ -342,18 +342,7 @@ admin.post('/apps/:name/suspend', async (c) => {
   }
 
   if ('refused' in result) {
-    if (result.refused === 'case-collision') {
-      return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
-    }
-    return c.json(
-      error(
-        ErrorCodes.CONFLICT,
-        `'${appName}' is a monorepo container and runs nothing itself; suspend its services instead: ` +
-          (result.services.length > 0 ? result.services.join(', ') : '(none)'),
-        { services: result.services }
-      ),
-      409
-    );
+    return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
   }
 
   await logActivityFor(authCtx, {

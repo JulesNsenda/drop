@@ -110,18 +110,23 @@ describe('app suspension routes', () => {
       );
     });
 
-    it('409s on a monorepo container, naming its services', async () => {
+    it('suspends a monorepo container, reporting its services\' stop errors (prefixed) like any other', async () => {
       ops({
-        suspendApp: jest.fn().mockResolvedValue({ refused: 'group-container', services: ['mono-api', 'mono-web'] }),
+        suspendApp: jest
+          .fn()
+          .mockResolvedValue({ suspended: true, at: 'now', stopErrors: ['mono-api: mono-api.b: still present after delete'] }),
       });
 
       const res = await post('/api/v1/admin/apps/shop/suspend', adminToken);
 
-      expect(res.status).toBe(409);
-      const body = (await res.json()) as { error: { message: string; details: { services: string[] } } };
-      expect(body.error.message).toContain('mono-api, mono-web');
-      expect(body.error.details.services).toEqual(['mono-api', 'mono-web']);
-      expect(logSpy).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { suspended: boolean; stopErrors?: string[] } };
+      expect(body.data.suspended).toBe(true);
+      expect(body.data.stopErrors).toEqual(['mono-api: mono-api.b: still present after delete']);
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ appName: 'shop', detail: expect.stringContaining('mono-api: mono-api.b') })
+      );
     });
 
     it('answers 500, not success, when the record cannot be written', async () => {

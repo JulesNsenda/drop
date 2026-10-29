@@ -430,6 +430,11 @@ describe('suspension policy: refusalForApp', () => {
       expect(holders(hostClaims('dropkit.sh', depsOf(apps)), 'site.dropkit.sh')).toEqual(['site', 'site-web']);
     });
 
+    it('a stale stamp holds nothing: the named app is no longer a container', () => {
+      const apps = [{ name: 'site' }, { name: 'site-web', group: 'site', groupContainer: 'site' }];
+      expect(holders(hostClaims('dropkit.sh', depsOf(apps)), 'site.dropkit.sh')).toEqual(['site-web']);
+    });
+
     it('a group stays claimed through a config alone (its state entries are gone)', () => {
       const apps = [{ name: 'kid', group: 'site', configOnly: true }];
       expect(claimedAgainst(hostClaims('dropkit.sh', depsOf(apps)), 'site.dropkit.sh', 'evil')).toBe(true);
