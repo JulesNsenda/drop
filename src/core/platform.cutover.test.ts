@@ -481,7 +481,7 @@ describe('zero-downtime cutover (#298 step 5)', () => {
       expect(cfg('site')?.runtimeSlot).toBeUndefined();
     }, 30000);
 
-    it('during the drain, after traffic moved: the app is not reported running, no watch is armed, the key is revoked', async () => {
+    it('during the drain, after traffic moved: the episode closes as failed, the app ends stopped, running is never written', async () => {
       platform = makePlatform();
       await platform.start();
       const appPath = await deployV1('site');
@@ -497,8 +497,9 @@ describe('zero-downtime cutover (#298 step 5)', () => {
         if (p.appId === 'site' && status) statuses.push(status);
       });
       // The suspension lands while the old instance drains.
+      // A real suspension (record, then both slots taken down) lands while the old instance drains.
       jest.spyOn(internals, 'cutoverDrainMs').mockImplementation(() => {
-        void getSuspensionStore().suspend('site', 'admin-1');
+        void platform!.suspendApp('site', 'admin-1');
         return 400;
       });
       arm.mockClear();
@@ -507,8 +508,13 @@ describe('zero-downtime cutover (#298 step 5)', () => {
       unsubscribe();
 
       expect(statuses).not.toContain('running');
+      expect(getStateManager().getApp('site')?.status).toBe('stopped');
       expect(arm).not.toHaveBeenCalled();
       expect(internals.healthProbers.has('site')).toBe(false);
+      expect(getDeployTracker().hasOpenEpisode('site')).toBe(false);
+      const [episode] = getDeployTracker().getEpisodes('site');
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
     }, 30000);
 
     it('after the config writes, before the traffic switch: the config is put back and traffic does not move', async () => {

@@ -9019,7 +9019,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.settleRefusedStart(appName, error.cause, {
           progress,
           closeEpisode: true,
-          replaced: progress.replaced === true,
+          replaced: progress.replaced === true || (error as { replaced?: boolean }).replaced === true,
         });
         return false;
       }
@@ -9027,7 +9027,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await this.settleRefusedStart(
           appName,
           { kind: 'suspended', reason: error.reason, via: error.via },
-          { progress, closeEpisode: true, replaced: progress.replaced === true }
+          {
+            progress,
+            closeEpisode: true,
+            replaced: progress.replaced === true || (error as { replaced?: boolean }).replaced === true,
+          }
         );
         return false;
       }
@@ -9398,18 +9402,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     await this.commitServedPath(appName, targetPath, newSlot);
     void this.recordDeploySignature(appName, this.sourcePathOf(appName));
     const info = await runtime.getStatus(appName);
-    // A suspension that landed during the drain (traffic has already moved, so
-    // nothing can be undone): do not report the app running or arm watches that
-    // would restart what the suspension took away. The closer revokes the key and
-    // leaves the status true; the episode is the caller's.
-    const lateRefusal = refusalForApp(appName);
-    if (lateRefusal?.reason === 'record') {
-      await this.settleRefusedStart(
-        appName,
-        { kind: 'suspended', reason: lateRefusal.reason, via: lateRefusal.via },
-        { closeEpisode: false }
-      );
-      return { ok: true, port: newPort };
+    // A refusal that landed during the drain. Traffic has already moved and the
+    // old slot is gone, so nothing is rolled back (this is outside the try): throw
+    // what the gate would, marked `replaced`, and the caller's existing catch
+    // settles once and closes the episode. Never report the app running or arm
+    // watches that would restart what the suspension took away.
+    try {
+      this.gateBeforeSwap(appName, ctx);
+    } catch (error) {
+      const late =
+        error instanceof StartRefused && !ctx && error.cause.kind === 'suspended'
+          ? new AppSuspendedError(appName, error.cause.reason, error.cause.via)
+          : error;
+      throw Object.assign(late as object, { replaced: true });
     }
     await this.stateManager?.setAppStatus(appName, 'running', { port: newPort, pid: info?.pid ?? undefined });
     this.appDeployTimes.set(appName, Date.now());
