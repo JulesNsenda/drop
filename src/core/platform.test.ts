@@ -2614,6 +2614,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
     expect(updateApp).toHaveBeenCalledWith(repoName, {
       group: 'ezsign-group',
       isGroupContainer: true,
+      groupTrusted: true,
     });
   });
 
@@ -2836,6 +2837,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       const addRoute = jest.fn().mockResolvedValue(undefined);
       (platform as any).router = { addRoute };
       (platform as any).appConfigService = {
+        getDomainOwners: jest.fn().mockReturnValue(new Map()),
         getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
         updateConfig: jest.fn(),
       };
@@ -2865,6 +2867,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       const addRoute = jest.fn().mockResolvedValue(undefined);
       (platform as any).router = { addRoute };
       (platform as any).appConfigService = {
+        getDomainOwners: jest.fn().mockReturnValue(new Map()),
         getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
         updateConfig: jest.fn(),
       };
@@ -2894,6 +2897,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       const updateConfig = jest.fn().mockResolvedValue(undefined);
       (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
       (platform as any).appConfigService = {
+        getDomainOwners: jest.fn().mockReturnValue(new Map()),
         getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
         updateConfig,
       };
@@ -2918,6 +2922,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       const updateConfig = jest.fn().mockResolvedValue(undefined);
       (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
       (platform as any).appConfigService = {
+        getDomainOwners: jest.fn().mockReturnValue(new Map()),
         getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
         updateConfig,
       };
@@ -2934,6 +2939,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       const updateConfig = jest.fn().mockResolvedValue(undefined);
       (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
       (platform as any).appConfigService = {
+        getDomainOwners: jest.fn().mockReturnValue(new Map()),
         getConfig: jest.fn().mockReturnValue(undefined),
         updateConfig,
       };
@@ -2955,6 +2961,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       const updateConfig = jest.fn().mockResolvedValue(undefined);
       (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
       (platform as any).appConfigService = {
+        getDomainOwners: jest.fn().mockReturnValue(new Map()),
         // No `route` on disk (no drop.yaml) → not same-origin this run, but a
         // stale publicUrl from a previous same-origin run is present.
         getConfig: jest.fn().mockReturnValue({ group: 'ezsign', publicUrl: 'https://ezsign.dropkit.sh' }),
@@ -2981,6 +2988,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       const updateConfig = jest.fn().mockResolvedValue(undefined);
       (platform as any).router = { addRoute: jest.fn().mockResolvedValue(undefined) };
       (platform as any).appConfigService = {
+        getDomainOwners: jest.fn().mockReturnValue(new Map()),
         getConfig: jest.fn().mockReturnValue({ group: 'ezsign' }),
         updateConfig,
       };
@@ -3000,6 +3008,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
       const addRoute = jest.fn().mockResolvedValue(undefined);
       (platform as any).router = { addRoute };
       (platform as any).appConfigService = {
+        getDomainOwners: jest.fn().mockReturnValue(new Map()),
         getConfig: jest.fn().mockReturnValue(undefined),
         updateConfig: jest.fn(),
       };
@@ -3033,6 +3042,7 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
         const addRoute = jest.fn().mockResolvedValue(undefined);
         (platform as any).router = { addRoute };
         (platform as any).appConfigService = {
+          getDomainOwners: jest.fn().mockReturnValue(new Map()),
           getConfig: jest.fn().mockReturnValue(undefined),
           updateConfig: jest.fn(),
         };
