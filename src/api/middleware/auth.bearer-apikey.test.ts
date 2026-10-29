@@ -92,7 +92,7 @@ describe('Bearer-presented API keys', () => {
 
   it('still treats a valid session JWT via Bearer as a JWT (JWT is tried first)', async () => {
     const app = buildApp();
-    await createUser('alice', 'password123', 'user');
+    await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
     const { getTestToken } = await import('../__testutils__/auth');
     const token = await getTestToken('alice', 'password123');
 

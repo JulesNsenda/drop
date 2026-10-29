@@ -62,6 +62,16 @@ export interface User {
    */
   credentialsInvalidBefore?: string;
   /**
+   * Stamped when the user's role is LOWERED. Honoured ONLY by the interactive
+   * credential classes (session JWT, OAuth/app-MCP access tokens, refresh
+   * tokens, authorization codes) via `predatesSessionInvalidation`, so a demoted
+   * user must sign in / re-authorize connectors at the new rank. Deliberately NOT
+   * `credentialsInvalidBefore`: API keys and agent tokens keep working, clamped
+   * to the owner's lower role as before. Optional, so records written before it
+   * existed load unchanged.
+   */
+  sessionsInvalidBefore?: string;
+  /**
    * DROP-130 Item 6: set only when this account was minted through the
    * SCOPED (non-admin, capability-only) path — a rank-0 `users:create`
    * caller acting on `POST /auth/users`, never an admin. `authenticateUser`
@@ -83,6 +93,30 @@ export interface User {
   mfaSecret?: EncryptedData;
   /** Last step index that was accepted — prevents replay */
   mfaLastUsedStep?: number;
+  /**
+   * SSO: set when the account was created without a password a human knows
+   * (`createUser({ credential: { passwordless: true } })`) — `passwordHash` is then the
+   * scrypt of random bytes nobody holds, so password login cannot succeed.
+   * Cleared by `resetUserPassword`, which is an admin choosing a real one.
+   * Never implies `mustChangePassword`: that would deadlock a user who has no
+   * password to change.
+   */
+  passwordless?: true;
+}
+
+/**
+ * An external (SSO) identity bound to a DROP user — an ADDITIONAL credential on
+ * that user, never an account of its own. Keyed on `(issuer, subject)`; `email`
+ * is what the IdP asserted at link time and is informational only (DROP's own
+ * email side is unverified and not unique, so it is never matched against).
+ * Deliberately NOT a field on `User`, so it cannot leak through `SafeUser`.
+ */
+export interface ExternalIdentity {
+  issuer: string;
+  subject: string;
+  userId: string;
+  email?: string;
+  linkedAt: string;
 }
 
 /**
@@ -320,6 +354,13 @@ interface CredentialsStore {
    * `getOrCreateOAuthClientId()`, on first admin `POST /oauth/client` call.
    */
   oauthClientId?: string;
+  /**
+   * `ExternalIdentity[]`, typed `unknown` ON PURPOSE: `isValidCredentialsStore`
+   * does not look at it (a bad field must never quarantine the whole store and
+   * with it every user), so nothing here may trust its shape. Read it ONLY
+   * through `readExternalIdentities`.
+   */
+  externalIdentities?: unknown;
 }
 
 // Module state
@@ -401,7 +442,12 @@ export async function initializeAuth(authConfig: AuthConfig): Promise<void> {
   // Create default admin user if no users exist
   if (credentials.users.length === 0) {
     const defaultPassword = crypto.randomBytes(16).toString('hex');
-    await createUser('admin', defaultPassword, 'admin', undefined, true);
+    await createUser({
+      username: 'admin',
+      role: 'admin',
+      credential: { password: defaultPassword },
+      mustChangePassword: true,
+    });
     console.log('='.repeat(60));
     console.log('DROP API - Default Admin Credentials');
     console.log('='.repeat(60));
@@ -565,6 +611,9 @@ function isLegacyPasswordHash(storedHash: string): boolean {
  */
 const VALID_USER_ROLES: ReadonlySet<string> = new Set(['admin', 'user', 'readonly']);
 
+/** Thrown by createUser/updateUser; the user-update route translates it to a 400. */
+export const PASSWORDLESS_ADMIN_REFUSAL = 'A passwordless account cannot be an admin';
+
 /**
  * Whether any DROP user already holds this address — the lookup the INVITE end
  * of the collision rule needs (DROP-155).
@@ -652,14 +701,32 @@ function requireGuestModule(): {
 }
 
 /**
- * Create a new user
+ * Whether a PASSWORDLESS (identity) account holds this address, other than
+ * `exceptUserId`. Normalised like `emailHeldByAnyUser`. Password-to-password
+ * duplicates are deliberately not covered: only the identity end of the rule is.
  */
-export async function createUser(
-  username: string,
-  password: string,
-  role: 'admin' | 'user' | 'readonly' = 'user',
-  email?: string,
-  mustChangePassword?: boolean,
+function emailHeldByPasswordlessUser(email: string, exceptUserId?: string): boolean {
+  const target = email.trim().toLowerCase();
+  if (!target) return false;
+  return (credentials?.users ?? []).some(
+    (u) => u.passwordless === true && u.id !== exceptUserId && (u.email ?? '').trim().toLowerCase() === target
+  );
+}
+
+/**
+ * What a new account is made from. The `externalIdentity` credential IS the
+ * passwordless credential: the account is reachable only through that identity,
+ * and the stored hash is the scrypt of random bytes that are discarded here, so
+ * no password verifies. (Known limitation: such a user cannot use the
+ * password-gated flows — enabling MFA, changing or confirming with a password,
+ * self-deleting; the routes say so explicitly. Recovery after containment is an
+ * admin `resetUserPassword`, then a login and a re-link from a post-stamp
+ * session — there is deliberately no admin "re-trust" shortcut.)
+ */
+export type NewUserInput = {
+  username: string;
+  role: 'admin' | 'user' | 'readonly';
+  email?: string;
   /**
    * DROP-130 Item 6: stamp `createdByScope` on the record. Only
    * `POST /auth/users` sets this, and only when the caller driving the
@@ -669,8 +736,34 @@ export async function createUser(
    * `undefined`, which is what keeps admin-created and self-service
    * accounts able to log in immediately.
    */
-  createdByScope?: boolean,
-): Promise<User> {
+  createdByScope?: boolean;
+} & (
+  | { credential: { password: string }; mustChangePassword?: boolean }
+  | {
+      /**
+       * Create the account AND its first external identity in one synchronous
+       * mutation and one save (JIT provisioning). Nothing can interleave between
+       * "this identity is free", "this email is free" and "it is now this user's".
+       */
+      credential: { externalIdentity: { issuer: string; subject: string } };
+      /**
+       * REQUIRED on this branch: the verified address the IdP asserted. It is
+       * both `User.email` and the identity record's stored email — one field.
+       */
+      email: string;
+      /** A passwordless account has no password to change. */
+      mustChangePassword?: never;
+    }
+);
+
+/**
+ * Create a new user. The one constructor: every account — password,
+ * passwordless, JIT — passes through the role, duplicate-name and
+ * guest-collision guards below.
+ */
+export async function createUser(input: NewUserInput): Promise<User> {
+  const { username, role, email, credential, createdByScope } = input;
+  const externalIdentity = 'externalIdentity' in credential ? credential.externalIdentity : undefined;
   if (!credentials || !config) {
     throw new Error('Auth not initialized');
   }
@@ -695,7 +788,45 @@ export async function createUser(
   // caller inherits it — the same argument the role check above makes.
   assertEmailNotHeldByGuest(email);
 
-  const { hash: passwordHash } = hashPassword(password);
+  // A passwordless account has no password a human could change or be
+  // challenged for; an admin one would be an unrecoverable-by-password root.
+  if (externalIdentity && role === 'admin') {
+    throw new Error(PASSWORDLESS_ADMIN_REFUSAL);
+  }
+
+  // Everything from here to the save is synchronous: the identity check, the
+  // email check, the user insert and the identity insert cannot be interleaved
+  // by another request.
+  let identities: ExternalIdentity[] = [];
+  let orphan: ExternalIdentity | undefined;
+  if (externalIdentity) {
+    if (!externalIdentity.issuer || !externalIdentity.subject) {
+      throw new Error('issuer and subject are required');
+    }
+    if (!email) throw new Error('An external identity account requires an email address');
+    const read = readExternalIdentities();
+    if (read === 'corrupt') throw new Error('External identity store is unreadable');
+    const claim = claimOf(read, externalIdentity.issuer, externalIdentity.subject, credentials.users);
+    if (claim.holder) throw new Error('That external identity is already linked');
+    identities = claim.rest;
+    orphan = claim.orphan;
+    // JIT must not mint a second account on an address a user already holds.
+    // `emailHeldByAnyUser` throws when it cannot tell, and that counts as a refusal.
+    if (emailHeldByAnyUser(email)) {
+      throw new Error('That email address is not available.');
+    }
+  } else if (email !== undefined && emailHeldByPasswordlessUser(email)) {
+    // The other end of the same rule: an address an identity (passwordless)
+    // account holds is not available to a password account either. Password to
+    // password duplicates are unchanged.
+    throw new Error('That email address is not available.');
+  }
+
+  const passwordHash = hashPassword(
+    // Decided by the same check as the passwordless flag, so an object that
+    // somehow carries both fields never stores a usable password.
+    externalIdentity ? crypto.randomBytes(32).toString('hex') : (credential as { password: string }).password
+  ).hash;
   const user: User = {
     id: crypto.randomUUID(),
     username,
@@ -703,12 +834,26 @@ export async function createUser(
     role,
     email,
     createdAt: new Date().toISOString(),
-    ...(mustChangePassword ? { mustChangePassword: true } : {}),
+    ...(externalIdentity ? { passwordless: true as const } : {}),
+    ...(input.mustChangePassword ? { mustChangePassword: true } : {}),
     ...(createdByScope ? { createdByScope: true } : {}),
   };
 
   credentials.users.push(user);
+  if (externalIdentity) {
+    credentials.externalIdentities = [
+      ...identities,
+      {
+        issuer: externalIdentity.issuer,
+        subject: externalIdentity.subject,
+        userId: user.id,
+        email: email as string,
+        linkedAt: new Date().toISOString(),
+      },
+    ];
+  }
   await saveCredentials(config.credentialsPath, credentials);
+  noteOrphanReplaced(orphan);
 
   return user;
 }
@@ -726,19 +871,39 @@ export function verifyUserPassword(userId: string, password: string): boolean {
 }
 
 /**
+ * Confirm an account's password for a destructive self-service action (account
+ * deletion), distinguishing a passwordless account — which has no password to
+ * confirm — from a wrong one.
+ */
+export function confirmAccountPassword(userId: string, password: string): 'ok' | 'invalid' | 'passwordless' {
+  if (!credentials) return 'invalid';
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return 'invalid';
+  if (user.passwordless) return 'passwordless';
+  return verifyPassword(password, user.passwordHash) ? 'ok' : 'invalid';
+}
+
+/**
  * Change a user's password
  */
-export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<boolean> {
+export async function changePassword(
+  userId: string,
+  currentPassword: string,
+  newPassword: string
+): Promise<'changed' | 'invalid' | 'passwordless'> {
   if (!credentials || !config) throw new Error('Auth not initialized');
 
   const user = credentials.users.find((u) => u.id === userId);
-  if (!user || !verifyPassword(currentPassword, user.passwordHash)) return false;
+  if (!user) return 'invalid';
+  // No password exists to change; the caller says so rather than "incorrect".
+  if (user.passwordless) return 'passwordless';
+  if (!verifyPassword(currentPassword, user.passwordHash)) return 'invalid';
 
   const { hash } = hashPassword(newPassword);
   user.passwordHash = hash;
   user.mustChangePassword = false;
   await saveCredentials(config.credentialsPath, credentials);
-  return true;
+  return 'changed';
 }
 
 /**
@@ -747,7 +912,7 @@ export async function changePassword(userId: string, currentPassword: string, ne
 /**
  * Admin reset a user's password — CONTAINMENT, not onboarding. This is an
  * admin forcing a reset on a possibly-compromised account (reachable from the
- * dashboard's "Reset password" button), distinct from `createUser(..., true)`
+ * dashboard's "Reset password" button), distinct from `createUser({ mustChangePassword: true })`
  * / self-service signup's `mustChangePassword`, which is onboarding ("set
  * your own password") and does NOT touch `credentialsInvalidBefore`.
  *
@@ -773,6 +938,8 @@ export async function resetUserPassword(userId: string, newPassword: string): Pr
   user.mustChangePassword = true;
   user.credentialsInvalidBefore = new Date().toISOString();
   delete user.createdByScope;
+  // An admin choosing a real password ends passwordless-ness.
+  delete user.passwordless;
   await saveCredentials(config.credentialsPath, credentials);
   return true;
 }
@@ -802,8 +969,292 @@ export async function deleteUser(userId: string): Promise<boolean> {
   credentials.refreshTokens = (credentials.refreshTokens ?? []).filter(
     (r) => r.userId !== userId
   );
+  // External identities go with the user. A malformed field is left exactly as
+  // found (never filtered by DROP) — see `readExternalIdentities`.
+  const identities = readExternalIdentities();
+  if (identities !== 'corrupt' && credentials.externalIdentities !== undefined) {
+    credentials.externalIdentities = identities.filter((i) => i.userId !== userId);
+  }
   await saveCredentials(config.credentialsPath, credentials);
   return true;
+}
+
+/** Set after the first 'corrupt' read in this process, so the evidence is written once. */
+let identitiesCorruptReported = false;
+
+/**
+ * The ONE read of `CredentialsStore.externalIdentities` (validated on every read). Returns `'corrupt'`
+ * when the field is not an array of well-formed entries that are unique on
+ * `(issuer, subject)` and on `(userId, issuer)`, and every caller then SKIPS
+ * ENTIRELY: answering from "what can be read" would let a lookup decide from a
+ * partial view. The field is never filtered or repaired by DROP — whatever is
+ * wrong with it stays as found until an operator looks (every other save writes
+ * it back untouched). One unreadable field must not turn into the loss of every
+ * link, nor into quarantining the whole store and with it every user. An absent
+ * field is simply empty.
+ *
+ * The first corrupt read in a process is made visible: logged, and a copy of
+ * the raw field is written beside the store for forensics.
+ */
+function readExternalIdentities(): ExternalIdentity[] | 'corrupt' {
+  const raw = credentials?.externalIdentities;
+  if (raw === undefined) return [];
+  if (isWellFormedIdentityList(raw)) return raw;
+  reportCorruptIdentities(raw);
+  return 'corrupt';
+}
+
+function isWellFormedIdentityList(raw: unknown): raw is ExternalIdentity[] {
+  if (!Array.isArray(raw)) return false;
+  const byPair = new Set<string>();
+  const byUserIssuer = new Set<string>();
+  for (const entry of raw as unknown[]) {
+    if (typeof entry !== 'object' || entry === null) return false;
+    const e = entry as Record<string, unknown>;
+    for (const key of ['issuer', 'subject', 'userId', 'linkedAt'] as const) {
+      if (typeof e[key] !== 'string' || (e[key] as string).length === 0) return false;
+    }
+    if (e.email !== undefined && typeof e.email !== 'string') return false;
+    const pair = JSON.stringify([e.issuer, e.subject]);
+    const userIssuer = JSON.stringify([e.userId, e.issuer]);
+    if (byPair.has(pair) || byUserIssuer.has(userIssuer)) return false;
+    byPair.add(pair);
+    byUserIssuer.add(userIssuer);
+  }
+  return true;
+}
+
+function reportCorruptIdentities(raw: unknown): void {
+  if (identitiesCorruptReported || !config) return;
+  identitiesCorruptReported = true;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const copyPath = `${config.credentialsPath}.identities-corrupt-${ts}`;
+  console.error(
+    `[auth] The externalIdentities field in the credentials store is malformed; SSO identity ` +
+      `operations are refused until it is repaired. A copy was written to ${copyPath}.`
+  );
+  // Fire and forget: this runs inside synchronous readers, and a failed
+  // evidence copy must not change what they answer.
+  writeJsonAtomic(copyPath, raw, { mode: 0o600 }).catch((err: unknown) => {
+    console.error('[auth] Failed to save a copy of the malformed identities field:', err);
+  });
+}
+
+/**
+ * Whether `(issuer, subject)` is claimed — the ONE definition, used by
+ * `createUser` and `linkExternalIdentity`. A row whose owner no longer exists
+ * is not a claim: it is dropped from `rest` (the rows to keep, which the caller
+ * writes in the same synchronous mutation) and returned as `orphan`, for the
+ * caller to log with `noteOrphanReplaced` once the write has happened.
+ */
+function claimOf(
+  identities: ExternalIdentity[],
+  issuer: string,
+  subject: string,
+  users: User[]
+): { holder?: ExternalIdentity; orphan?: ExternalIdentity; rest: ExternalIdentity[] } {
+  const row = identities.find((i) => i.issuer === issuer && i.subject === subject);
+  if (!row) return { rest: identities };
+  if (users.some((u) => u.id === row.userId)) return { holder: row, rest: identities };
+  return { orphan: row, rest: identities.filter((i) => i !== row) };
+}
+
+function noteOrphanReplaced(orphan: ExternalIdentity | undefined): void {
+  if (!orphan) return;
+  console.warn(`[auth] Replaced an external identity row at ${orphan.issuer} owned by missing user ${orphan.userId}`);
+}
+
+/** A record linked before its owner's invalidation stamp (or whose owner is gone) is not trusted. */
+function identityIsStale(identity: ExternalIdentity, owner: User | undefined): boolean {
+  if (!owner) return true;
+  return predatesInvalidationStamp(identity.linkedAt, owner.credentialsInvalidBefore);
+}
+
+/**
+ * Module-internal. Resolve `(issuer, subject)` to its user from FRESH state. A
+ * record linked before the user's `credentialsInvalidBefore` is `'stale'`: a
+ * suspension or forced reset is containment, and a link made before it is a
+ * credential from before the incident, exactly like an API key or JWT — the
+ * user must re-link. Disabled accounts still resolve; the gate answers for them.
+ */
+type ExternalIdentityResolution =
+  | { status: 'found'; user: User }
+  | { status: 'not_linked' | 'stale' | 'user_missing' | 'corrupt' };
+
+function resolveExternalIdentity(issuer: string, subject: string): ExternalIdentityResolution {
+  if (!credentials) return { status: 'corrupt' };
+  const identities = readExternalIdentities();
+  if (identities === 'corrupt') return { status: 'corrupt' };
+  const identity = identities.find((i) => i.issuer === issuer && i.subject === subject);
+  if (!identity) return { status: 'not_linked' };
+  const user = credentials.users.find((u) => u.id === identity.userId);
+  if (!user) return { status: 'user_missing' };
+  // A disabled account is the gate's to answer ('disabled'), not 'stale': a
+  // suspension stamps the user, so every identity of a suspended account is
+  // stale too, and 'stale' would hide the real reason.
+  if (user.enabled === false) return { status: 'found', user };
+  if (identityIsStale(identity, user)) return { status: 'stale' };
+  return { status: 'found', user };
+}
+
+/**
+ * What `(issuer, subject)` currently resolves to — a STATUS only, never a user,
+ * so a caller can decide what to do (refuse, offer a re-link, start JIT) without
+ * holding anything that could mint a session. `completeExternalIdentityLogin`
+ * remains the only entry that does.
+ */
+export function classifyExternalIdentity(
+  issuer: string,
+  subject: string
+): 'found' | 'not_linked' | 'stale' | 'user_missing' | 'corrupt' {
+  return resolveExternalIdentity(issuer, subject).status;
+}
+
+export type ExternalLoginResult =
+  | AuthenticateResult
+  | { status: 'not_linked' | 'stale' | 'corrupt' | 'user_missing' };
+
+/**
+ * The SSO login entry. Re-resolves `(issuer, subject)` against fresh state and
+ * runs the same post-authentication gate as a password login (disabled,
+ * createdByScope, MFA challenge, lastLogin, session JWT). The caller has
+ * verified the IdP's assertion; this is what turns it into a session.
+ */
+export async function completeExternalIdentityLogin(
+  issuer: string,
+  subject: string
+): Promise<ExternalLoginResult> {
+  if (!credentials || !jwtSecret || !config) throw new Error('Auth not initialized');
+  const resolved = resolveExternalIdentity(issuer, subject);
+  if (resolved.status !== 'found') return { status: resolved.status };
+  // One of the two places a VerifiedLogin is made: the identity just resolved.
+  return completeLogin({ user: resolved.user } as VerifiedLogin);
+}
+
+export type LinkExternalIdentityResult =
+  | { status: 'linked' }
+  | { status: 'relinked' } // the user's stale record was refreshed
+  | { status: 'already_linked_to_user' } // idempotent: this exact identity is already this user's
+  | { status: 'already_linked' } // (issuer, subject) belongs to another user
+  | { status: 'issuer_taken' } // this user already has a different, trusted identity at the issuer
+  | { status: 'user_not_found' }
+  | { status: 'user_disabled' }
+  | { status: 'stale_session' } // the authenticating session predates the user's invalidation stamp
+  | { status: 'session_mismatch' } // the session belongs to a different user
+  | { status: 'corrupt' };
+
+/**
+ * Bind `(issuer, subject)` to a user. Unique on `(issuer, subject)` across the
+ * store, and one identity per issuer per user. Never writes `User.email`.
+ *
+ * `authenticatedAt` — the `iat` (seconds, or an ISO string) of the session that
+ * started the link — and `sessionUserId` are REQUIRED (the link is refused unless
+ * the session's own user is `userId`), and a session that predates the user's
+ * `credentialsInvalidBefore` cannot add a credential: that is the same
+ * containment every other credential gets, and without it a stolen
+ * pre-incident JWT could plant a new login method that outlives the incident.
+ * (An `iat` is whole seconds, so one minted in the same second as the stamp
+ * reads as predating it — the fail-closed rule of `predatesInvalidationStamp`,
+ * left as is.) A disabled user cannot be linked.
+ *
+ * A STALE record of this user's (same identity, or another subject at the same
+ * issuer) is replaced under the same condition — that is how a contained user
+ * re-links. Orphaned rows are handled by `claimOf`.
+ */
+export async function linkExternalIdentity(
+  userId: string,
+  identity: { issuer: string; subject: string; email?: string },
+  options: { authenticatedAt: string | number; sessionUserId: string }
+): Promise<LinkExternalIdentityResult> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  // A link binds to the session's OWN user, never to a user the caller names.
+  if (options.sessionUserId !== userId) return { status: 'session_mismatch' };
+  const { issuer, subject, email } = identity;
+  if (!issuer || !subject) throw new Error('issuer and subject are required');
+  const identities = readExternalIdentities();
+  if (identities === 'corrupt') return { status: 'corrupt' };
+  const user = credentials.users.find((u) => u.id === userId);
+  if (!user) return { status: 'user_not_found' };
+  if (user.enabled === false) return { status: 'user_disabled' };
+  if (predatesInvalidationStamp(options.authenticatedAt, user.credentialsInvalidBefore)) {
+    return { status: 'stale_session' };
+  }
+
+  const entry: ExternalIdentity = {
+    issuer,
+    subject,
+    userId,
+    ...(email ? { email } : {}),
+    linkedAt: new Date().toISOString(),
+  };
+
+  let status: 'linked' | 'relinked' = 'linked';
+  const claim = claimOf(identities, issuer, subject, credentials.users);
+  let next = claim.rest;
+  if (claim.holder) {
+    if (claim.holder.userId !== userId) return { status: 'already_linked' };
+    if (!identityIsStale(claim.holder, user)) return { status: 'already_linked_to_user' };
+    status = 'relinked';
+    next = next.filter((i) => i !== claim.holder);
+  }
+  const sameIssuer = next.find((i) => i.userId === userId && i.issuer === issuer);
+  if (sameIssuer) {
+    // This user's own row at the issuer, for a different subject: replaceable
+    // only when it is stale (the same condition as a re-link).
+    if (!identityIsStale(sameIssuer, user)) return { status: 'issuer_taken' };
+    status = 'relinked';
+    next = next.filter((i) => i !== sameIssuer);
+  }
+
+  credentials.externalIdentities = [...next, entry];
+  await saveCredentials(config.credentialsPath, credentials);
+  noteOrphanReplaced(claim.orphan);
+  return { status };
+}
+
+/** Shown to an admin who re-enables a passwordless account whose identities are all stale. */
+export const NO_LOGIN_METHOD_WARNING =
+  'This account has no working login method: it has no password and its external identities predate the suspension. ' +
+  'Reset its password to restore access; the user can then sign in and re-link.';
+
+/**
+ * Whether a passwordless account currently has NO way in: every identity it has
+ * (none counts) is stale, or the identities field is unreadable.
+ */
+export function hasNoWorkingLoginMethod(userId: string): boolean {
+  const user = credentials?.users.find((u) => u.id === userId);
+  if (!user || user.passwordless !== true) return false;
+  const identities = readExternalIdentities();
+  if (identities === 'corrupt') return true;
+  return !identities.some((i) => i.userId === userId && !identityIsStale(i, user));
+}
+
+/** Remove a user's identity at an issuer. Last-login-method policy is the caller's. */
+export async function unlinkExternalIdentity(
+  userId: string,
+  issuer: string
+): Promise<'unlinked' | 'not_found' | 'corrupt'> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  const identities = readExternalIdentities();
+  if (identities === 'corrupt') return 'corrupt';
+  if (!identities.some((i) => i.userId === userId && i.issuer === issuer)) return 'not_found';
+  credentials.externalIdentities = identities.filter(
+    (i) => !(i.userId === userId && i.issuer === issuer)
+  );
+  await saveCredentials(config.credentialsPath, credentials);
+  return 'unlinked';
+}
+
+/** A user's external identities (copies), each marked `stale` when it is not currently honoured, or `'corrupt'`. */
+export function listExternalIdentities(
+  userId: string
+): (ExternalIdentity & { stale?: true })[] | 'corrupt' {
+  const identities = readExternalIdentities();
+  if (identities === 'corrupt') return 'corrupt';
+  const owner = credentials?.users.find((u) => u.id === userId);
+  return identities
+    .filter((i) => i.userId === userId)
+    .map((i) => ({ ...i, ...(identityIsStale(i, owner) ? { stale: true as const } : {}) }));
 }
 
 /**
@@ -818,6 +1269,22 @@ export async function deleteUser(userId: string): Promise<boolean> {
  * than an admission. There is exactly ONE caller of `deleteUser` today; if that
  * stops being true, this comment is the thing that will have gone stale.
  */
+
+/**
+ * `predatesInvalidationStamp` against BOTH of the user's stamps: the
+ * user-wide `credentialsInvalidBefore` and `sessionsInvalidBefore` (role
+ * demotion). Called by the session/connector verifiers only; the API-key paths
+ * keep checking `credentialsInvalidBefore` alone.
+ */
+export function predatesSessionInvalidation(
+  mintedAt: string | number | undefined,
+  user: Pick<User, 'credentialsInvalidBefore' | 'sessionsInvalidBefore'>
+): boolean {
+  return (
+    predatesInvalidationStamp(mintedAt, user.credentialsInvalidBefore) ||
+    predatesInvalidationStamp(mintedAt, user.sessionsInvalidBefore)
+  );
+}
 
 /**
  * Set `user.enabled` and, whenever the TARGET state is disabled, stamp
@@ -916,9 +1383,26 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
   // address and MOVING a user onto one are the same parallel identity; a check
   // only on create would be walked past by an update one request later.
   assertEmailNotHeldByGuest(updates.email);
+  if (updates.email !== undefined && emailHeldByPasswordlessUser(updates.email, userId)) {
+    throw new Error('That email address is not available.');
+  }
+
+  // Mirrors createUser's guard: a passwordless account is never an admin.
+  if (updates.role === 'admin' && user.passwordless) {
+    throw new Error(PASSWORDLESS_ADMIN_REFUSAL);
+  }
 
   if (updates.enabled !== undefined) setUserEnabled(user, updates.enabled);
-  if (updates.role) user.role = updates.role;
+  if (updates.role) {
+    // A LOWERING of rank invalidates sessions and connector grants issued
+    // under the old, higher role, so the user must re-authorize at the new
+    // rank. API keys are untouched (the owner-role clamp caps them). A raise
+    // or an unchanged role leaves everything alone.
+    if (rankOf(updates.role) < rankOf(user.role)) {
+      user.sessionsInvalidBefore = new Date().toISOString();
+    }
+    user.role = updates.role;
+  }
   if (updates.maxApps !== undefined) user.maxApps = updates.maxApps;
   if (updates.email !== undefined) user.email = updates.email;
   await saveCredentials(config.credentialsPath, credentials);
@@ -953,6 +1437,42 @@ export async function authenticateUser(username: string, password: string): Prom
     return { status: 'invalid' };
   }
 
+  // Opportunistically upgrade legacy SHA-256 hashes to scrypt on a successful
+  // password match, BEFORE the gate: hardening the stored hash of an account
+  // that is then refused (disabled, scope-created) is benign — the password was
+  // correct, and the new hash verifies the same password.
+  if (isLegacyPasswordHash(user.passwordHash)) {
+    user.passwordHash = hashPassword(password).hash;
+    await saveCredentials(config.credentialsPath, credentials);
+  }
+
+  // One of the two places a VerifiedLogin is made: the password just matched.
+  return completeLogin({ user } as VerifiedLogin);
+}
+
+declare const verifiedLoginBrand: unique symbol;
+
+/**
+ * Proof that a credential has ALREADY been verified for `user`. Not exported,
+ * and constructed (by cast) in exactly two places — the password check in
+ * `authenticateUser` and the identity resolution in
+ * `completeExternalIdentityLogin` — so there is no factory a route, or a
+ * future caller, could hand a merely-looked-up user to.
+ */
+interface VerifiedLogin {
+  readonly [verifiedLoginBrand]: true;
+  readonly user: User;
+}
+
+/**
+ * The post-authentication gate every login path shares: disabled ->
+ * createdByScope -> MFA challenge -> lastLogin -> session JWT. A pure gate:
+ * MODULE-PRIVATE, reachable only by holding a `VerifiedLogin`.
+ */
+async function completeLogin(verified: VerifiedLogin): Promise<AuthenticateResult> {
+  if (!credentials || !config) throw new Error('Auth not initialized');
+  const { user } = verified;
+
   if (user.enabled === false) {
     return { status: 'disabled' };
   }
@@ -961,18 +1481,12 @@ export async function authenticateUser(username: string, password: string): Prom
   // `users:create` path must not be able to log ITSELF in — that is the step
   // that turns "can call POST /auth/users" into a full session, and from
   // there into arbitrary code execution via POST /apps/:name/source (see
-  // `User.createdByScope`). Checked only after the password has already
-  // matched above, so this reveals nothing to anyone who has not already
+  // `User.createdByScope`). Checked only after the credential has already
+  // been verified, so this reveals nothing to anyone who has not already
   // authenticated as this account — a wrong password on a scoped-created
   // account still returns the same `invalid` status as any other account.
   if (user.createdByScope === true) {
     return { status: 'awaiting_admin_password' };
-  }
-
-  // Opportunistically upgrade legacy SHA-256 hashes to scrypt on successful login.
-  if (isLegacyPasswordHash(user.passwordHash)) {
-    user.passwordHash = hashPassword(password).hash;
-    await saveCredentials(config.credentialsPath, credentials);
   }
 
   // MFA gate: if user has MFA enabled, issue a short-lived challenge token
@@ -1001,7 +1515,7 @@ async function issueMfaChallenge(userId: string): Promise<string> {
 }
 
 export type VerifyChallengeResult =
-  | { status: 'ok'; userId: string; jti: string }
+  | { status: 'ok'; userId: string; jti: string; iat?: number }
   | { status: 'invalid' }
   | { status: 'expired' }
   | { status: 'attempt_limit' };
@@ -1021,7 +1535,8 @@ export async function verifyMfaChallenge(challengeToken: string): Promise<Verify
     const entry = challengeAttempts.get(jti);
     if (entry && entry.count >= MFA_MAX_ATTEMPTS) return { status: 'attempt_limit' };
 
-    return { status: 'ok', userId, jti };
+    const iat = typeof payload.iat === 'number' ? payload.iat : undefined;
+    return { status: 'ok', userId, jti, iat };
   } catch {
     return { status: 'expired' };
   }
@@ -1080,6 +1595,18 @@ export async function completeMfaLogin(
     return { status: 'invalid' };
   }
 
+  // The challenge was issued by a gate that has since been shut: a user who was
+  // disabled, or scope-created, or contained (suspend / forced reset) after the
+  // challenge was minted must not be able to finish the login with it. This was
+  // always true of password+MFA; it matters more now that every login path
+  // (password, SSO) can end in a challenge.
+  if (user.enabled === false || user.createdByScope === true) {
+    return { status: 'invalid' };
+  }
+  if (predatesInvalidationStamp(challenge.iat, user.credentialsInvalidBefore)) {
+    return { status: 'invalid' };
+  }
+
   if (!masterKey) throw new Error('MFA encryption key not available');
 
   const { verifyTotp } = await import('../../utils/totp');
@@ -1120,10 +1647,13 @@ export async function completeMfaLogin(
  * Set up TOTP for a user: returns the otpauth:// URI and base32 secret.
  * Does NOT persist anything — the client must call enableMfa() with a verified code.
  */
-export function setupMfa(userId: string): { uri: string; secret: string } | null {
+export function setupMfa(userId: string): { uri: string; secret: string } | null | 'passwordless' {
   if (!credentials) return null;
   const user = credentials.users.find((u) => u.id === userId);
   if (!user) return null;
+  // Enrolment is password-gated, so a TOTP secret is never handed to an account
+  // that could not finish it.
+  if (user.passwordless) return 'passwordless';
 
   const { generateTotpSecret, buildOtpauthUri } = require('../../utils/totp');
   const secret: string = generateTotpSecret();
@@ -1141,11 +1671,18 @@ export async function enableMfa(
   password: string,
   secretBase32: string,
   code: string,
-): Promise<{ status: 'ok' } | { status: 'invalid_password' } | { status: 'invalid_code' } | { status: 'no_key' }> {
+): Promise<
+  | { status: 'ok' }
+  | { status: 'invalid_password' }
+  | { status: 'invalid_code' }
+  | { status: 'no_key' }
+  | { status: 'passwordless' }
+> {
   if (!credentials || !config) throw new Error('Auth not initialized');
+  const user = credentials.users.find((u) => u.id === userId);
+  if (user?.passwordless) return { status: 'passwordless' };
   if (!masterKey) return { status: 'no_key' };
 
-  const user = credentials.users.find((u) => u.id === userId);
   if (!user || !verifyPassword(password, user.passwordHash)) return { status: 'invalid_password' };
 
   const { verifyTotp } = await import('../../utils/totp');
@@ -1331,7 +1868,7 @@ export async function verifyAppMcpAccessToken(
     // the rest of its 15-minute lifetime just because the account was later
     // re-enabled or the password changed.
     const iat = typeof p['iat'] === 'number' ? (p['iat'] as number) : undefined;
-    if (predatesInvalidationStamp(iat, user.credentialsInvalidBefore)) return null;
+    if (predatesSessionInvalidation(iat, user)) return null;
 
     const sid = p['sid'];
     if (typeof sid === 'string' && sid && isGrantDenied(sid)) return null;
@@ -1407,7 +1944,7 @@ export async function verifyOAuthAccessToken(
     // authenticating for the rest of its 15-minute lifetime just because the
     // account was later re-enabled or the password changed.
     const iat = typeof p['iat'] === 'number' ? (p['iat'] as number) : undefined;
-    if (predatesInvalidationStamp(iat, record.credentialsInvalidBefore)) return null;
+    if (predatesSessionInvalidation(iat, record)) return null;
 
     // Single-grant revocation, within this process lifetime. Not durable — see
     // the note above the denylist.
@@ -1684,7 +2221,7 @@ export async function rotateRefreshToken(presented: string): Promise<{
   // access tokens after a later re-enable or password change. Checked here,
   // before the record is consumed, for the same reason as the `enabled`
   // check above.
-  if (predatesInvalidationStamp(createdAt, owner.credentialsInvalidBefore)) return null;
+  if (predatesSessionInvalidation(createdAt, owner)) return null;
 
   // Global connector-policy gate — site 3 of 5, see `mayUseConnectors`'
   // header (connector-policy.ts). THIS PLACEMENT IS THE WHOLE POINT: checked
@@ -2058,6 +2595,11 @@ export async function deleteApiKey(keyId: string): Promise<boolean> {
   return true;
 }
 
+/** The name of an app's minted provisioning key (its DROP_API_KEY): minted, and revoked, under this name. */
+export function appProvisionKeyName(appName: string): string {
+  return `app:${appName}:provision`;
+}
+
 /**
  * Delete all API keys with a given name (used to rotate the CLI local key on restart).
  */
@@ -2189,6 +2731,7 @@ export function resetAuth(): void {
   lastUsedFlushAt = 0;
   challengeAttempts.clear();
   revokedGrants.clear();
+  identitiesCorruptReported = false;
 }
 
 /**
@@ -2364,7 +2907,7 @@ export function authMiddleware(requiredRole?: 'admin' | 'user' | 'readonly') {
       // `payload.iat`, set by `issueSessionJwt`'s `.setIssuedAt()` — Unix
       // SECONDS, which `predatesInvalidationStamp` already accepts (see the
       // two OAuth call sites).
-      if (predatesInvalidationStamp(jwtIssuedAt, jwtUserRecord.credentialsInvalidBefore)) {
+      if (predatesSessionInvalidation(jwtIssuedAt, jwtUserRecord)) {
         return c.json(error(ErrorCodes.UNAUTHORIZED, 'Account is no longer active'), 401);
       }
       // Role from the RECORD, not the claim — a demotion must bite now.

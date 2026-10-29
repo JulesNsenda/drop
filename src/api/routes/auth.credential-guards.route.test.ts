@@ -53,7 +53,7 @@ describe('account-credential routes require an interactive session', () => {
     await server.initialize();
     app = server.getApp();
 
-    const bob = await createUser('bob', 'password123', 'user');
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
     bobId = bob.id;
     bobToken = await getTestToken('bob', 'password123');
     bobKey = (await createApiKey('bob-ci', 'user', undefined, undefined, bobId)).key;

@@ -5,6 +5,7 @@ import Card from './ui/Card';
 import Button from './ui/Button';
 import Input from './ui/Input';
 import InviteLinkPanel from './InviteLinkPanel';
+import { useInfoTip } from './ui/InfoTip';
 import { AccountGrantRow, GuestGrantRow } from './ShareGrantRows';
 import {
   gateNotReappliedText,
@@ -127,6 +128,21 @@ function ShareCard({ appName }: { appName: string }) {
   const [guestEmail, setGuestEmail] = useState('');
   /** Set when the platform refuses the `{ email }` branch, so the field stops offering it. */
   const [guestInvitesDisabled, setGuestInvitesDisabled] = useState(false);
+
+  // A hook, so it sits above the early returns below. Read apart from its
+  // summary line, hence the self-contained wording.
+  const sharedTip = useInfoTip(
+    'sharing this app',
+    <>
+      <p>You can only see and manage the people you shared this app with yourself.</p>
+      {!guestInvitesDisabled && (
+        <p className="mt-2">
+          Someone invited by email opens this app without a DROP account. Their invitation is
+          single-use and expires.
+        </p>
+      )}
+    </>
+  );
 
   // None of this survives a change of app. `AppDetailPage` does not remount on
   // a name change, so a live single-use invitation minted for app A would
@@ -398,13 +414,16 @@ function ShareCard({ appName }: { appName: string }) {
       </Card>
 
       <Card className="p-6">
-        <h3 className="flex items-center gap-2 font-semibold">
-          <Lock className="h-4 w-4" /> Who you&rsquo;ve shared it with
-        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="flex items-center gap-2 font-semibold">
+            <Lock className="h-4 w-4" /> Who you&rsquo;ve shared it with
+          </h3>
+          {sharedTip.button}
+        </div>
         <p className="mt-1 text-sm opacity-70">
-          People you grant here can sign in and open this app. You can only see and manage the
-          people you shared it with yourself.
+          People you grant here can sign in and open this app.
         </p>
+        {sharedTip.panel}
 
         {view.othersGrantedCount > 0 && (
           <p className="mt-2 text-sm opacity-70">
@@ -491,13 +510,6 @@ function ShareCard({ appName }: { appName: string }) {
               Invite
             </Button>
           </div>
-        )}
-
-        {!guestInvitesDisabled && (
-          <p className="mt-2 text-xs opacity-60">
-            Someone invited by email opens this app without a DROP account. Their invitation is
-            single-use and expires.
-          </p>
         )}
 
         {!canGrant && (

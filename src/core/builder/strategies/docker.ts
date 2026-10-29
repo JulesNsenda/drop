@@ -9,6 +9,9 @@ import { BuildContext } from '../builder.types';
 import { AppType } from '../../detector/detector.types';
 import { BaseBuildStrategy } from './base';
 
+/** The `buildCommand` the Docker detector (detectors/docker.ts) suggests. */
+const DETECTOR_SUGGESTED_BUILD_COMMAND = 'docker build -t app .';
+
 export class DockerBuildStrategy extends BaseBuildStrategy {
   name = 'docker';
   supportedTypes: AppType[] = ['docker'];
@@ -22,15 +25,32 @@ export class DockerBuildStrategy extends BaseBuildStrategy {
     return null;
   }
 
+  /**
+   * ` --build-arg DROP_GIT_COMMIT=<sha>` when the deployed commit is known.
+   * The app folder has no .git, so this is how a Dockerfile (`ARG
+   * DROP_GIT_COMMIT`) learns the commit. The value is interpolated into a
+   * shell command, so only a plain hex object name is ever used.
+   */
+  private gitCommitArg(context: BuildContext): string {
+    const sha = context.env?.DROP_GIT_COMMIT;
+    return sha && /^[0-9a-f]{7,64}$/i.test(sha) ? ` --build-arg DROP_GIT_COMMIT=${sha}` : '';
+  }
+
   getBuildCommand(context: BuildContext): string | null {
     // Use custom build command if provided
     if (context.config.buildCommand) {
+      // The command the Docker detector suggests is the platform's own, so it
+      // gets the commit argument like the one built below; a command the owner
+      // wrote in drop.yaml is theirs and is left exactly as written.
+      if (context.config.buildCommand === DETECTOR_SUGGESTED_BUILD_COMMAND) {
+        return `docker build${this.gitCommitArg(context)} -t app .`;
+      }
       return context.config.buildCommand;
     }
 
     // Will be updated in preBuild based on what files exist
     const imageName = context.appName.toLowerCase().replace(/[^a-z0-9-]/g, '-');
-    return `docker build -t ${imageName}:latest .`;
+    return `docker build${this.gitCommitArg(context)} -t ${imageName}:latest .`;
   }
 
   getOutputDirectory(_context: BuildContext): string | null {
@@ -69,7 +89,7 @@ export class DockerBuildStrategy extends BaseBuildStrategy {
       if (composeFile) {
         context.config.buildCommand = `docker-compose -f ${composeFile} build`;
       } else if (dockerfilePath) {
-        context.config.buildCommand = `docker build -t ${imageName}:latest -f ${dockerfilePath} .`;
+        context.config.buildCommand = `docker build${this.gitCommitArg(context)} -t ${imageName}:latest -f ${dockerfilePath} .`;
       }
     }
   }

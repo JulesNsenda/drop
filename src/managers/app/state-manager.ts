@@ -30,6 +30,14 @@ export type AppStatus =
   | 'needs-config';
 export type AppType = 'nodejs' | 'python' | 'go' | 'static' | 'docker' | 'unknown';
 
+/** What `revertTransientStarting` puts back: the fields a start's 'starting' write can clear. */
+export interface TransientStatusSnapshot {
+  status: AppStatus;
+  error?: string;
+  parkedReason?: string;
+  missingSecrets?: string[];
+}
+
 export interface AppState {
   name: string;
   type: AppType;
@@ -408,6 +416,43 @@ export class AppStateManager {
     ].slice(0, MAX_RECENT_OPENERS);
 
     await this.updateApp(name, { lastOpenedAt: minute, recentOpeners });
+  }
+
+  /** The fields `revertTransientStarting` puts back, as they are now (copied), or undefined for an unknown app. */
+  snapshotTransientStatus(name: string): TransientStatusSnapshot | undefined {
+    const app = this.apps.get(name);
+    if (!app) return undefined;
+    return {
+      status: app.status,
+      error: app.error,
+      parkedReason: app.parkedReason,
+      missingSecrets: app.missingSecrets ? [...app.missingSecrets] : undefined,
+    };
+  }
+
+  /**
+   * Undo a refused promotion's transient 'starting', compare-and-set: it does
+   * nothing unless the status is STILL 'starting' (anything else was written by
+   * what refused the start, and is the truth), and then puts back the snapshot's
+   * status, error, parkedReason and missingSecrets.
+   *
+   * SILENT on purpose: no `app:updated` is published. The deploy tracker closes
+   * an episode on a 'running' or 'errored' status event, and the held build's
+   * episode must stay open. Remove this once F Item 1 makes episode closes explicit.
+   */
+  async revertTransientStarting(name: string, snapshot: TransientStatusSnapshot): Promise<boolean> {
+    const app = this.apps.get(name);
+    if (!app || app.status !== 'starting') return false;
+    app.status = snapshot.status;
+    if (snapshot.error === undefined) delete app.error;
+    else app.error = snapshot.error;
+    if (snapshot.parkedReason === undefined) delete app.parkedReason;
+    else app.parkedReason = snapshot.parkedReason;
+    if (snapshot.missingSecrets === undefined) delete app.missingSecrets;
+    else app.missingSecrets = [...snapshot.missingSecrets];
+    app.updatedAt = new Date().toISOString();
+    this.scheduleSave();
+    return true;
   }
 
   async setAppStatus(name: string, status: AppStatus, details?: { port?: number; pid?: number; error?: string; missingSecrets?: string[]; readinessUnverified?: boolean; parkedReason?: string; awaitingPromotion?: boolean }): Promise<AppState | null> {

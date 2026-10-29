@@ -46,8 +46,8 @@ describe('app route authorization', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    const bob = await createUser('bob', 'password123', 'user');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
     aliceId = alice.id;
     bobId = bob.id;
     aliceToken = await getTestToken('alice', 'password123');
@@ -117,7 +117,7 @@ describe('app route authorization', () => {
   });
 
   it('rejects an invalid app name on POST /apps (P0-9)', async () => {
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     const adminToken = await getTestToken('root', 'password123');
     const dir = path.join(tempDir, 'validdir');
     await fs.mkdir(dir, { recursive: true });
@@ -139,7 +139,7 @@ describe('app route authorization', () => {
   });
 
   it('rejects POST /apps with 507 when disk is below the watermark (P2-5)', async () => {
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     const adminToken = await getTestToken('root', 'password123');
     const dir = path.join(tempDir, 'lowdiskdir');
     await fs.mkdir(dir, { recursive: true });
@@ -155,7 +155,7 @@ describe('app route authorization', () => {
 
   it('gates POST /apps at the admin role (E)', async () => {
     // readonly must not reach the collection route at all.
-    await createUser('viewer', 'password123', 'readonly');
+    await createUser({ username: 'viewer', role: 'readonly', credential: { password: 'password123' } });
     const viewerToken = await getTestToken('viewer', 'password123');
     const dir = path.join(tempDir, 'role-gate-dir');
     await fs.mkdir(dir, { recursive: true });
@@ -184,7 +184,7 @@ describe('app route authorization', () => {
     // not just DELETE/PUT/PATCH/POST) would still go green without this. GET
     // /apps must stay open at readonly, same as GET /apps/:name already is
     // (auth.apps-role-gate.route.test.ts).
-    await createUser('viewer2', 'password123', 'readonly');
+    await createUser({ username: 'viewer2', role: 'readonly', credential: { password: 'password123' } });
     const viewerToken = await getTestToken('viewer2', 'password123');
 
     const res = await app.request('/api/v1/apps', { headers: authHeader(viewerToken) });

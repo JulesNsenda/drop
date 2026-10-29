@@ -71,10 +71,10 @@ describe('GET /apps/:name/source (source download)', () => {
     getStateManager({ stateFilePath: path.join(tempDir, 'apps.json') });
 
     await startServer(true);
-    aliceId = (await createUser('alice', 'password123', 'user')).id;
-    await createUser('bob', 'password123', 'user');
-    await createUser('reader', 'password123', 'readonly');
-    await createUser('sysadmin', 'password123', 'admin');
+    aliceId = (await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } })).id;
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'reader', role: 'readonly', credential: { password: 'password123' } });
+    await createUser({ username: 'sysadmin', role: 'admin', credential: { password: 'password123' } });
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
     readerToken = await getTestToken('reader', 'password123');

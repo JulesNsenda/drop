@@ -40,6 +40,16 @@ import type { AppDetectedPayload } from '../event-bus';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in src/core/git-deploy/git-deploy.test.ts.
 import type { AppUpdatePayload } from '../event-bus/event-bus.types';
+import { setPlatformOps, resetPlatformOps, AppInProgressError } from '../../api/platform-ops';
+import { AppSuspendedError } from '../../api/platform-ops';
+import * as rollbackModule from '../../managers/rollback';
+import { getSuspensionStore, resetSuspensionStore } from '../../managers/suspension';
+import { makePlatformOpsStub } from '../../api/__testutils__/platform-ops';
+
+import { loadEmptySuspensionStore } from '../__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 
 describe('UploadDeployService', () => {
   let tempDir: string;
@@ -811,6 +821,184 @@ describe('UploadDeployService', () => {
     });
   });
 
+  describe('deploy - a suspended app', () => {
+    /** Every file under a folder with its content: the tree "unchanged" means. */
+    async function snapshotTree(dir: string): Promise<Record<string, string>> {
+      const out: Record<string, string> = {};
+      for (const entry of await fs.readdir(dir, { recursive: true, withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        const full = path.join(entry.parentPath, entry.name);
+        out[path.relative(dir, full)] = await fs.readFile(full, 'utf8');
+      }
+      return out;
+    }
+
+    it('refuses an upload onto it before the quota is charged or a file lands, and releases what it took', async () => {
+      await service.deploy({
+        appName: 'frozen',
+        archivePath: await buildArchive('frozen-v1', { 'index.js': 'v1', 'keep.js': 'keep' }),
+        userId: 'user-1',
+      });
+      const before = await snapshotTree(path.join(appsDir, 'frozen'));
+      await getSuspensionStore().suspend('frozen', 'admin-1');
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+      const published: string[] = [];
+      const unsubscribe = [
+        eventBus.subscribe('app:update', (p) => void published.push(`update:${p.name}`)),
+        eventBus.subscribe('app:detected', (p) => void published.push(`detected:${p.name}`)),
+      ];
+
+      try {
+        await expect(
+          service.deploy({
+            appName: 'frozen',
+            archivePath: await buildArchive('frozen-v2', { 'index.js': 'v2 tenant' }),
+            userId: 'user-1',
+          })
+        ).rejects.toBeInstanceOf(AppSuspendedError);
+      } finally {
+        unsubscribe.forEach((u) => u());
+      }
+
+      expect(admit).not.toHaveBeenCalled();
+      expect(await snapshotTree(path.join(appsDir, 'frozen'))).toEqual(before);
+      expect(published).toEqual([]);
+      expect(service.isUploading('frozen')).toBe(false);
+      expect(isReserved('frozen')).toBe(false);
+    });
+
+    it('a suspension landing during extraction leaves the tree unchanged and takes no rollback snapshot', async () => {
+      await service.deploy({
+        appName: 'frozen',
+        archivePath: await buildArchive('x1', { 'index.js': 'v1', 'keep.js': 'keep' }),
+        userId: 'user-1',
+      });
+      const before = await snapshotTree(path.join(appsDir, 'frozen'));
+      const capture = jest.spyOn(rollbackModule, 'captureBeforeRedeploy');
+      // The disk check runs right after extraction: the suspension lands in that window.
+      jest.spyOn(diskUtils, 'hasEnoughDisk').mockImplementationOnce(async () => {
+        await getSuspensionStore().suspend('frozen', 'admin-1');
+        return { ok: true, freeMb: 10000 };
+      });
+      const published: string[] = [];
+      const unsub = eventBus.subscribe('app:update', (p) => void published.push(p.name));
+
+      try {
+        await expect(
+          service.deploy({
+            appName: 'frozen',
+            archivePath: await buildArchive('x2', { 'index.js': 'v2 tenant' }),
+            userId: 'user-1',
+          })
+        ).rejects.toBeInstanceOf(AppSuspendedError);
+      } finally {
+        unsub();
+      }
+
+      expect(capture).not.toHaveBeenCalled();
+      expect(await snapshotTree(path.join(appsDir, 'frozen'))).toEqual(before);
+      expect(published).toEqual([]);
+      expect(service.isUploading('frozen')).toBe(false);
+    });
+
+    it('a NEW app whose name is suspended during extraction is unregistered again and nothing is left on disk', async () => {
+      jest.spyOn(diskUtils, 'hasEnoughDisk').mockImplementationOnce(async () => {
+        await getSuspensionStore().suspend('late', 'admin-1');
+        return { ok: true, freeMb: 10000 };
+      });
+
+      await expect(
+        service.deploy({
+          appName: 'late',
+          archivePath: await buildArchive('late', { 'index.js': 'tenant' }),
+          userId: 'admin-1',
+          callerIsAdmin: true,
+        })
+      ).rejects.toBeInstanceOf(AppSuspendedError);
+
+      expect(getStateManager().hasApp('late')).toBe(false);
+      expect(fssync.existsSync(path.join(appsDir, 'late'))).toBe(false);
+    });
+
+    it('refuses an admin upload the same way: suspension is not an ownership question', async () => {
+      await service.deploy({ appName: 'frozen', archivePath: await buildArchive('f1', { 'index.js': 'v1' }) });
+      await getSuspensionStore().suspend('frozen', 'admin-1');
+
+      await expect(
+        service.deploy({
+          appName: 'frozen',
+          archivePath: await buildArchive('f2', { 'index.js': 'v2' }),
+          userId: 'admin-1',
+          callerIsAdmin: true,
+        })
+      ).rejects.toBeInstanceOf(AppSuspendedError);
+      expect(fssync.readFileSync(path.join(appsDir, 'frozen', 'index.js'), 'utf8')).toBe('v1');
+    });
+
+    it('refuses a NEW app under a suspended name (the record is name-keyed): nothing is registered or written', async () => {
+      await getSuspensionStore().suspend('reborn', 'admin-1');
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+
+      // A plain user is already told the name is taken (isNewNameRefused reads the record);
+      // an admin gets past that and meets the suspension.
+      await expect(
+        service.deploy({
+          appName: 'reborn',
+          archivePath: await buildArchive('reborn-user', { 'index.js': 'tenant' }),
+          userId: 'user-1',
+        })
+      ).rejects.toBeInstanceOf(UploadNotFoundError);
+      await expect(
+        service.deploy({
+          appName: 'reborn',
+          archivePath: await buildArchive('reborn', { 'index.js': 'tenant' }),
+          userId: 'admin-1',
+          callerIsAdmin: true,
+        })
+      ).rejects.toBeInstanceOf(AppSuspendedError);
+
+      expect(admit).not.toHaveBeenCalled();
+      expect(getStateManager().hasApp('reborn')).toBe(false);
+      expect(fssync.existsSync(path.join(appsDir, 'reborn'))).toBe(false);
+      expect(isReserved('reborn')).toBe(false);
+    });
+
+    it('answers a caller who does not own the app as for an unknown app, not as suspended', async () => {
+      await service.deploy({
+        appName: 'theirs',
+        archivePath: await buildArchive('t1', { 'index.js': 'v1' }),
+        userId: 'owner-1',
+      });
+      await getSuspensionStore().suspend('theirs', 'admin-1');
+
+      await expect(
+        service.deploy({
+          appName: 'theirs',
+          archivePath: await buildArchive('t2', { 'index.js': 'v2' }),
+          userId: 'someone-else',
+        })
+      ).rejects.toBeInstanceOf(UploadNotFoundError);
+    });
+
+    it('carries the store as the reason when the store cannot answer, refusing before any charge', async () => {
+      await service.deploy({ appName: 'frozen', archivePath: await buildArchive('u1', { 'index.js': 'v1' }) });
+      resetSuspensionStore();
+      const file = path.join(tempDir, 'suspensions.json');
+      await fs.writeFile(file, '{not json');
+      await getSuspensionStore(file).load();
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+
+      const err = await service
+        .deploy({ appName: 'frozen', archivePath: await buildArchive('u2', { 'index.js': 'v2' }) })
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(AppSuspendedError);
+      expect((err as AppSuspendedError).reason).toBe('store-unreadable');
+      expect(admit).not.toHaveBeenCalled();
+      expect(fssync.readFileSync(path.join(appsDir, 'frozen', 'index.js'), 'utf8')).toBe('v1');
+    });
+  });
+
   describe('isUploading', () => {
     it('is true while a deploy is in flight and false once settled', async () => {
       const archivePath = await buildArchive('inflight-app', { 'index.js': 'x' });
@@ -962,6 +1150,121 @@ describe('UploadDeployService', () => {
       expect(config?.agentCreated).toBeUndefined();
       expect(config?.ephemeral).toBeUndefined();
       expect(config?.expiresAt).toBeUndefined();
+    });
+  });
+
+  describe('the app claim around the write (redeploys)', () => {
+    afterEach(() => resetPlatformOps());
+
+    async function deployed(name: string): Promise<void> {
+      const v1 = await buildArchive(`${name}-v1`, { 'index.js': 'v1' });
+      await service.deploy({ appName: name, archivePath: v1 });
+    }
+
+    it('holds the claim across the write, then gives it back before publishing', async () => {
+      await deployed('claimed');
+      const release = jest.fn();
+      // The platform refuses a claim while an upload is marked in flight, as its
+      // busy check does: the upload must not refuse itself.
+      const tryReserveApp = jest.fn((n: string) => (service.isUploading(n) ? null : release));
+      setPlatformOps(makePlatformOpsStub({ tryReserveApp }));
+      let releasedDuringLand = -1;
+      const land = jest.spyOn(service as never, 'landFiles' as never);
+      land.mockImplementationOnce((async () => {
+        releasedDuringLand = release.mock.calls.length;
+      }) as never);
+      let releasedAtPublish = -1;
+      const unsubscribe = eventBus.subscribe('app:update', (payload) => {
+        if (payload.name === 'claimed') releasedAtPublish = release.mock.calls.length;
+      });
+
+      try {
+        const v2 = await buildArchive('claimed-v2', { 'index.js': 'v2' });
+        await service.deploy({ appName: 'claimed', archivePath: v2 });
+      } finally {
+        unsubscribe();
+      }
+
+      expect(tryReserveApp).toHaveBeenCalledWith('claimed');
+      expect(releasedDuringLand).toBe(0);
+      expect(releasedAtPublish).toBe(1);
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(service.isUploading('claimed')).toBe(false);
+    });
+
+    it('refuses with AppInProgressError while the app is building or claimed, and writes nothing', async () => {
+      await deployed('building');
+      const tryReserveApp = jest.fn().mockReturnValue(null);
+      setPlatformOps(makePlatformOpsStub({ tryReserveApp }));
+
+      const v2 = await buildArchive('building-v2', { 'index.js': 'v2' });
+      await expect(service.deploy({ appName: 'building', archivePath: v2 })).rejects.toBeInstanceOf(
+        AppInProgressError
+      );
+
+      expect(fssync.readFileSync(path.join(appsDir, 'building', 'index.js'), 'utf8')).toBe('v1');
+      expect(service.isUploading('building')).toBe(false);
+      expect(isReserved('building')).toBe(false);
+    });
+
+    it('refuses when a build container is alive, releases the claim, and writes nothing', async () => {
+      await deployed('containered');
+      const release = jest.fn();
+      setPlatformOps(
+        makePlatformOpsStub({
+          tryReserveApp: jest.fn().mockReturnValue(release),
+          hasLiveBuildContainer: jest.fn().mockResolvedValue(true),
+        })
+      );
+
+      const v2 = await buildArchive('containered-v2', { 'index.js': 'v2' });
+      await expect(
+        service.deploy({ appName: 'containered', archivePath: v2 })
+      ).rejects.toBeInstanceOf(AppInProgressError);
+
+      expect(release).toHaveBeenCalledTimes(1);
+      expect(fssync.readFileSync(path.join(appsDir, 'containered', 'index.js'), 'utf8')).toBe('v1');
+      expect(service.isUploading('containered')).toBe(false);
+    });
+
+    it('refuses a monorepo child while its container is busy, claiming nothing', async () => {
+      await deployed('child');
+      const tryReserveApp = jest.fn().mockReturnValue(() => undefined);
+      setPlatformOps(
+        makePlatformOpsStub({ tryReserveApp, isGroupBusy: jest.fn().mockReturnValue(true) })
+      );
+
+      const v2 = await buildArchive('child-v2', { 'index.js': 'v2' });
+      await expect(service.deploy({ appName: 'child', archivePath: v2 })).rejects.toBeInstanceOf(
+        AppInProgressError
+      );
+
+      expect(tryReserveApp).not.toHaveBeenCalled();
+      expect(fssync.readFileSync(path.join(appsDir, 'child', 'index.js'), 'utf8')).toBe('v1');
+      expect(service.isUploading('child')).toBe(false);
+    });
+
+    it('releases the claim when the write fails', async () => {
+      await deployed('failing');
+      const release = jest.fn();
+      setPlatformOps(makePlatformOpsStub({ tryReserveApp: jest.fn().mockReturnValue(release) }));
+      jest.spyOn(service as never, 'landFiles' as never).mockRejectedValueOnce(new Error('land failed') as never);
+
+      const v2 = await buildArchive('failing-v2', { 'index.js': 'v2' });
+      await expect(service.deploy({ appName: 'failing', archivePath: v2 })).rejects.toThrow('land failed');
+
+      expect(release).toHaveBeenCalledTimes(1);
+    });
+
+    it('takes no claim for the first upload of a new app', async () => {
+      const tryReserveApp = jest.fn().mockReturnValue(() => undefined);
+      setPlatformOps(makePlatformOpsStub({ tryReserveApp }));
+
+      const archivePath = await buildArchive('brand-new', { 'index.js': 'x' });
+      const result = await service.deploy({ appName: 'brand-new', archivePath });
+
+      expect(result.isNew).toBe(true);
+      expect(tryReserveApp).not.toHaveBeenCalled();
     });
   });
 });

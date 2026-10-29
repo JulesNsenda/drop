@@ -56,7 +56,7 @@ describe('MCP rank-0 admission', () => {
       enableJwt: true,
       enableApiKeys: true,
     });
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
   });
 

@@ -42,7 +42,7 @@ describe('app_mcp access tokens', () => {
       enableJwt: true,
       enableApiKeys: true,
     });
-    user = await createUser('alice', 'correct-horse-battery-staple', 'user');
+    user = await createUser({ username: 'alice', role: 'user', credential: { password: 'correct-horse-battery-staple' } });
   });
 
   afterEach(async () => {
@@ -138,7 +138,7 @@ describe('refresh grants carry their resource', () => {
       enableJwt: true,
       enableApiKeys: true,
     });
-    user = await createUser('alice', 'correct-horse-battery-staple', 'user');
+    user = await createUser({ username: 'alice', role: 'user', credential: { password: 'correct-horse-battery-staple' } });
   });
 
   afterEach(async () => {

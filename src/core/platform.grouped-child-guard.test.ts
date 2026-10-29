@@ -28,6 +28,11 @@ import * as path from 'path';
 import * as os from 'os';
 import { DropPlatform, createPlatform } from './platform';
 
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('grouped monorepo children are the container’s to build', () => {
   let platform: DropPlatform;
   let tempDir: string;
@@ -69,6 +74,8 @@ describe('grouped monorepo children are the container’s to build', () => {
     };
     (platform as any).stateManager = {
       getApp: (n: string) => states.get(n),
+      // isGroupBusy (the explicit-update guard) reads the whole set.
+      getAllApps: () => [...states.values()],
       registerApp: jest.fn().mockResolvedValue(undefined),
       updateApp: jest.fn().mockResolvedValue(undefined),
       hasApp: jest.fn().mockReturnValue(true),
@@ -207,7 +214,11 @@ describe('grouped monorepo children are the container’s to build', () => {
     let inProgressAdd: jest.SpyInstance;
 
     beforeEach(() => {
-      (platform as any).runtime = { getStatus: jest.fn().mockResolvedValue(undefined) };
+      (platform as any).runtime = {
+        getStatus: jest.fn().mockResolvedValue(null),
+        delete: jest.fn(),
+        start: jest.fn().mockResolvedValue({ pid: 1 }),
+      };
       (platform as any).detector = { detect: jest.fn().mockResolvedValue({ type: 'static' }) };
       (platform as any).builder = { build: jest.fn().mockResolvedValue({ success: true }) };
       const inProgress = new Set<string>();

@@ -6,6 +6,7 @@ import Card from './ui/Card';
 import { asArray } from '../lib/api-shape';
 import Button from './ui/Button';
 import Input from './ui/Input';
+import { useInfoTip } from './ui/InfoTip';
 import InviteLinkPanel from './InviteLinkPanel';
 import { AccountGrantRow, GuestGrantRow } from './ShareGrantRows';
 import {
@@ -154,6 +155,54 @@ function AccessTab({ appName }: { appName: string }) {
     | { kind: 'ok'; grants: OwnGrant[]; guests: OwnGuest[] }
     | { kind: 'error'; message: string }
   >({ kind: 'loading' });
+
+  // Hooks, so they sit above the early returns below. Each tip is read apart
+  // from its summary line, hence the self-contained wording.
+  const accessTip = useInfoTip(
+    'who may open this app',
+    <>
+      Anyone other than the owner and administrators must be listed here. This is the complete
+      list, including shares made below, which appear here under the name of whoever granted
+      them. A guest invited by email has no account at all, so they never appear in it.
+    </>
+  );
+  const shareTip = useInfoTip(
+    'sharing and invitations',
+    <>
+      <p>
+        A share admits someone the same way the allow-list does, and appears there too. The
+        difference is that a share carries your name as the grantor, so you can take it back one
+        entry at a time. Someone with no DROP account can be invited by email instead: they open
+        this app with no account, no password and no signup, on a single-use invitation that
+        expires on its own.
+      </p>
+      <p className="mt-2">
+        Sharing also ticks that person in the allow-list. Administrators and this app&rsquo;s
+        owner cannot be shared with — they can open it already.
+      </p>
+      {inviteBlockedBy !== 'guests' && inviteBlockedBy !== 'sharing' && (
+        <p className="mt-2">
+          Resend (or re-entering the address) sends a fresh invitation — the link is never stored,
+          so that is how a lost or expired one is replaced.
+        </p>
+      )}
+      {inviteBlockedBy === 'sharing' && (
+        <p className="mt-2">
+          Both sharing and invitations go through the same route, so switching owner sharing off
+          switches off both. Turning on “Let owners share their apps” under Settings → Platform
+          re-enables them — that also lets every app owner share their own apps. Access can still
+          be granted from the allow-list.
+        </p>
+      )}
+    </>
+  );
+  const unlistedTip = useInfoTip(
+    'guests who are not listed',
+    <>
+      These guests were invited by someone else, or are not readable right now. Revoking one is{' '}
+      <code className="text-xs">DELETE /apps/{appName}/share/guests/&lt;id&gt;</code>.
+    </>
+  );
 
   /**
    * Which app the mounted component is currently about. `AppDetailPage` does
@@ -687,15 +736,16 @@ function AccessTab({ appName }: { appName: string }) {
       </Card>
 
       <Card className="p-6">
-        <h3 className="flex items-center gap-2 font-semibold">
-          <Lock className="h-4 w-4" /> Who may open it
-        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="flex items-center gap-2 font-semibold">
+            <Lock className="h-4 w-4" /> Who may open it
+          </h3>
+          {accessTip.button}
+        </div>
         <p className="mt-1 text-sm opacity-70">
-          The owner and administrators can always open this app. Everyone else must be listed here
-          — this is the complete list, including shares made below, which appear here under the
-          name of whoever granted them. A guest invited by email has no account at all, so they
-          never appear in it.
+          The owner and administrators can always open this app.
         </p>
+        {accessTip.panel}
 
         {banner && (
           <div
@@ -750,16 +800,16 @@ function AccessTab({ appName }: { appName: string }) {
       </Card>
 
       <Card className="p-6">
-        <h3 className="flex items-center gap-2 font-semibold">
-          <UserPlus className="h-4 w-4" /> Share this app
-        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 className="flex items-center gap-2 font-semibold">
+            <UserPlus className="h-4 w-4" /> Share this app
+          </h3>
+          {shareTip.button}
+        </div>
         <p className="mt-1 text-sm opacity-70">
-          A share admits someone the same way the list above does, and appears there too — the
-          difference is that it carries your name as the grantor, so you can take it back one
-          entry at a time. Someone with no DROP account can be invited by email instead: they
-          open this app with no account, no password and no signup, on a single-use invitation
-          that expires on its own.
+          A share admits someone the same way the list above does, and appears there too.
         </p>
+        {shareTip.panel}
 
         {shareBanner && (
           <div
@@ -839,13 +889,15 @@ function AccessTab({ appName }: { appName: string }) {
               so an admin is told that guests they cannot list can open this
               app, even when the share read above was refused outright. */}
           {unlistedGuests > 0 && (
-            <p className="pt-1 text-xs opacity-60">
-              {unlistedGuests === 1
-                ? '1 guest can open this app who is not listed here'
-                : `${unlistedGuests} guests can open this app who are not listed here`}{' '}
-              — invited by someone else, or not readable right now. Revoking one is{' '}
-              <code className="text-xs">DELETE /apps/{appName}/share/guests/&lt;id&gt;</code>.
-            </p>
+            <>
+              <p className="flex items-center gap-1 pt-1 text-xs opacity-60">
+                {unlistedGuests === 1
+                  ? '1 guest can open this app who is not listed here.'
+                  : `${unlistedGuests} guests can open this app who are not listed here.`}
+                {unlistedTip.button}
+              </p>
+              {unlistedTip.panel}
+            </>
           )}
         </div>
 
@@ -863,10 +915,8 @@ function AccessTab({ appName }: { appName: string }) {
             behind it. `guest-invites` takes only the email one. */}
         {inviteBlockedBy === 'sharing' ? (
           <p className="mt-4 border-t pt-4 text-sm opacity-70">
-            Owner-initiated sharing is switched off for this platform, and both sharing and
-            invitations go through the same route. Turning on “Let owners share their apps” under
-            Settings → Platform re-enables them — that also lets every app owner share their own
-            apps. Access can still be granted from the allow-list above.
+            Owner sharing is switched off — turn on “Let owners share their apps” under Settings →
+            Platform.
           </p>
         ) : (
           <>
@@ -888,11 +938,6 @@ function AccessTab({ appName }: { appName: string }) {
                 Share
               </Button>
             </div>
-
-            <p className="mt-2 text-xs opacity-60">
-              Sharing also ticks that person in the list above. Administrators and this app&rsquo;s
-              owner cannot be shared with — they can open it already.
-            </p>
 
             {inviteBlockedBy === 'guests' ? (
               <p className="mt-4 border-t pt-4 text-sm opacity-70">
@@ -919,12 +964,6 @@ function AccessTab({ appName }: { appName: string }) {
                     Invite
                   </Button>
                 </div>
-
-                <p className="mt-2 text-xs opacity-60">
-                  Re-entering an address that has already been invited sends a fresh invitation —
-                  that is the only way to replace a lost or expired one, because the link is never
-                  stored.
-                </p>
               </>
             )}
 

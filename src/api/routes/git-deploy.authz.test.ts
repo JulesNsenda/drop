@@ -16,6 +16,7 @@ import { getTestToken } from '../__testutils__/auth';
 import { getStateManager, resetStateManager } from '../../managers/app/state-manager';
 import { resetRateLimits } from '../middleware/rate-limit';
 import * as gitDeployModule from '../../core/git-deploy';
+import { AppSuspendedError } from '../platform-ops';
 
 describe('git redeploy route authorization', () => {
   let tempDir: string;
@@ -61,9 +62,9 @@ describe('git redeploy route authorization', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'user');
-    await createUser('bob', 'password123', 'user');
-    await createUser('sysadmin', 'password123', 'admin');
+    const alice = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'sysadmin', role: 'admin', credential: { password: 'password123' } });
     aliceId = alice.id;
     aliceToken = await getTestToken('alice', 'password123');
     bobToken = await getTestToken('bob', 'password123');
@@ -101,7 +102,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(aliceToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything());
+    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything(), expect.anything());
   });
 
   it("admin can redeploy any user's app", async () => {
@@ -110,7 +111,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(adminToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything());
+    expect(redeploy).toHaveBeenCalledWith('alice-app', expect.anything(), expect.anything());
   });
 
   it('nonexistent app returns 404, service not called', async () => {
@@ -137,7 +138,7 @@ describe('git redeploy route authorization', () => {
       headers: bearer(adminToken),
     });
     expect(res.status).toBe(200);
-    expect(redeploy).toHaveBeenCalledWith('legacy-app', expect.anything());
+    expect(redeploy).toHaveBeenCalledWith('legacy-app', expect.anything(), expect.anything());
   });
 
   describe('monorepo group child resolution', () => {
@@ -169,7 +170,7 @@ describe('git redeploy route authorization', () => {
       });
       expect(res.status).toBe(200);
       // Resolved to the container, not the child (child has no gitSource).
-      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything());
+      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything(), expect.anything());
     });
 
     it('admin redeploying a group child resolves to the container', async () => {
@@ -178,7 +179,7 @@ describe('git redeploy route authorization', () => {
         headers: bearer(adminToken),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything());
+      expect(redeploy).toHaveBeenCalledWith('grp-repo', expect.anything(), expect.anything());
     });
 
     it("crafted group collision cannot redeploy another tenant's container (IDOR)", async () => {
@@ -186,7 +187,7 @@ describe('git redeploy route authorization', () => {
       // He can reach his own child, but the resolved container is Alice's — the
       // recheck on the resolved container must block it. Same 404 as any miss.
       const sm = getStateManager();
-      const bobId = (await createUser('mallory', 'password123', 'user')).id;
+      const bobId = (await createUser({ username: 'mallory', role: 'user', credential: { password: 'password123' } })).id;
       const malloryToken = await getTestToken('mallory', 'password123');
       await sm.registerApp('evil-backend', path.join(tempDir, 'evil-backend'));
       await sm.updateApp('evil-backend', { userId: bobId, group: 'grp' });
@@ -210,7 +211,7 @@ describe('git redeploy route authorization', () => {
         headers: bearer(aliceToken),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: undefined }));
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: undefined }), expect.anything());
     });
 
     it('a tokenId in the body is forwarded to the resolved app', async () => {
@@ -220,7 +221,7 @@ describe('git redeploy route authorization', () => {
         body: JSON.stringify({ tokenId: 'git_abc123' }),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: 'git_abc123' }));
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: 'git_abc123' }), expect.anything());
     });
 
     it('tokenId: null is forwarded as-is to clear the stored token', async () => {
@@ -230,7 +231,7 @@ describe('git redeploy route authorization', () => {
         body: JSON.stringify({ tokenId: null }),
       });
       expect(res.status).toBe(200);
-      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: null }));
+      expect(redeploy).toHaveBeenCalledWith('alice-app', expect.objectContaining({ tokenId: null }), expect.anything());
     });
 
     it('a malformed tokenId 400s and never reaches the service', async () => {
@@ -291,7 +292,8 @@ describe('git redeploy route authorization', () => {
       expect(res.status).toBe(200);
       expect(redeploy).toHaveBeenCalledWith(
         'alice-app',
-        expect.objectContaining({ tokenId: 'git_abc123', userId: aliceId })
+        expect.objectContaining({ tokenId: 'git_abc123', userId: aliceId }),
+        expect.anything()
       );
     });
 
@@ -322,9 +324,34 @@ describe('git redeploy route authorization', () => {
         expect(res.status).toBe(200);
         expect(redeploy).toHaveBeenCalledWith(
           'tok-grp-repo',
-          expect.objectContaining({ tokenId: 'git_abc123' })
+          expect.objectContaining({ tokenId: 'git_abc123' }),
+          expect.anything()
         );
       });
+    });
+  });
+
+  describe('a suspended app', () => {
+    it('POST /git/redeploy answers 409 APP_SUSPENDED', async () => {
+      redeploy.mockRejectedValueOnce(new AppSuspendedError('alice-app'));
+
+      const res = await app.request('/api/v1/git/redeploy/alice-app', { method: 'POST', headers: bearer(aliceToken) });
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
+    });
+
+    it('POST /git/deploy answers 409 APP_SUSPENDED for a suspended name', async () => {
+      deploy.mockRejectedValueOnce(new AppSuspendedError('fresh-app'));
+
+      const res = await app.request('/api/v1/git/deploy', {
+        method: 'POST',
+        headers: { ...bearer(aliceToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repoUrl: 'https://github.com/acme/app' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('APP_SUSPENDED');
     });
   });
 

@@ -23,8 +23,9 @@
 
 import { getAppConfigService } from '../managers/app/app-config';
 import type { AppState } from '../managers/app/state-manager';
-import { isHttpsEnabled, getDomainSuffix } from '../api/runtime-config';
+import { isHttpsEnabled, getDomainSuffix, getPublicUrl } from '../api/runtime-config';
 import { isLocalhostDomain } from './domain-validator';
+import { platformHostProblem } from './reserved-hosts';
 
 export interface ComputeAppUrlOptions {
   /**
@@ -68,7 +69,14 @@ export function computeAppUrl(app: AppState, options?: ComputeAppUrlOptions): st
   if (publicUrl && !app.customDomain && !configDomains?.length) {
     return forceHttps ? publicUrl.replace(/^http:\/\//, 'https://') : publicUrl;
   }
-  const domain = app.customDomain || configDomains?.[0] || `${app.name}.${getDomainSuffix()}`;
+  const suffix = getDomainSuffix();
+  const domain = app.customDomain || configDomains?.[0] || `${app.name}.${suffix}`;
+  // The chosen host is one the router would refuse (the platform's own host, a
+  // name under it, or one that cannot be parsed): there is no URL to hand out.
+  // Fail closed rather than fall through to a lower-priority candidate — the
+  // MCP gateway and the session audience treat this URL as the app's canonical
+  // origin, and a fallback would be one the app's owner never chose.
+  if (platformHostProblem(domain, { publicUrl: getPublicUrl(), domainSuffix: suffix })) return undefined;
   if (isLocalhostDomain(domain)) return undefined;
   const proto = forceHttps || (isHttpsEnabled() && !tlsDisabled) ? 'https' : 'http';
   return `${proto}://${domain}`;

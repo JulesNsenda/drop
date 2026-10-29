@@ -59,7 +59,7 @@ describe('principalId', () => {
     it('SURVIVES a refresh — the whole point of the sid', async () => {
       // The defect this prevents: with a per-token principal, one refresh
       // resets the quota. An agent could double its allowance by refreshing.
-      const user = await createUser('alice', 'password123', 'user');
+      const user = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
 
       const sid = 'grant-sid-1';
       const first = await mintOAuthAccessToken(user, AUD, sid);
@@ -79,7 +79,7 @@ describe('principalId', () => {
     it('survives REPEATED refreshes, not just the first', async () => {
       // A carry that works once but re-mints on the second rotation would pass
       // the test above and still reset hourly in practice.
-      const user = await createUser('alice', 'password123', 'user');
+      const user = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
       const sid = 'grant-sid-2';
       let token = await issueRefreshToken(user.id, 'client-1', sid);
 
@@ -93,7 +93,7 @@ describe('principalId', () => {
     it('separates two concurrent sessions for the SAME user', async () => {
       // Ownership is shared; metering is not. Two agent sessions must not be
       // able to spend each other's budget.
-      const user = await createUser('alice', 'password123', 'user');
+      const user = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
 
       const a = await verifyOAuthAccessToken(await mintOAuthAccessToken(user, AUD, 'sid-a'), AUD);
       const b = await verifyOAuthAccessToken(await mintOAuthAccessToken(user, AUD, 'sid-b'), AUD);
@@ -105,7 +105,7 @@ describe('principalId', () => {
     it('degrades to the coarse principal for a token minted before sid existed', async () => {
       // Never wrong, just coarse. The GRANT self-heals on its next rotation
       // (see 'legacy grants' below); this covers the already-minted token.
-      const user = await createUser('alice', 'password123', 'user');
+      const user = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
 
       const ctx = await verifyOAuthAccessToken(await mintOAuthAccessToken(user, AUD), AUD);
 
@@ -134,7 +134,7 @@ describe('principalId', () => {
       // Both halves matter and they pull in opposite directions. Two keys for
       // one human must be metered apart (principalId), yet both must still
       // resolve to that human for access checks (userId) — DROP-075's fix.
-      const owner = await createUser('bob', 'password123', 'user');
+      const owner = await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
       const one = await createApiKey('ci-a', 'user', undefined, undefined, owner.id);
       const two = await createApiKey('ci-b', 'user', undefined, undefined, owner.id);
 
@@ -155,7 +155,7 @@ describe('principalId', () => {
       // Unprefixed, `jwt -> sub` and a sid-less `oauth -> userId` are the SAME
       // string — so a runaway agent session would trip the circuit breaker on
       // the human's own dashboard deploys and spend their quota.
-      const user = await createUser('dave', 'password123', 'user');
+      const user = await createUser({ username: 'dave', role: 'user', credential: { password: 'password123' } });
       const oauthCtx = await verifyOAuthAccessToken(await mintOAuthAccessToken(user, AUD), AUD);
 
       expect(oauthCtx?.principalId).not.toBe(`jwt:${user.id}`);
@@ -178,7 +178,7 @@ describe('principalId', () => {
       // suspension proves `rotateRefreshToken`'s own `enabled` check on its
       // own terms: this record was never present at suspension time, so no
       // purge — present or future-removed — could be why rotation fails.
-      const user = await createUser('eve', 'password123', 'user');
+      const user = await createUser({ username: 'eve', role: 'user', credential: { password: 'password123' } });
 
       await suspendUser(user.id);
       const refreshToken = await issueRefreshToken(user.id, 'client-1', 'sid-e');
@@ -195,7 +195,7 @@ describe('principalId', () => {
       // purges nothing" above), so the record here definitely survives —
       // pinning that rotation still fails because the OWNER is disabled, the
       // exact primitive Item 4 needs once suspendUser stops purging too.
-      const user = await createUser('frank2', 'password123', 'user');
+      const user = await createUser({ username: 'frank2', role: 'user', credential: { password: 'password123' } });
       const refreshToken = await issueRefreshToken(user.id, 'client-1', 'sid-f2');
 
       await updateUser(user.id, { enabled: false });
@@ -204,8 +204,8 @@ describe('principalId', () => {
     });
 
     it('kills an OAuth grant when the user is DELETED', async () => {
-      const admin = await createUser('root', 'password123', 'admin');
-      const user = await createUser('frank', 'password123', 'user');
+      const admin = await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
+      const user = await createUser({ username: 'frank', role: 'user', credential: { password: 'password123' } });
       const refreshToken = await issueRefreshToken(user.id, 'client-1', 'sid-f');
 
       await deleteUser(user.id);
@@ -222,7 +222,7 @@ describe('principalId', () => {
     // hour", which is exactly the window an incident happens in.
 
     it('kills a LIVE access token when its grant is revoked', async () => {
-      const user = await createUser('ivan', 'password123', 'user');
+      const user = await createUser({ username: 'ivan', role: 'user', credential: { password: 'password123' } });
       const sid = 'sid-live-1';
       const token = await mintOAuthAccessToken(user, AUD, sid);
       const refreshToken = await issueRefreshToken(user.id, 'client-1', sid);
@@ -236,7 +236,7 @@ describe('principalId', () => {
     });
 
     it('kills a LIVE access token when the user is suspended', async () => {
-      const user = await createUser('judy', 'password123', 'user');
+      const user = await createUser({ username: 'judy', role: 'user', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUD, 'sid-live-2');
       expect(await verifyOAuthAccessToken(token, AUD)).not.toBeNull();
 
@@ -247,7 +247,7 @@ describe('principalId', () => {
 
     it('kills EVERY grant of a suspended user, not just one', async () => {
       // Denying by user has to cover sessions the revoker never saw.
-      const user = await createUser('karl', 'password123', 'user');
+      const user = await createUser({ username: 'karl', role: 'user', credential: { password: 'password123' } });
       const a = await mintOAuthAccessToken(user, AUD, 'sid-a');
       const b = await mintOAuthAccessToken(user, AUD, 'sid-b');
 
@@ -259,8 +259,8 @@ describe('principalId', () => {
 
     it('does not touch a DIFFERENT user or a different grant', async () => {
       // A denylist that over-matches is an outage, not a fix.
-      const victim = await createUser('mallory', 'password123', 'user');
-      const bystander = await createUser('trent', 'password123', 'user');
+      const victim = await createUser({ username: 'mallory', role: 'user', credential: { password: 'password123' } });
+      const bystander = await createUser({ username: 'trent', role: 'user', credential: { password: 'password123' } });
       const bystanderToken = await mintOAuthAccessToken(bystander, AUD, 'sid-ok');
       const otherGrant = await mintOAuthAccessToken(bystander, AUD, 'sid-other');
 
@@ -272,7 +272,7 @@ describe('principalId', () => {
 
     it('denies only the revoked grant, leaving the user other sessions alive', async () => {
       // Revoking one refresh token must not log the human out everywhere.
-      const user = await createUser('nina', 'password123', 'user');
+      const user = await createUser({ username: 'nina', role: 'user', credential: { password: 'password123' } });
       const doomedSid = 'sid-doomed';
       const keptSid = 'sid-kept';
       const doomed = await mintOAuthAccessToken(user, AUD, doomedSid);
@@ -306,7 +306,7 @@ describe('principalId', () => {
 
     it('a suspended user stays revoked ACROSS a restart', async () => {
       const credentialsPath = path.join(tempDir, 'credentials.json');
-      const user = await createUser('olga', 'password123', 'user');
+      const user = await createUser({ username: 'olga', role: 'user', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUD, 'sid-restart');
 
       await suspendUser(user.id);
@@ -320,8 +320,8 @@ describe('principalId', () => {
 
     it('a deleted user stays revoked ACROSS a restart', async () => {
       const credentialsPath = path.join(tempDir, 'credentials.json');
-      await createUser('root', 'password123', 'admin');
-      const user = await createUser('peter', 'password123', 'user');
+      await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
+      const user = await createUser({ username: 'peter', role: 'user', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUD, 'sid-del');
 
       await deleteUser(user.id);
@@ -335,7 +335,7 @@ describe('principalId', () => {
       // which sets the flag and does NOT purge keys, refresh tokens or deny
       // anything. Two disable paths with different security semantics is a
       // trap; the durable check makes them equivalent.
-      const user = await createUser('quinn', 'password123', 'user');
+      const user = await createUser({ username: 'quinn', role: 'user', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUD, 'sid-ui');
 
       await updateUser(user.id, { enabled: false });
@@ -345,20 +345,26 @@ describe('principalId', () => {
 
     it('honours a DEMOTION immediately, rather than 15 minutes later', async () => {
       // role rode in the claim, so a demoted admin kept admin standing for the
-      // rest of the token's life.
-      const user = await createUser('rita', 'password123', 'admin');
+      // rest of the token's life. A demotion now ends connector (OAuth) access
+      // outright; the user re-approves and gets a token at the new role.
+      const user = await createUser({ username: 'rita', role: 'admin', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUD, 'sid-demote');
       expect((await verifyOAuthAccessToken(token, AUD))?.role).toBe('admin');
 
       await updateUser(user.id, { role: 'readonly' });
 
-      expect((await verifyOAuthAccessToken(token, AUD))?.role).toBe('readonly');
+      expect(await verifyOAuthAccessToken(token, AUD)).toBeNull();
+      // Stamps are second-granular: a token minted in the same second would
+      // also predate the stamp.
+      await new Promise((r) => setTimeout(r, 1100));
+      const fresh = await mintOAuthAccessToken(user, AUD, 'sid-demote-2');
+      expect((await verifyOAuthAccessToken(fresh, AUD))?.role).toBe('readonly');
     });
 
     it('leaves an untouched user working after a restart', async () => {
       // A durable check that over-rejects is an outage.
       const credentialsPath = path.join(tempDir, 'credentials.json');
-      const user = await createUser('sam', 'password123', 'user');
+      const user = await createUser({ username: 'sam', role: 'user', credential: { password: 'password123' } });
       const token = await mintOAuthAccessToken(user, AUD, 'sid-fine');
 
       await restart(credentialsPath);
@@ -373,7 +379,7 @@ describe('principalId', () => {
       // rotations, so a pre-upgrade grant would never heal and its principal
       // would stay permanently coarse — not "ages out in 15 minutes", as an
       // earlier version of this comment claimed.
-      const user = await createUser('grace', 'password123', 'user');
+      const user = await createUser({ username: 'grace', role: 'user', credential: { password: 'password123' } });
       const refreshToken = await issueRefreshToken(user.id, 'client-1');
 
       const rotated = await rotateRefreshToken(refreshToken);
@@ -383,7 +389,7 @@ describe('principalId', () => {
     });
 
     it('then keeps that healed sid stable across later rotations', async () => {
-      const user = await createUser('heidi', 'password123', 'user');
+      const user = await createUser({ username: 'heidi', role: 'user', credential: { password: 'password123' } });
       let token = await issueRefreshToken(user.id, 'client-1');
 
       const first = await rotateRefreshToken(token);
@@ -398,7 +404,7 @@ describe('principalId', () => {
     it('keeps userId as the OWNER on every path', async () => {
       // principalId must not have quietly become the thing canAccess reads —
       // that would make one agent session unable to see its own user's apps.
-      const user = await createUser('carol', 'password123', 'user');
+      const user = await createUser({ username: 'carol', role: 'user', credential: { password: 'password123' } });
       const ctx = await verifyOAuthAccessToken(
         await mintOAuthAccessToken(user, AUD, 'sid-x'),
         AUD

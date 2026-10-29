@@ -80,9 +80,9 @@ describe('GET /api/v1/deploys authorization (P2-4)', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'readonly');
-    const bob = await createUser('bob', 'password123', 'user');
-    await createUser('root', 'password123', 'admin');
+    const alice = await createUser({ username: 'alice', role: 'readonly', credential: { password: 'password123' } });
+    const bob = await createUser({ username: 'bob', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     aliceId = alice.id;
     bobId = bob.id;
     aliceToken = await getTestToken('alice', 'password123');

@@ -29,6 +29,8 @@ import { isNewNameRefused } from '../app-names';
 import { resolveGitBackedName } from '../git-backed';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
+import { getPlatformOps, AppInProgressError, AppSuspendedError } from '../../api/platform-ops';
+import { getSuspensionStore } from '../../managers/suspension';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { syncTree, DEFAULT_PRESERVE } from '../../utils/tree-sync';
@@ -170,6 +172,11 @@ export class UploadDeployService {
           }; redeploy it from git instead of uploading`
         );
       }
+      // A suspended app is refused HERE: before admitDeploy (which charges the
+      // quota) and before anything is extracted or landed. After the ownership
+      // checks above, so a caller who may not know the app is answered as for
+      // an unknown one. A recreated name stays suspended (the store is name-keyed).
+      this.assertNotSuspended(appName);
       await admitDeploy(appName, !existingApp, { principalId, actorUserId: userId });
 
       // Ephemeral quota, checked here for the same reason the guardrail is:
@@ -206,6 +213,8 @@ export class UploadDeployService {
     // Set by landFiles once THIS call is the one creating the folder.
     const landing = { created: false };
     let hadConfig = false;
+    // The platform's claim on the app while its folder is written (redeploys).
+    let releaseClaim: (() => void) | undefined;
 
     try {
       stagingDir = path.join(this.config.tempDirectory, `upload-${appName}-${Date.now()}`);
@@ -305,6 +314,14 @@ export class UploadDeployService {
         }
       }
 
+      // Held from before the snapshot to the end of the write: a build running
+      // in the folder, or a restart, must not overlap either.
+      if (!isNew) releaseClaim = await this.claimFolder(appName);
+      // Re-checked synchronously after the claim and the extraction, before the
+      // snapshot and the write: a suspension can land in either await. The catch
+      // below undoes a registration this call made.
+      this.assertNotSuspended(appName);
+
       if (!isNew) {
       // Rollback snapshot of the tree that is SERVING, before it is replaced
       // (#296). Best-effort by contract: it never throws, and a skipped or
@@ -316,7 +333,14 @@ export class UploadDeployService {
         }
       }
 
+      // And again right before the write (the snapshot above is an await).
+      this.assertNotSuspended(appName);
       await this.landFiles(stagingDir, destPath, refuseExisting, landing);
+
+      // The write is done: give the claim back before publishing, or the
+      // platform's own busy check would drop this method's event.
+      releaseClaim?.();
+      releaseClaim = undefined;
 
       const acceptedAt = new Date().toISOString();
 
@@ -374,6 +398,7 @@ export class UploadDeployService {
       }
       throw err;
     } finally {
+      releaseClaim?.();
       release(appName, principal);
       // Idempotent: already cleared above on the success path. Still needed
       // here for the failure path (extraction/disk-check/landFiles threw
@@ -383,6 +408,43 @@ export class UploadDeployService {
         await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
       }
     }
+  }
+
+  /** Throws AppSuspendedError when the app is suspended (or the store cannot say), synchronously. */
+  private assertNotSuspended(appName: string): void {
+    const suspension = getSuspensionStore().refusalFor(appName);
+    if (suspension) throw new AppSuspendedError(appName, suspension);
+  }
+
+  /**
+   * Take the platform's claim on an existing app and confirm no build container
+   * is alive in its folder, as git deploy does before it writes there. Refuses
+   * with AppInProgressError (409) if either fails. Without platform operations
+   * (no platform is wired) there is no builder to collide with and no claim.
+   */
+  private async claimFolder(appName: string): Promise<(() => void) | undefined> {
+    const ops = getPlatformOps();
+    if (!ops) return undefined;
+    // A monorepo child is not written while its container re-expands (and the
+    // reverse), the same rule git deploy applies.
+    if (ops.isGroupBusy(appName)) throw new AppInProgressError(appName);
+    // The platform counts an upload in flight as busy, which would refuse this
+    // call's own claim. Unmark for the one synchronous step that takes it.
+    this.activeUploads.delete(appName);
+    let claim: (() => void) | null;
+    try {
+      claim = ops.tryReserveApp(appName);
+    } finally {
+      this.activeUploads.add(appName);
+    }
+    if (!claim) throw new AppInProgressError(appName);
+    try {
+      if (await ops.hasLiveBuildContainer(appName)) throw new AppInProgressError(appName);
+    } catch (err) {
+      claim();
+      throw err;
+    }
+    return claim;
   }
 
   /**

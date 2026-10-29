@@ -21,6 +21,7 @@ import {
   addGitToken,
   deleteGitToken,
   GitTokenInfo,
+  gitTokenOwnerLabel,
   App,
   useHealth,
 } from '../hooks/useApi';
@@ -584,6 +585,7 @@ function DeployPage() {
                   {tokens.map(t => (
                     <option key={t.id} value={t.id}>
                       {t.name}
+                      {role === 'admin' ? ` (${gitTokenOwnerLabel(t)})` : ''}
                     </option>
                   ))}
                 </select>
@@ -618,6 +620,9 @@ function DeployPage() {
                       >
                         <span className="text-sm text-muted">
                           {t.name}
+                          {role === 'admin' && (
+                            <span className="ml-2 text-xs text-faint">{gitTokenOwnerLabel(t)}</span>
+                          )}
                         </span>
                         <button
                           type="button"

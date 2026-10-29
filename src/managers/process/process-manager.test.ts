@@ -186,6 +186,25 @@ describe('ProcessManager', () => {
       );
     });
 
+    it('deletes a stopped entry before starting over it, so PM2 takes its fresh-start path', async () => {
+      mockGetProcessStatus
+        .mockResolvedValueOnce(createStatus({ status: 'stopped' }))
+        .mockResolvedValue(createStatus());
+
+      await new ProcessManager().start({ name: 'test-app', script: 'index.js', cwd: '/app' });
+
+      expect(mockDeleteProcess).toHaveBeenCalledWith('test-app');
+      expect(mockDeleteProcess.mock.invocationCallOrder[0]).toBeLessThan(mockStart.mock.invocationCallOrder[0]);
+    });
+
+    it('deletes nothing when there is no entry to start over', async () => {
+      mockGetProcessStatus.mockResolvedValueOnce(null).mockResolvedValue(createStatus());
+
+      await new ProcessManager().start({ name: 'test-app', script: 'index.js', cwd: '/app' });
+
+      expect(mockDeleteProcess).not.toHaveBeenCalled();
+    });
+
     it('should return existing status if already online', async () => {
       mockGetProcessStatus.mockResolvedValue(createStatus());
 
@@ -475,5 +494,17 @@ describe('ProcessConfig conversion', () => {
         restart_delay: 2000,
       })
     );
+  });
+
+  it('passes filterEnv to PM2 as filter_env', async () => {
+    const manager = new ProcessManager();
+    await manager.start({ name: 'a', script: 'index.js', cwd: '/app', filterEnv: ['DROP_', 'AWS_'] });
+    expect(mockStart).toHaveBeenLastCalledWith(expect.objectContaining({ filter_env: ['DROP_', 'AWS_'] }));
+  });
+
+  it('omits filter_env when there is no filterEnv', async () => {
+    const manager = new ProcessManager();
+    await manager.start({ name: 'b', script: 'index.js', cwd: '/app' });
+    expect(mockStart.mock.calls[mockStart.mock.calls.length - 1][0]).not.toHaveProperty('filter_env');
   });
 });

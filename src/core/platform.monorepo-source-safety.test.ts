@@ -41,6 +41,11 @@ function linkDir(target: string, linkPath: string): void {
   fssync.symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
 }
 
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('expandMonorepo refuses unsafe service sources', () => {
   let platform: DropPlatform;
   let tempDir: string;

@@ -33,13 +33,15 @@ Full documentation lives at **[dropkit.sh/docs](https://dropkit.sh/docs)**, and 
 | Environment variables (platform and injected) | [docs → Environment variables](https://dropkit.sh/docs#environment-variables) |
 | Persistent data directories | [docs → Persistent data](https://dropkit.sh/docs#persistent-data) |
 | Supported runtimes and how detection works | [docs → Runtimes & detection](https://dropkit.sh/docs#runtimes) |
-| Caddy routing, HTTPS, wildcard certs, custom domains | [docs → Routing & HTTPS](https://dropkit.sh/docs#routing-https) |
+| Caddy routing, HTTPS, DNS-01 certs, custom domains | [docs → Routing & HTTPS](https://dropkit.sh/docs#routing-https) |
 | Database auto-provisioning and what triggers it | [docs → Databases](https://dropkit.sh/docs#databases) |
 | Log capture and retention | [docs → Logs](https://dropkit.sh/docs#logs) |
 | Connecting Claude, Cursor and other agents | [docs → Integrations](https://dropkit.sh/docs#claude-web) |
 | Every CLI command and REST endpoint | [reference](https://dropkit.sh/docs/api) |
 
 Also in this repo: [HTTPS setup](docs/HTTPS-SETUP.md), [git redeploy and custom domains](docs/GIT-REDEPLOY-AND-CUSTOM-DOMAINS.md), [agent deploys](docs/AGENT-DEPLOY.md).
+
+Agents can deploy to DROP unaided with the [deploy-to-drop skill](skills/deploy-to-drop/SKILL.md) (Claude Code, Cursor and any SKILL.md-compatible agent).
 
 ## Requirements
 

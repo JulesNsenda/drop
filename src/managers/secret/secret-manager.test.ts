@@ -2,6 +2,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { SecretManager } from './secret-manager';
+import * as atomicWrite from '../../utils/atomic-write';
 
 describe('SecretManager', () => {
   let sm: SecretManager;
@@ -17,6 +18,31 @@ describe('SecretManager', () => {
 
   afterEach(async () => {
     await fs.rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('serializes overlapping writes so they reach the disk in request order', async () => {
+    const real = atomicWrite.writeJsonAtomic;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const spy = jest.spyOn(atomicWrite, 'writeJsonAtomic').mockImplementation(async (...args) => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // A random delay is what lets an unchained write overtake an earlier one.
+      await new Promise((r) => setTimeout(r, Math.random() * 15));
+      try {
+        return await real(...(args as Parameters<typeof real>));
+      } finally {
+        inFlight--;
+      }
+    });
+
+    await Promise.all(Array.from({ length: 12 }, (_, i) => sm.set('myapp', `K${i}`, `v${i}`)));
+    spy.mockRestore();
+
+    expect(maxInFlight).toBe(1);
+    const onDisk = new SecretManager({ storePath, masterKey: 'test-master-key' });
+    await onDisk.initialize();
+    expect(onDisk.list('myapp')).toHaveLength(12);
   });
 
   it('should set and get a secret', async () => {

@@ -67,7 +67,7 @@ describe('app session token', () => {
       enableJwt: true,
       enableApiKeys: true,
     } as never);
-    const user = await createUser('alice', 'password123', 'user');
+    const user = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
     userId = user.id;
   });
 
@@ -272,7 +272,7 @@ describe('app guest session token', () => {
 
   describe('class isolation — the token_use-first ordering', () => {
     it('a USER session token is refused by the GUEST verifier', async () => {
-      const user = await createUser('alice', 'password123', 'user');
+      const user = await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
       const userToken = await mintAppSessionToken(user.id, 'alice', APP, ORIGIN);
       expect(await verifyAppGuestSessionToken(userToken, ORIGIN, APP)).toBeNull();
     });

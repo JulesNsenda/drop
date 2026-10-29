@@ -14,7 +14,49 @@ export interface AppStorageAllocation {
   userName: string;
   accessKeyId: string;
   createdAt: string;
+  /**
+   * Who owned the app when the bucket was created. Carried onto the retired
+   * record, because by the time a deleted app's storage is settled the app
+   * (and its owner) is gone — and the per-user cap must keep counting a bucket
+   * that is still billing the operator.
+   */
+  ownerUserId?: string;
+  /**
+   * `AppState.createdAt` of the app this was provisioned for. With
+   * `ownerUserId` it is the incarnation marker: app names are reusable, so a
+   * record is the property of ONE app, not of whoever holds the name now.
+   * `provisionAppStorage` refuses to hand a record to a different incarnation.
+   */
+  appCreatedAt?: string;
+  /**
+   * The IAM key is revoked and its user deleted; only the bucket survives. Set
+   * by a `keepData` delete (the bucket is the owner's data, the credential is
+   * not) and by the first half of a detach.
+   */
+  accessRevoked?: boolean;
+  /**
+   * Retired because it was found on a name whose current app is NOT the one it
+   * was made for. Nothing — not even the sweep's key revocation — touches it
+   * until an admin resolves it (`DELETE /admin/object-storage/retired/:id`).
+   */
+  quarantined?: boolean;
+  /**
+   * Set when the app this belonged to was deleted and its resources were NOT
+   * (all) destroyed — the record is moved off the app's name so a new app of
+   * the same name can never inherit the bucket. `teardown-failed` is retried by
+   * the sweep; `kept` (a `keepData` delete) is left for an admin, who can list
+   * and destroy it.
+   */
+  retired?: { at: string; reason: RetiredReason };
 }
+
+/**
+ * Why a record was moved off its app's name. `deleting`: the app was deleted
+ * and the sweep has yet to drain the bucket. `teardown-failed`: a destroy was
+ * attempted and AWS refused (retried by the sweep). `kept`: a keepData delete —
+ * only an admin destroys it.
+ */
+export type RetiredReason = 'deleting' | 'teardown-failed' | 'kept';
 
 /** The allocation plus its secret, as injected into the app's environment. */
 export interface AppStorageCredentials extends AppStorageAllocation {
@@ -44,8 +86,19 @@ export interface ObjectStorageProvider {
     accessKeyId: string;
     secretAccessKey: string;
   }>;
+  /**
+   * Delete the key(s), the inline policy and the user — and nothing else, so
+   * the bucket and its objects survive. Idempotent; true when the user existed.
+   */
+  revokeAccess(input: { userName: string }): Promise<boolean>;
   /** Delete the key(s), the user, every object and the bucket. Idempotent. */
   deprovision(input: { bucket: string; userName: string }): Promise<StorageDeprovisionResult>;
+  /**
+   * Whether the APP's own key can reach its bucket yet (an S3 HeadBucket made
+   * with that key, not the admin's). A brand-new IAM key takes a moment to be
+   * honoured everywhere; false means "not yet", never an error.
+   */
+  probeAccess(input: { bucket: string; accessKeyId: string; secretAccessKey: string }): Promise<boolean>;
   /** Confirm the admin credential works; returns the account it belongs to. */
   whoAmI(): Promise<{ account: string }>;
 }

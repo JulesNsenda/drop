@@ -37,8 +37,8 @@ Staging certificates won't be trusted by browsers but help verify your setup wit
 | `--https` | Enable HTTPS with Let's Encrypt | `--https` |
 | `--acme-email <email>` | Email for certificate notifications | `--acme-email admin@example.com` |
 | `--acme-staging` | Use Let's Encrypt staging (testing) | `--acme-staging` |
-| `--dns-provider <provider>` | DNS provider for wildcard certs | `--dns-provider cloudflare` |
-| `--wildcard` | Use wildcard certificate | `--wildcard` |
+| `--dns-provider <provider>` | DNS provider for DNS-01 issuance | `--dns-provider cloudflare` |
+| `--wildcard` | Issue per-host certificates via DNS-01 (not a `*.domain` cert) | `--wildcard` |
 
 ### Environment Variables
 
@@ -51,7 +51,7 @@ export DROP_ENABLE_HTTPS=true
 export DROP_ACME_EMAIL=admin@example.com
 export DROP_ACME_STAGING=false
 
-# DNS provider credentials (for wildcards)
+# DNS provider credentials (for DNS-01)
 export DROP_DNS_PROVIDER=cloudflare
 export DROP_WILDCARD_CERT=true
 
@@ -68,9 +68,9 @@ export AWS_ACCESS_KEY_ID=your-access-key
 export AWS_SECRET_ACCESS_KEY=your-secret-key
 ```
 
-## Wildcard Certificates
+## DNS-01 Issuance (`--wildcard`)
 
-Wildcard certificates (`*.example.com`) require DNS-01 challenge, which needs access to your DNS provider's API.
+`--wildcard` / `DROP_WILDCARD_CERT` does **not** issue a single `*.example.com` certificate. It adds a DNS-01 `tls` block (using the configured DNS provider) to each generated route, so Caddy obtains a separate certificate for every app hostname via the DNS-01 challenge. This needs access to your DNS provider's API, but does not need ports 80/443 to be publicly reachable for validation.
 
 ### Supported DNS Providers
 
@@ -199,7 +199,7 @@ curl -X POST http://localhost:3000/api/v1/certs/renew
 2. Port 80 must be accessible from the internet
 3. Caddy handles the challenge automatically
 
-### For DNS-01 Challenge (Wildcards)
+### For DNS-01 Challenge (`--wildcard`)
 
 1. DNS provider API access is required
 2. Ports 80/443 don't need to be publicly accessible

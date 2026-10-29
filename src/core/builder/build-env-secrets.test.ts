@@ -71,6 +71,32 @@ describe('sanitizeBuildEnv', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('DROP_SOMETHING'));
   });
 
+  it('passes DROP_GIT_COMMIT through as an override (platform-set, not a secret)', () => {
+    const env = sanitizeBuildEnv({ DROP_GIT_COMMIT: 'a'.repeat(40) });
+    expect(env.DROP_GIT_COMMIT).toBe('a'.repeat(40));
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('still drops DROP_GIT_COMMIT inherited from process.env', () => {
+    const before = process.env.DROP_GIT_COMMIT;
+    process.env.DROP_GIT_COMMIT = 'inherited';
+    try {
+      expect(sanitizeBuildEnv({}).DROP_GIT_COMMIT).toBeUndefined();
+    } finally {
+      if (before === undefined) delete process.env.DROP_GIT_COMMIT;
+      else process.env.DROP_GIT_COMMIT = before;
+    }
+  });
+
+  it('still refuses DROP_API_KEY (and the rest) as an override, alongside DROP_GIT_COMMIT', () => {
+    const env = sanitizeBuildEnv({ DROP_GIT_COMMIT: 'abc1234', DROP_API_KEY: 'k', AWS_X: 'y', CF_Z: 'z' });
+    expect(env.DROP_GIT_COMMIT).toBe('abc1234');
+    expect(env.DROP_API_KEY).toBeUndefined();
+    expect(env.AWS_X).toBeUndefined();
+    expect(env.CF_Z).toBeUndefined();
+    expect(String(warn.mock.calls[0][0])).not.toContain('DROP_GIT_COMMIT');
+  });
+
   it('still passes ordinary overrides through', () => {
     const env = sanitizeBuildEnv({ NODE_ENV: 'production', VITE_API_BASE: '/api' });
     expect(env.NODE_ENV).toBe('production');

@@ -41,7 +41,7 @@ import type {
 // the core/event-bus barrel (only AppUpdatedPayload is) — pull it from the
 // types module directly rather than editing the barrel, which is outside
 // this module's scope.
-import type { AppUpdatePayload } from '../../core/event-bus/event-bus.types';
+import type { AppUpdatePayload, DeployTriggerTag } from '../../core/event-bus/event-bus.types';
 import type { BuildStage } from '../../core/builder/builder.types';
 import type {
   DeployRow,
@@ -76,7 +76,7 @@ function categoryForStage(stage: BuildStage): DeployFailureCategory {
   }
 }
 
-type DeployTrigger = 'deploy' | 'hot-reload' | 'upload';
+type DeployTrigger = DeployTriggerTag;
 
 interface PendingTrigger {
   trigger: DeployTrigger;
@@ -200,8 +200,10 @@ export class DeployTracker {
       appName,
       userId,
       stage: 'triggered',
-      at: pending?.at ?? at,
-      detail: pending?.trigger,
+      // An explicit trigger is its own account of the start: the pending tag's
+      // timestamp (an earlier app:update, say) is not this deploy's.
+      at: payload.trigger ? at : (pending?.at ?? at),
+      detail: payload.trigger ?? pending?.trigger,
     });
     this.rows.unshift({
       deployId,

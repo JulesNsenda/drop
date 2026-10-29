@@ -9,6 +9,10 @@ import * as os from 'os';
 import * as fsPromises from 'fs/promises';
 import * as yaml from 'yaml';
 import { DropPlatform, createPlatform } from './platform';
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
 import { eventBus } from './event-bus';
 import { resetDeployBreaker, getDeployBreaker } from '../managers/guardrail/deploy-breaker';
 import * as detectorModule from './detector';
@@ -3044,6 +3048,166 @@ describe('expandMonorepo (M2: monorepo -> per-service app expansion)', () => {
           expect.stringMatching(/dashboard.*reserved/),
           'ROUTER'
         );
+      });
+
+      describe('tenant hostnames under the platform host', () => {
+        const stubPlatform = (getConfig: any, extra: Record<string, unknown> = {}) => {
+          (platform as any).config.domainSuffix = 'dropkit.sh';
+          const router = {
+            addRoute: jest.fn().mockResolvedValue(undefined),
+            getRoute: jest.fn().mockReturnValue(undefined),
+            removeRoute: jest.fn().mockResolvedValue(undefined),
+            ...extra,
+          };
+          (platform as any).router = router;
+          (platform as any).appConfigService = {
+            getConfig,
+            updateConfig: jest.fn(),
+            updateSystemConfig: jest.fn().mockResolvedValue(undefined),
+            getDomainOwners: jest.fn().mockReturnValue(new Map()),
+          };
+          (platform as any).stateManager = {
+            getApp: jest.fn().mockReturnValue({ customDomain: 'x.dashboard.dropkit.sh' }),
+            setAccessGateUnapplied: jest.fn().mockResolvedValue(undefined),
+          };
+          (platform as any).caddyServer = undefined;
+          const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+          const errorSpy = jest.spyOn((platform as any).logger, 'error').mockImplementation(() => undefined);
+          return { router, warnSpy, errorSpy };
+        };
+
+        const ownedRoute = (owner: string, key: string, hostname: string) =>
+          jest.fn().mockImplementation((k: string) => (k === key ? { owner, hostname } : undefined));
+
+        const route = async (
+          publicUrl: string | undefined,
+          appName: string,
+          domains: string[],
+          extra: Record<string, unknown> = {}
+        ) => {
+          setPublicUrl(publicUrl);
+          const appPath = path.join(appsDir, appName);
+          await fsPromises.mkdir(appPath, { recursive: true });
+          await fsPromises.writeFile(
+            path.join(appPath, 'drop.yaml'),
+            `name: ${appName}\ndomains:\n${domains.map((d) => `  - ${d}`).join('\n')}\n`
+          );
+          const stubs = stubPlatform(jest.fn().mockReturnValue(undefined), extra);
+          await (platform as any).handleConfigureRoute(appName, 4011);
+          expect(stubs.errorSpy).not.toHaveBeenCalled();
+          return {
+            ...stubs,
+            addRoute: stubs.router.addRoute,
+            hosts: stubs.router.addRoute.mock.calls.map((c: any) => c[0].hostname),
+          };
+        };
+
+        it('does not route a name under the public host, and falls back to the default hostname', async () => {
+          const { hosts, warnSpy } = await route('https://dashboard.dropkit.sh', 'tenant', [
+            'x.dashboard.dropkit.sh',
+            'X.Dashboard.DropKit.sh',
+          ]);
+          expect(hosts).toEqual(['tenant.dropkit.sh']);
+          expect(warnSpy).toHaveBeenCalledWith(
+            expect.stringMatching(/x\.dashboard\.dropkit\.sh.*under the platform's own host/i),
+            'ROUTER'
+          );
+        });
+
+        it('still routes an ordinary custom domain alongside a refused one', async () => {
+          const { hosts } = await route('https://dashboard.dropkit.sh', 'tenant', [
+            'x.dashboard.dropkit.sh',
+            'www.example.com',
+          ]);
+          expect(hosts).toEqual(['www.example.com']);
+        });
+
+        it('routes everything when no public URL is set', async () => {
+          const { hosts } = await route(undefined, 'tenant', ['x.dashboard.dropkit.sh']);
+          expect(hosts).toEqual(['x.dashboard.dropkit.sh']);
+        });
+
+        it('with the suffix equal to the public host, the subtree rule is off: extra names route, the platform host itself does not', async () => {
+          const { hosts } = await route('https://dropkit.sh', 'tenant', [
+            'tenant.dropkit.sh',
+            'extra.dropkit.sh',
+            'dropkit.sh',
+          ]);
+          expect(hosts).toEqual(['tenant.dropkit.sh', 'extra.dropkit.sh']);
+        });
+
+        it('removes a route that was live for a name now refused', async () => {
+          const { router } = await route(
+            'https://dashboard.dropkit.sh',
+            'tenant',
+            ['x.dashboard.dropkit.sh', 'www.example.com'],
+            { getRoute: ownedRoute('tenant', 'tenant/x.dashboard.dropkit.sh', 'x.dashboard.dropkit.sh') }
+          );
+          expect(router.removeRoute).toHaveBeenCalledTimes(1);
+          expect(router.removeRoute).toHaveBeenCalledWith('tenant/x.dashboard.dropkit.sh');
+        });
+
+        it('does not route a previously verified customDomain under the public host, and withdraws its route and verification', async () => {
+          setPublicUrl('https://dashboard.dropkit.sh');
+          const { router, warnSpy, errorSpy } = stubPlatform(
+            jest.fn().mockReturnValue({
+              customDomainVerified: { domain: 'x.dashboard.dropkit.sh', verifiedAt: '2026-01-01T00:00:00Z' },
+            }),
+            { getRoute: ownedRoute('tenant', 'tenant/x.dashboard.dropkit.sh', 'x.dashboard.dropkit.sh') }
+          );
+
+          await (platform as any).handleConfigureRoute('tenant', 4012);
+
+          expect(router.addRoute.mock.calls.map((c: any) => c[0].hostname)).toEqual(['tenant.dropkit.sh']);
+          expect(warnSpy).toHaveBeenCalledWith(
+            expect.stringMatching(/x\.dashboard\.dropkit\.sh.*under the platform's own host/),
+            'ROUTER'
+          );
+          expect(router.removeRoute).toHaveBeenCalledWith('tenant/x.dashboard.dropkit.sh');
+          expect((platform as any).appConfigService.updateSystemConfig).toHaveBeenCalledWith('tenant', {
+            customDomainVerified: undefined,
+          });
+          expect(errorSpy).not.toHaveBeenCalled();
+        });
+
+        it("never removes another app's route that shares the key (behalf-behalf vs behalf)", async () => {
+          // 'behalf-behalf' on dropkit.sh and 'behalf' on behalf.dropkit.sh both
+          // used to map to one key.
+          const key = 'behalf-behalf/dropkit.sh';
+          const victim = { getRoute: ownedRoute('behalf', key, 'behalf.dropkit.sh') };
+          const { router } = stubPlatform(jest.fn().mockReturnValue(undefined), victim);
+          await (platform as any).pruneRoute('behalf-behalf', 'dropkit.sh');
+          expect(router.removeRoute).not.toHaveBeenCalled();
+
+          // Same owner, different hostname behind the same key: also kept.
+          const other = stubPlatform(jest.fn().mockReturnValue(undefined), {
+            getRoute: ownedRoute('behalf-behalf', key, 'behalf.dropkit.sh'),
+          });
+          await (platform as any).pruneRoute('behalf-behalf', 'dropkit.sh');
+          expect(other.router.removeRoute).not.toHaveBeenCalled();
+
+          // Its own route is removed (hostname compared case-insensitively).
+          const own = stubPlatform(jest.fn().mockReturnValue(undefined), {
+            getRoute: ownedRoute('behalf-behalf', key, 'DropKit.sh'),
+          });
+          await (platform as any).pruneRoute('behalf-behalf', 'dropkit.sh');
+          expect(own.router.removeRoute).toHaveBeenCalledWith(key);
+        });
+
+        it('warns once at boot when the suffix is, or is under, the public host', () => {
+          setPublicUrl('https://drop.example.com');
+          (platform as any).config.domainSuffix = 'drop.example.com';
+          const warnSpy = jest.spyOn((platform as any).logger, 'warn').mockImplementation(() => undefined);
+          (platform as any).warnPlatformHostConfig();
+          expect(warnSpy).toHaveBeenCalledTimes(1);
+          expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/same-site/), 'SECURITY');
+
+          warnSpy.mockClear();
+          (platform as any).config.domainSuffix = 'dropkit.sh';
+          setPublicUrl('https://dashboard.dropkit.sh');
+          (platform as any).warnPlatformHostConfig();
+          expect(warnSpy).not.toHaveBeenCalled();
+        });
       });
 
       it('still routes a normal (non-colliding) app name once a reserved host is configured', async () => {

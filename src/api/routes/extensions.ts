@@ -13,6 +13,7 @@ import { Hono } from 'hono';
 import { success } from '../types';
 import { getDatabaseProvisioner } from '../../managers/database';
 import { getRedisProvisioner } from '../../managers/redis';
+import { getObjectStorageProvisioner } from '../../managers/object-storage';
 
 export type ExtensionKind = 'service' | 'apptype';
 
@@ -24,7 +25,11 @@ export type ExtensionKind = 'service' | 'apptype';
  * readonly-tier, so a raw reason here would be host-layout disclosure to
  * anyone with a viewer token. NEVER an exception message or a host path.
  */
-export type ExtensionUnavailableReason = 'postgres-not-ready' | 'redis-not-ready';
+export type ExtensionUnavailableReason =
+  | 'postgres-not-ready'
+  | 'redis-not-ready'
+  /** #301: an operator has not enabled object storage and given it a region, prefix and AWS credential. */
+  | 'object-storage-not-configured';
 
 export interface ExtensionDescriptor {
   id: string;
@@ -102,6 +107,20 @@ const STATIC_METADATA: readonly StaticExtensionMeta[] = Object.freeze([
     keywords: ['redis', 'cache', 'caching', 'queue', 'pubsub', 'pub/sub', 'session store', 'bullmq', 'in-memory'],
     docsUrl: 'https://dropkit.sh/docs',
     snippet: 'redis: true',
+  },
+  {
+    id: 'object-storage',
+    kind: 'service',
+    displayName: 'Object storage (S3)',
+    summary:
+      'Give this app its own private S3 bucket, with a key that can reach that bucket and nothing ' +
+      'else. DROP injects AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and S3_BUCKET, which ' +
+      'every AWS SDK reads with no code. Attach it from the app\'s Database tab. Detaching or ' +
+      'deleting the app deletes the bucket and everything in it — there is no backup.',
+    keywords: ['s3', 'object storage', 'bucket', 'uploads', 'files', 'blob', 'aws', 'media', 'storage'],
+    docsUrl: 'https://dropkit.sh/docs',
+    // No snippet: attach-only, by design. The bucket bills the operator's
+    // AWS account, so there is no drop.yaml key that could create one.
   },
   {
     id: 'external-database-url',
@@ -200,9 +219,9 @@ const STATIC_METADATA: readonly StaticExtensionMeta[] = Object.freeze([
  *   healthy". It is kept as a real branch because tests and a partially-booted
  *   platform can both reach it.
  */
-function computeAvailability(
+async function computeAvailability(
   id: string
-): Pick<ExtensionDescriptor, 'availability' | 'unavailableReason'> {
+): Promise<Pick<ExtensionDescriptor, 'availability' | 'unavailableReason'>> {
   if (id === 'postgres') {
     return getDatabaseProvisioner() !== null
       ? { availability: 'available' }
@@ -213,17 +232,31 @@ function computeAvailability(
       ? { availability: 'available' }
       : { availability: 'unavailable', unavailableReason: 'redis-not-ready' };
   }
+  if (id === 'object-storage') {
+    // Collapsed to one reason on purpose: which of enabled/region/prefix/
+    // credential is missing is the operator's business, and this route is
+    // readonly-tier. Never throws — an unreadable credential is "not
+    // configured" here.
+    const availability = await getObjectStorageProvisioner()
+      .availability()
+      .catch(() => ({ available: false }) as const);
+    return availability.available
+      ? { availability: 'available' }
+      : { availability: 'unavailable', unavailableReason: 'object-storage-not-configured' };
+  }
   // external-database-url and every app-type card never depend on the
   // bundled server(s) — always available.
   return { availability: 'available' };
 }
 
 // GET /extensions - the full catalog
-extensions.get('/', (c) => {
-  const catalog: ExtensionDescriptor[] = STATIC_METADATA.map((meta) => ({
-    ...meta,
-    ...computeAvailability(meta.id),
-  }));
+extensions.get('/', async (c) => {
+  const catalog: ExtensionDescriptor[] = await Promise.all(
+    STATIC_METADATA.map(async (meta) => ({
+      ...meta,
+      ...(await computeAvailability(meta.id)),
+    }))
+  );
   return c.json(success({ extensions: catalog }));
 });
 

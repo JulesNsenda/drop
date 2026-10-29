@@ -6,9 +6,11 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { execFile } from 'child_process';
-import { GitDeployService, resetGitDeployService } from './git-deploy';
+import { GitDeployService, resetGitDeployService, deployActorOfInfo, publishRedeployUpdate } from './git-deploy';
 import { resetStateManager, getStateManager, AppStateManager } from '../../managers/app/state-manager';
 import { resetSecretManager, getSecretManager } from '../../managers/secret';
+import * as gitClient from './git-client';
+import type { TokenCaller, GitDeployRequest, DeployActor } from './git-deploy.types';
 import {
   AppConfigService,
   getAppConfigService,
@@ -18,9 +20,25 @@ import * as diskUtils from '../../utils/disk';
 import * as breakerModule from '../../managers/guardrail/deploy-breaker';
 import { tryReserve, ownerOf, isReserved, resetDeployReservations } from '../deploy-reservations';
 import { eventBus } from '../event-bus';
+import { setPlatformOps, resetPlatformOps, AppInProgressError } from '../../api/platform-ops';
+import { PlatformNotReadyError } from './git-deploy';
+import { AppSuspendedError } from '../../api/platform-ops';
+import { getSuspensionStore, resetSuspensionStore } from '../../managers/suspension';
+import type { PlatformOps } from '../../api/platform-ops';
+import { makePlatformOpsStub } from '../../api/__testutils__/platform-ops';
+import * as activity from '../../managers/activity';
+import { getDeployTracker, resetDeployTracker } from '../../managers/deploy-tracker';
 // AppUpdatePayload isn't re-exported by ../event-bus (index.ts) - see the same
 // note in managers/deploy-tracker/deploy-tracker.ts.
 import type { AppDetectedPayload, AppUpdatePayload } from '../event-bus/event-bus.types';
+
+// What the mocked `git clone` puts in its destination: these files (and a
+// `.git/`, as a real clone has), and the same list from `ls-files`. A gate
+// lets a test hold a clone open to observe overlap.
+let mockCloneFiles: Record<string, string> = { 'index.html': '<h1>v1</h1>' };
+let mockCloneGate: Promise<void> | null = null;
+let mockCloneActive = 0;
+let mockCloneMaxActive = 0;
 
 // Mock execFile to avoid actual git operations
 jest.mock('child_process', () => ({
@@ -51,7 +69,36 @@ jest.mock('child_process', () => ({
     }
 
     if (sub[0] === 'clone') {
-      callback(null, { stdout: '', stderr: '' });
+      const dest = args[args.length - 1];
+      mockCloneActive++;
+      mockCloneMaxActive = Math.max(mockCloneMaxActive, mockCloneActive);
+      Promise.resolve(mockCloneGate).then(() => {
+        const nodeFs = require('fs');
+        const nodePath = require('path');
+        nodeFs.mkdirSync(nodePath.join(dest, '.git'), { recursive: true });
+        nodeFs.writeFileSync(nodePath.join(dest, '.git', 'config'), '[core]');
+        for (const [rel, content] of Object.entries(mockCloneFiles)) {
+          nodeFs.mkdirSync(nodePath.dirname(nodePath.join(dest, rel)), { recursive: true });
+          nodeFs.writeFileSync(nodePath.join(dest, rel), content);
+        }
+        mockCloneActive--;
+        callback(null, { stdout: '', stderr: '' });
+      });
+      return {} as any;
+    }
+
+    if (sub[0] === 'ls-files') {
+      const out = Object.keys(mockCloneFiles)
+        .map(
+          (rel) =>
+            '100644 ' +
+            require('crypto').createHash('sha1').update(mockCloneFiles[rel]).digest('hex') +
+            ' 0\t' +
+            rel +
+            '\0'
+        )
+        .join('');
+      callback(null, { stdout: out, stderr: '' });
       return {} as any;
     }
 
@@ -91,8 +138,49 @@ import {
   resetPrincipalQuota,
 } from '../../managers/guardrail/principal-quota';
 
+// The platform ops a redeploy requires: a reservation that is exclusive per app.
+const reservedNow = new Set<string>();
+function installOps(over: Partial<PlatformOps> = {}): void {
+  setPlatformOps(
+    makePlatformOpsStub({
+      tryReserveApp: (name: string) => {
+        if (reservedNow.has(name)) return null;
+        reservedNow.add(name);
+        return () => {
+          reservedNow.delete(name);
+        };
+      },
+      ...over,
+    })
+  );
+}
+
+/** The token caller for tests that are about something other than ownership. */
+const ADMIN: TokenCaller = { admin: true, interactive: true };
+const ALICE: TokenCaller = { userId: 'alice', admin: false };
+const BOB: TokenCaller = { userId: 'bob', admin: false };
+
+/**
+ * The service with an admin caller filled in where a test is about something
+ * other than ownership. The real signatures take the caller as a REQUIRED
+ * argument; the ownership tests pass theirs explicitly.
+ */
+class AdminService extends GitDeployService {
+  deploy(request: GitDeployRequest, caller: TokenCaller = ADMIN) {
+    return super.deploy(request, caller);
+  }
+  redeploy(appName: string, actor: DeployActor = {}, caller: TokenCaller | null = ADMIN) {
+    return super.redeploy(appName, actor, caller);
+  }
+}
+
+import { loadEmptySuspensionStore } from '../__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('GitDeployService', () => {
-  let service: GitDeployService;
+  let service: AdminService;
   let tempDir: string;
 
   beforeEach(async () => {
@@ -132,8 +220,10 @@ describe('GitDeployService', () => {
 
     // Create service
     resetGitDeployService();
-    service = new GitDeployService({ appsDirectory: appsDir });
+    service = new AdminService({ appsDirectory: appsDir });
     await service.initialize();
+    reservedNow.clear();
+    installOps();
 
     // The child_process mock above intercepts the PowerShell/df calls that
     // hasEnoughDisk relies on, which would otherwise make every disk check
@@ -572,7 +662,7 @@ describe('GitDeployService', () => {
     }
 
     /**
-     * Make the next `git pull` fail, whatever else redeploy() runs around it.
+     * Make the next `git clone` fail, whatever else redeploy() runs around it.
      *
      * These tests used to call `mockImplementationOnce` on the premise that
      * "the pull is the first execFile call redeploy() makes". It is not, and
@@ -588,7 +678,7 @@ describe('GitDeployService', () => {
       const original = mock.getMockImplementation() as (...a: unknown[]) => unknown;
       let fired = false;
       mock.mockImplementation((cmd: string, args: string[], opts: unknown, cb?: Function) => {
-        if (!fired && Array.isArray(args) && args.includes('pull')) {
+        if (!fired && Array.isArray(args) && args.includes('clone')) {
           fired = true;
           mock.mockImplementation(original);
           const callback = cb || (typeof opts === 'function' ? opts : undefined);
@@ -598,6 +688,26 @@ describe('GitDeployService', () => {
         return original(cmd, args, opts, cb);
       });
     }
+
+    it('deployActorOfInfo and publishRedeployUpdate are the one conversion and the one post-land publish', () => {
+      expect(
+        deployActorOfInfo({ principalId: 'p-1', actorUserId: 'u-1', automationSource: 'webhook', agent: true })
+      ).toEqual({ principalId: 'p-1', userId: 'u-1', automation: 'webhook' });
+
+      const seen: AppUpdatePayload[] = [];
+      const unsubscribe = eventBus.subscribe('app:update', (payload) => void seen.push(payload));
+      publishRedeployUpdate('some-app', '/apps/some-app', { principalId: 'p-1', userId: 'u-1' });
+      unsubscribe();
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatchObject({
+        name: 'some-app',
+        path: '/apps/some-app',
+        reason: 'git redeploy',
+        bypassCooldown: true,
+        principalId: 'p-1',
+        actorUserId: 'u-1',
+      });
+    });
 
     it('publishes app:update with bypassCooldown after a successful pull', async () => {
       const appName = 'redeploy-app';
@@ -661,23 +771,533 @@ describe('GitDeployService', () => {
       }
     });
 
-    it('rejects fast when .git is missing on disk, without attempting a pull (Fix 4)', async () => {
-      const appName = 'redeploy-no-git-app';
-      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
-      // Deliberately do NOT create .git — simulates an upload-deploy prune or
-      // a monorepo re-materialization that removed the real repository while
-      // gitSource stayed behind in state.
+    describe('landing tracked files (fresh clone per redeploy)', () => {
+      const appDir = (name: string): string => path.join(tempDir, 'webapps', name);
+      const exists = (p: string): Promise<boolean> =>
+        fs.lstat(p).then(
+          () => true,
+          () => false
+        );
 
-      const pullCallsBefore = (execFile as unknown as jest.Mock).mock.calls.filter(
-        (call) => call[1]?.[0] === 'pull' || call[1]?.includes('pull')
-      ).length;
+      beforeEach(() => {
+        mockCloneFiles = { 'index.html': '<h1>v1</h1>', 'src/app.js': 'v1' };
+        mockCloneGate = null;
+        mockCloneActive = 0;
+        mockCloneMaxActive = 0;
+      });
 
-      await expect(service.redeploy(appName)).rejects.toThrow(/has no git repository on disk/);
+      afterEach(() => {
+        resetPlatformOps();
+      });
 
-      const pullCallsAfter = (execFile as unknown as jest.Mock).mock.calls.filter(
-        (call) => call[1]?.[0] === 'pull' || call[1]?.includes('pull')
-      ).length;
-      expect(pullCallsAfter).toBe(pullCallsBefore);
+      it('clones the recorded URL into the clone base, runs nothing in the app folder, and removes the clone', async () => {
+        const appName = 'redeploy-fresh-clone';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        (execFile as unknown as jest.Mock).mockClear();
+
+        await service.redeploy(appName);
+
+        const calls = (execFile as unknown as jest.Mock).mock.calls;
+        const clone = calls.find((c) => (c[1] as string[]).includes('clone'));
+        expect(clone).toBeDefined();
+        const args = clone![1] as string[];
+        expect(args.slice(-2)[0]).toBe(`https://github.com/user/${appName}`);
+        const dest = args[args.length - 1];
+        expect(dest.startsWith(path.join(tempDir, 'webapps'))).toBe(false);
+        expect(dest).toContain(path.join(tempDir, 'temp', '.git-clones'));
+        await expect(fs.access(dest)).rejects.toThrow();
+        for (const c of calls) {
+          const opts = c[2] as { cwd?: string } | undefined;
+          expect(opts?.cwd ?? '').not.toContain(path.join(tempDir, 'webapps'));
+          expect((c[1] as string[]).includes('pull')).toBe(false);
+        }
+        const env = (clone![2] as { env: NodeJS.ProcessEnv }).env;
+        expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+      });
+
+      it('lands the tracked files but not the clone\'s .git', async () => {
+        const appName = 'land-files';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+
+        expect(await fs.readFile(path.join(appDir(appName), 'src', 'app.js'), 'utf-8')).toBe('v1');
+        expect(await exists(path.join(appDir(appName), '.git'))).toBe(false);
+      });
+
+      it('removes a leftover .git from the app folder on redeploy', async () => {
+        const appName = 'redeploy-removes-dotgit';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await makeGitDir(appName);
+
+        await service.redeploy(appName);
+
+        expect(await exists(path.join(appDir(appName), '.git'))).toBe(false);
+      });
+
+      it('leaves untracked files alone, and deletes upstream-removed files only because the saved list names them', async () => {
+        const appName = 'land-prune';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await fs.writeFile(path.join(appDir(appName), 'app-data.db'), 'state');
+
+        // Upstream drops src/app.js and adds a file.
+        mockCloneFiles = { 'index.html': '<h1>v2</h1>', 'new.txt': 'n' };
+        await service.redeploy(appName);
+
+        expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v2</h1>');
+        expect(await exists(path.join(appDir(appName), 'src', 'app.js'))).toBe(false);
+        expect(await fs.readFile(path.join(appDir(appName), 'app-data.db'), 'utf-8')).toBe('state');
+      });
+
+      it('prunes nothing on the first redeploy of an app that has no saved list', async () => {
+        const appName = 'land-no-manifest';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await fs.rm(path.join(tempDir, 'drop-svc', 'git-manifests'), { recursive: true, force: true });
+
+        mockCloneFiles = { 'index.html': '<h1>v2</h1>' };
+        await service.redeploy(appName);
+
+        expect(await exists(path.join(appDir(appName), 'src', 'app.js'))).toBe(true);
+      });
+
+      it('refuses a repository over the entry cap, and leaves the app as it was', async () => {
+        const appName = 'land-capped';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const capped = new GitDeployService({
+          appsDirectory: path.join(tempDir, 'webapps'),
+          maxEntries: 1,
+        });
+        await capped.initialize();
+        mockCloneFiles = { 'a.txt': 'a', 'b.txt': 'b' };
+
+        await expect(capped.redeploy(appName, {}, ADMIN)).rejects.toThrow(/maximum of 1 entries/);
+
+        expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+      });
+
+      it('refuses a redeploy while the platform is building or deploying the app', async () => {
+        const appName = 'land-in-progress';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        setPlatformOps({ isAppInProgress: () => true } as unknown as PlatformOps);
+        (execFile as unknown as jest.Mock).mockClear();
+
+        await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+
+        const cloned = (execFile as unknown as jest.Mock).mock.calls.some((c) =>
+          (c[1] as string[]).includes('clone')
+        );
+        expect(cloned).toBe(false);
+      });
+
+      it('serialises two redeploys of one app: their clone-and-land never overlap, and isCloning holds until the last ends', async () => {
+        const appName = 'land-serial';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        mockCloneMaxActive = 0;
+        let release!: () => void;
+        mockCloneGate = new Promise<void>((r) => {
+          release = r;
+        });
+
+        const first = service.redeploy(appName);
+        const second = service.redeploy(appName);
+        // Both are admitted and waiting; the gate keeps the first clone open.
+        await new Promise((r) => setTimeout(r, 50));
+        expect(service.isCloning(appName)).toBe(true);
+        release();
+        mockCloneGate = null;
+        await Promise.all([first, second]);
+
+        expect(mockCloneMaxActive).toBe(1);
+        expect(service.isCloning(appName)).toBe(false);
+      });
+
+      it('the platform sweeps leftovers from the clone base at initialize(); a CLI process never does', async () => {
+        const leftover = path.join(tempDir, 'temp', '.git-clones', 'crashed-abc');
+        await fs.mkdir(leftover, { recursive: true });
+
+        await service.initialize(); // no sweepCloneBase: the CLI shape
+        expect(await exists(leftover)).toBe(true);
+
+        const platformShaped = new GitDeployService({
+          appsDirectory: path.join(tempDir, 'webapps'),
+          sweepCloneBase: true,
+        });
+        await platformShaped.initialize();
+        expect(await exists(leftover)).toBe(false);
+      });
+
+      it('holds the platform reservation across clone and land, and releases it before app:update', async () => {
+        const appName = 'land-reserved';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        let open!: () => void;
+        mockCloneGate = new Promise<void>((r) => {
+          open = r;
+        });
+        const heldAtPublish: boolean[] = [];
+        const unsub = eventBus.subscribe('app:update', (p) => {
+          if (p.name === appName) heldAtPublish.push(reservedNow.has(appName));
+        });
+        try {
+          const run = service.redeploy(appName);
+          await new Promise((r) => setTimeout(r, 50));
+          // The clone is open: the slot is ours, so a build could not start.
+          expect(reservedNow.has(appName)).toBe(true);
+          open();
+          mockCloneGate = null;
+          await run;
+        } finally {
+          unsub();
+        }
+
+        expect(heldAtPublish).toEqual([false]);
+        expect(reservedNow.has(appName)).toBe(false);
+      });
+
+      it('reserves BEFORE charging the deploy quota: a refused attempt costs nothing', async () => {
+        const appName = 'land-no-charge';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const admit = jest.spyOn(breakerModule, 'admitDeploy');
+        admit.mockClear();
+        try {
+          reservedNow.add(appName);
+          await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+          reservedNow.clear();
+          installOps({ hasLiveBuildContainer: jest.fn().mockResolvedValue(true) });
+          await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+
+          expect(admit).not.toHaveBeenCalled();
+        } finally {
+          admit.mockRestore();
+        }
+      });
+
+      it('a first deploy appears in the apps folder whole, in one step, never half-landed', async () => {
+        const appName = 'land-atomic-first';
+        mockCloneFiles = { 'index.html': '<h1>v1</h1>', 'src/app.js': 'v1' };
+        let open!: () => void;
+        mockCloneGate = new Promise<void>((r) => {
+          open = r;
+        });
+
+        const run = service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await new Promise((r) => setTimeout(r, 50));
+        expect(await exists(appDir(appName))).toBe(false);
+        open();
+        mockCloneGate = null;
+        await run;
+
+        expect(await fs.readFile(path.join(appDir(appName), 'src', 'app.js'), 'utf-8')).toBe('v1');
+        expect(await exists(path.join(appDir(appName), '.git'))).toBe(false);
+        // No staging directory is left in the clone base.
+        const base = path.join(tempDir, 'temp', '.git-clones');
+        expect(await fs.readdir(base).catch(() => [])).toEqual([]);
+        // The saved list was written for the next redeploy.
+        expect(await exists(path.join(tempDir, 'drop-svc', 'git-manifests', `${appName}.json`))).toBe(true);
+      });
+
+      it('a first deploy refused as busy (quiesced, or a stale build container) is an AppInProgressError', async () => {
+        installOps({ tryReserveApp: () => null });
+        await expect(
+          service.deploy({ repoUrl: 'https://github.com/user/land-first-busy', branch: 'main' })
+        ).rejects.toBeInstanceOf(AppInProgressError);
+        expect(getStateManager().hasApp('land-first-busy')).toBe(false);
+        expect(await exists(appDir('land-first-busy'))).toBe(false);
+
+        installOps({ hasLiveBuildContainer: jest.fn().mockResolvedValue(true) });
+        await expect(
+          service.deploy({ repoUrl: 'https://github.com/user/land-first-busy', branch: 'main' })
+        ).rejects.toBeInstanceOf(AppInProgressError);
+        expect(reservedNow.size).toBe(0);
+      });
+
+      it('queued redeploys are saved to disk and come back after a restart', async () => {
+        const appName = 'land-queue-persist';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+
+        service.queueRedeploy(appName, { automation: 'webhook' });
+        await new Promise((r) => setTimeout(r, 50));
+        const file = path.join(tempDir, 'drop-svc', 'git-pending-redeploys.json');
+        expect(JSON.parse(await fs.readFile(file, 'utf-8'))).toEqual({
+          [appName]: { automation: 'webhook' },
+        });
+        service.dispose();
+
+        const restarted = new GitDeployService({
+          appsDirectory: path.join(tempDir, 'webapps'),
+          resumeQueue: true,
+        });
+        await restarted.initialize();
+        expect((restarted as unknown as { pending: Map<string, unknown> }).pending.has(appName)).toBe(true);
+        restarted.dispose();
+
+        // A CLI-shaped service does not pick the queue up.
+        const cli = new GitDeployService({ appsDirectory: path.join(tempDir, 'webapps') });
+        await cli.initialize();
+        expect((cli as unknown as { pending: Map<string, unknown> }).pending.size).toBe(0);
+        cli.dispose();
+      });
+
+      it('a queued redeploy that fails is recorded as a failed deploy and in the activity log', async () => {
+        const appName = 'land-queue-fails';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        resetDeployTracker();
+        getDeployTracker(path.join(tempDir, 'deploys.json'));
+        const logSpy = jest.spyOn(activity, 'logActivityFor').mockResolvedValue();
+        const failed: Array<{ appId: string }> = [];
+        const unsub = eventBus.subscribe('build:failed', (p) => {
+          failed.push({ appId: p.appId });
+        });
+        try {
+          service.queueRedeploy(appName, { automation: 'webhook' });
+          failNextPull('fatal: repository not found');
+
+          await (service as unknown as { flushPending(): Promise<void> }).flushPending();
+
+          expect(logSpy).toHaveBeenCalledTimes(1);
+          expect(logSpy.mock.calls[0][1]).toMatchObject({ action: 'redeploy', appName });
+          expect(String(logSpy.mock.calls[0][1].detail)).toContain('queued redeploy failed');
+          expect(failed).toEqual([{ appId: appName }]);
+        } finally {
+          unsub();
+          logSpy.mockRestore();
+          resetDeployTracker();
+          service.dispose();
+        }
+      });
+
+      it('a failure listing the tracked files carries no argv or absolute path either', async () => {
+        const appName = 'land-lsfiles-fails';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const mock = execFile as unknown as jest.Mock;
+        const original = mock.getMockImplementation() as (...a: unknown[]) => unknown;
+        mock.mockImplementation((cmd: string, args: string[], opts: unknown, cb?: Function) => {
+          if (Array.isArray(args) && args.includes('ls-files')) {
+            mock.mockImplementation(original);
+            const callback = (cb || opts) as (e: Error) => void;
+            callback(
+              Object.assign(new Error('Command failed: git ' + args.join(' ') + ' in ' + tempDir), {
+                code: 128,
+                stderr: 'fatal: index file corrupt',
+              })
+            );
+            return {} as unknown;
+          }
+          return original(cmd, args, opts, cb);
+        });
+
+        const err = await service.redeploy(appName).catch((e: Error) => e);
+
+        expect((err as Error).message).toContain('exit 128');
+        expect((err as Error).message).not.toContain('ls-files');
+        expect((err as Error).message).not.toContain(tempDir);
+      });
+
+      it('refuses to land while the reservation is taken, a build container is alive, or a monorepo child is busy', async () => {
+        const appName = 'land-refused';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        (execFile as unknown as jest.Mock).mockClear();
+
+        reservedNow.add(appName);
+        await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+        reservedNow.clear();
+
+        installOps({ hasLiveBuildContainer: jest.fn().mockResolvedValue(true) });
+        await expect(service.redeploy(appName)).rejects.toBeInstanceOf(AppInProgressError);
+        // The failed attempt released what it took.
+        expect(reservedNow.has(appName)).toBe(false);
+
+        const cloned = (execFile as unknown as jest.Mock).mock.calls.some((c) =>
+          (c[1] as string[]).includes('clone')
+        );
+        expect(cloned).toBe(false);
+
+        const group = 'grp';
+        await getStateManager().registerApp('grp-container', path.join(tempDir, 'webapps', 'grp-container'));
+        await getStateManager().updateApp('grp-container', {
+          group,
+          isGroupContainer: true,
+          gitSource: { repoUrl: 'https://github.com/user/grp', branch: 'main' },
+        } as Record<string, unknown>);
+        await getStateManager().registerApp('grp-child', path.join(tempDir, 'webapps', 'grp-child'));
+        await getStateManager().updateApp('grp-child', { group } as Record<string, unknown>);
+        // The group rule is the platform's (isGroupBusy; its own test pins the scan).
+        installOps({ isGroupBusy: (n: string) => n === 'grp-container' });
+        await expect(service.redeploy('grp-container')).rejects.toBeInstanceOf(AppInProgressError);
+      });
+
+      it('fails closed when platform operations are unavailable, as a busy-kind error', async () => {
+        const appName = 'land-no-ops';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        resetPlatformOps();
+
+        const err = await service.redeploy(appName).catch((e: Error) => e);
+        expect(err).toBeInstanceOf(PlatformNotReadyError);
+        expect(err).toBeInstanceOf(AppInProgressError);
+        expect((err as Error).message).toMatch(/unavailable/);
+      });
+
+      it('the queue keeps its entries while the platform has not published its operations (boot) or has withdrawn them (shutdown)', async () => {
+        const appName = 'land-queue-boot';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const pending = (): Map<string, unknown> =>
+          (service as unknown as { pending: Map<string, unknown> }).pending;
+        const flush = (): Promise<void> =>
+          (service as unknown as { flushPending(): Promise<void> }).flushPending();
+        const redeploy = jest.spyOn(service, 'redeploy');
+        const failures: string[] = [];
+        const unsub = eventBus.subscribe('build:failed', (p) => {
+          failures.push(p.appId);
+        });
+        try {
+          // Boot: the timer fires before setPlatformOps.
+          resetPlatformOps();
+          service.queueRedeploy(appName, { automation: 'webhook' });
+          await flush();
+          expect(redeploy).not.toHaveBeenCalled();
+          expect(pending().has(appName)).toBe(true);
+          expect(failures).toEqual([]);
+
+          // Shutdown race: the operations vanish after the flush started.
+          installOps();
+          redeploy.mockRejectedValueOnce(new PlatformNotReadyError(appName));
+          await flush();
+          expect(pending().has(appName)).toBe(true);
+          expect(failures).toEqual([]);
+
+          // Once ready, it runs and leaves the queue.
+          redeploy.mockRestore();
+          await flush();
+          expect(pending().has(appName)).toBe(false);
+        } finally {
+          unsub();
+          service.dispose();
+        }
+      });
+
+      it('a first deploy is staged inside the apps folder (one volume) under a hidden name, and renamed into place', async () => {
+        const appName = 'land-stage-parent';
+        const rename = jest.spyOn(require('fs/promises'), 'rename');
+        try {
+          await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+          const call = rename.mock.calls.find((c) => String(c[1]) === appDir(appName));
+          expect(call).toBeDefined();
+          expect(path.dirname(String(call![0]))).toBe(path.join(tempDir, 'webapps'));
+          expect(path.basename(String(call![0])).startsWith('.drop-stage-')).toBe(true);
+        } finally {
+          rename.mockRestore();
+        }
+      });
+
+      it('only EEXIST/ENOTEMPTY mean "already exists"; any other rename error surfaces as it is', async () => {
+        const realFs = require('fs/promises');
+        const original = realFs.rename.bind(realFs);
+        const rename = jest.spyOn(realFs, 'rename');
+        // Fail only the rename INTO the app folder (the platform's own atomic
+        // state writes also rename, and must keep working).
+        const failInto = (name: string, code: string): void => {
+          rename.mockImplementation(async (from: unknown, to: unknown) => {
+            if (String(to) === appDir(name)) {
+              throw Object.assign(new Error(`${code}: simulated`), { code });
+            }
+            return original(from, to);
+          });
+        };
+        try {
+          failInto('land-rename-a', 'EEXIST');
+          await expect(
+            service.deploy({ repoUrl: 'https://github.com/user/land-rename-a', branch: 'main' })
+          ).rejects.toThrow(/already exists/);
+
+          failInto('land-rename-b', 'EPERM');
+          const err = await service
+            .deploy({ repoUrl: 'https://github.com/user/land-rename-b', branch: 'main' })
+            .catch((e: Error) => e);
+          expect((err as Error).message).toContain('EPERM');
+          expect((err as Error).message).not.toMatch(/already exists/);
+        } finally {
+          rename.mockRestore();
+        }
+      });
+
+      it('the platform removes a stage left by a crashed first deploy at boot', async () => {
+        const leftover = path.join(tempDir, 'webapps', '.drop-stage-crashed-abc123');
+        await fs.mkdir(leftover, { recursive: true });
+
+        const platformShaped = new GitDeployService({
+          appsDirectory: path.join(tempDir, 'webapps'),
+          sweepCloneBase: true,
+        });
+        await platformShaped.initialize();
+
+        expect(await exists(leftover)).toBe(false);
+      });
+
+      it('a push refused as busy is queued (latest wins) and runs once the app is free', async () => {
+        const appName = 'land-queued';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        installOps({ isAppInProgress: () => true });
+        await expect(service.redeploy(appName, { automation: 'webhook' })).rejects.toBeInstanceOf(
+          AppInProgressError
+        );
+        service.queueRedeploy(appName, { automation: 'webhook' });
+        service.queueRedeploy(appName, { automation: 'webhook' });
+        mockCloneFiles = { 'index.html': '<h1>queued</h1>' };
+        const flush = (): Promise<void> =>
+          (service as unknown as { flushPending(): Promise<void> }).flushPending();
+
+        await flush(); // still busy: stays queued
+        expect(await exists(path.join(appDir(appName), 'queued.txt'))).toBe(false);
+        expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+
+        installOps();
+        await flush();
+        expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>queued</h1>');
+        service.dispose();
+      });
+
+      it('a first deploy that loses the folder race leaves the other creator\'s folder alone', async () => {
+        const appName = 'land-race';
+        let open!: () => void;
+        mockCloneGate = new Promise<void>((r) => {
+          open = r;
+        });
+
+        const run = service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        await new Promise((r) => setTimeout(r, 50));
+        // Someone else takes the folder while the clone is in flight.
+        await fs.mkdir(appDir(appName), { recursive: true });
+        await fs.writeFile(path.join(appDir(appName), 'theirs.txt'), 'not ours');
+        open();
+        mockCloneGate = null;
+
+        await expect(run).rejects.toThrow(/already exists/);
+        expect(await fs.readFile(path.join(appDir(appName), 'theirs.txt'), 'utf-8')).toBe('not ours');
+      });
+
+      it('a clone error carries no argv or absolute temp path', async () => {
+        const appName = 'land-error-text';
+        await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+        const mock = execFile as unknown as jest.Mock;
+        const original = mock.getMockImplementation() as (...a: unknown[]) => unknown;
+        mock.mockImplementation((cmd: string, args: string[], opts: unknown, cb?: Function) => {
+          if (Array.isArray(args) && args.includes('clone')) {
+            mock.mockImplementation(original);
+            const callback = (cb || opts) as (e: Error) => void;
+            callback(
+              Object.assign(new Error('Command failed: git clone ' + args.join(' ')), {
+                code: 128,
+                stderr: 'fatal: could not read from remote repository',
+              })
+            );
+            return {} as unknown;
+          }
+          return original(cmd, args, opts, cb);
+        });
+
+        const err = await service.redeploy(appName).catch((e: Error) => e);
+
+        expect((err as Error).message).toContain('exit 128');
+        expect((err as Error).message).not.toContain('--depth');
+        expect((err as Error).message).not.toContain(tempDir);
+      });
     });
 
     describe('token attach (DROP-142)', () => {
@@ -691,7 +1311,7 @@ describe('GitDeployService', () => {
         await makeGitDir(appName);
         const stored = await service.setToken('recovery-token', 'ghp_recoveryvalue');
 
-        const result = await service.redeploy(appName, { tokenId: stored.id });
+        const result = await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
 
         expect(result.appName).toBe(appName);
         const app = getStateManager().getApp(appName);
@@ -711,7 +1331,7 @@ describe('GitDeployService', () => {
 
         failNextPull();
 
-        await expect(service.redeploy(appName, { tokenId: stored.id })).rejects.toThrow();
+        await expect(service.redeploy(appName, { tokenId: stored.id }, ADMIN)).rejects.toThrow();
         const app = getStateManager().getApp(appName);
         expect(app?.gitSource?.tokenId).toBeUndefined();
       });
@@ -724,7 +1344,7 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('kept-token', 'ghp_keptvalue');
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
 
         failNextPull();
@@ -738,7 +1358,7 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('to-clear', 'ghp_toclear');
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
 
         await service.redeploy(appName, { tokenId: null });
@@ -760,7 +1380,7 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('leaked-token', 'ghp_leaked');
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(stored.id);
 
         failNextPull();
@@ -778,7 +1398,7 @@ describe('GitDeployService', () => {
         await makeGitDir(appName);
 
         await expect(
-          service.redeploy(appName, { tokenId: 'git_doesnotexist' })
+          service.redeploy(appName, { tokenId: 'git_doesnotexist' }, ADMIN)
         ).rejects.toThrow(/GitHub token 'git_doesnotexist' not found/);
         expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBeUndefined();
       });
@@ -792,8 +1412,8 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('vanishing', 'ghp_vanishing');
-        await service.redeploy(appName, { tokenId: stored.id });
-        await service.removeToken(stored.id);
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
+        await service.removeToken(stored.id, ADMIN);
 
         await expect(service.redeploy(appName)).resolves.toBeDefined();
       });
@@ -803,7 +1423,7 @@ describe('GitDeployService', () => {
         await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
         await makeGitDir(appName);
         const stored = await service.setToken('unchanged', 'ghp_unchanged');
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
 
         await service.redeploy(appName);
 
@@ -831,7 +1451,7 @@ describe('GitDeployService', () => {
         const secretValue = 'ghp_totallysecretvalue';
         const stored = await service.setToken('argv-check', secretValue);
 
-        await service.redeploy(appName, { tokenId: stored.id });
+        await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
 
         for (const call of (execFile as unknown as jest.Mock).mock.calls) {
           const args = (call[1] ?? []) as string[];
@@ -860,7 +1480,7 @@ describe('GitDeployService', () => {
         await fs.mkdir(path.join(tempDir, 'webapps', 'grp-container', '.git'), { recursive: true });
         const stored = await service.setToken('group-token', 'ghp_groupvalue');
 
-        await service.redeploy('grp-container', { tokenId: stored.id });
+        await service.redeploy('grp-container', { tokenId: stored.id }, ADMIN);
 
         expect(sm.getApp('grp-container')?.gitSource?.tokenId).toBe(stored.id);
         expect(sm.getApp('grp-child')?.gitSource).toBeUndefined();
@@ -878,7 +1498,7 @@ describe('GitDeployService', () => {
       await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
       await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
       const stored = await service.setToken('restart-token', 'ghp_restartvalue');
-      await service.redeploy(appName, { tokenId: stored.id });
+      await service.redeploy(appName, { tokenId: stored.id }, ADMIN);
 
       // Flush the debounced save and tear down the live instance, mirroring
       // an actual shutdown.
@@ -906,23 +1526,694 @@ describe('GitDeployService', () => {
       expect(token.id).toBeDefined();
       expect(token.name).toBe('my-token');
 
-      const tokens = service.listTokens();
+      const tokens = service.listTokens(ADMIN);
       expect(tokens.length).toBe(1);
       expect(tokens[0].name).toBe('my-token');
     });
 
     it('should remove tokens', async () => {
       const token = await service.setToken('to-delete', 'ghp_xyz');
-      expect(service.listTokens().length).toBe(1);
+      expect(service.listTokens(ADMIN).length).toBe(1);
 
-      const deleted = await service.removeToken(token.id);
+      const deleted = await service.removeToken(token.id, ADMIN);
       expect(deleted).toBe(true);
-      expect(service.listTokens().length).toBe(0);
+      expect(service.listTokens(ADMIN).length).toBe(0);
     });
 
     it('should return false when removing non-existent token', async () => {
-      const deleted = await service.removeToken('non-existent');
+      const deleted = await service.removeToken('non-existent', ADMIN);
       expect(deleted).toBe(false);
+    });
+  });
+
+  describe('token ownership', () => {
+    async function makeGitDir(appName: string): Promise<void> {
+      await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
+    }
+
+    it('lists only the caller\'s own tokens; an admin sees all, with owners', async () => {
+      const a = await service.setToken('alice-pat', 'ghp_alice', 'alice');
+      const b = await service.setToken('bob-pat', 'ghp_bob', 'bob');
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+
+      expect(service.listTokens(ALICE).map((t) => t.id)).toEqual([a.id]);
+      expect(service.listTokens(BOB).map((t) => t.id)).toEqual([b.id]);
+      const all = service.listTokens(ADMIN);
+      expect(all.map((t) => t.id).sort()).toEqual([a.id, b.id, legacy.id].sort());
+      expect(all.find((t) => t.id === a.id)?.ownerUserId).toBe('alice');
+      expect(all.find((t) => t.id === legacy.id)?.ownerUserId).toBeUndefined();
+      // The owner field is an admin-view detail only.
+      expect(service.listTokens(ALICE)[0].ownerUserId).toBeUndefined();
+    });
+
+    it('a legacy ownerless token is invisible and undeletable to a non-admin, manageable by an admin', async () => {
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+
+      expect(service.listTokens(ALICE)).toEqual([]);
+      expect(await service.removeToken(legacy.id, ALICE)).toBe(false);
+      expect(service.listTokens(ADMIN)).toHaveLength(1);
+      expect(await service.removeToken(legacy.id, ADMIN)).toBe(true);
+    });
+
+    it('a foreign token deletes exactly like an unknown id, and survives', async () => {
+      const b = await service.setToken('bob-pat', 'ghp_bob', 'bob');
+
+      expect(await service.removeToken(b.id, ALICE)).toBe(false);
+      expect(await service.removeToken('git_doesnotexist', ALICE)).toBe(false);
+      expect(service.listTokens(BOB)).toHaveLength(1);
+      expect(await service.removeToken(b.id, BOB)).toBe(true);
+      // The owner record goes with the token.
+      expect(JSON.parse(getSecretManager().get('__drop_git_token_owners', 'owners') ?? '{}')).toEqual({});
+    });
+
+    it('deploy refuses a foreign token with the same error as an unknown one', async () => {
+      const b = await service.setToken('bob-pat', 'ghp_bob', 'bob');
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/foreign', branch: 'main', tokenId: b.id }, ALICE)
+      ).rejects.toThrow(`GitHub token '${b.id}' not found`);
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/legacy', branch: 'main', tokenId: legacy.id }, ALICE)
+      ).rejects.toThrow(/GitHub token .* not found/);
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/unk', branch: 'main', tokenId: 'git_nope' }, ALICE)
+      ).rejects.toThrow("GitHub token 'git_nope' not found");
+    });
+
+    it('deploy accepts the owner\'s token and an admin\'s choice of any token', async () => {
+      const a = await service.setToken('alice-pat', 'ghp_alice', 'alice');
+
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/mine', branch: 'main', tokenId: a.id }, ALICE)
+      ).resolves.toBeDefined();
+      await expect(
+        service.deploy({ repoUrl: 'https://github.com/acme/admins', branch: 'main', tokenId: a.id }, ADMIN)
+      ).resolves.toBeDefined();
+    });
+
+    it('redeploy refuses to ATTACH a foreign or legacy token and persists nothing', async () => {
+      const appName = 'attach-foreign';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      await makeGitDir(appName);
+      const b = await service.setToken('bob-pat', 'ghp_bob', 'bob');
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+
+      await expect(service.redeploy(appName, { tokenId: b.id }, ALICE)).rejects.toThrow(/GitHub token .* not found/);
+      await expect(service.redeploy(appName, { tokenId: legacy.id }, ALICE)).rejects.toThrow(
+        /GitHub token .* not found/
+      );
+      expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBeUndefined();
+
+      await expect(service.redeploy(appName, { tokenId: legacy.id }, ADMIN)).resolves.toBeDefined();
+      expect(getStateManager().getApp(appName)?.gitSource?.tokenId).toBe(legacy.id);
+    });
+
+    it('an already-attached legacy token keeps being used by owner, API and webhook redeploys without a re-check', async () => {
+      const appName = 'attached-legacy';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      await makeGitDir(appName);
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacyvalue');
+      await service.redeploy(appName, { tokenId: legacy.id }, ADMIN);
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy(appName, { userId: 'alice' }, ALICE);
+      await service.redeploy(appName, { automation: 'webhook' }, null);
+      await service.redeploy(appName, {}, null);
+
+      expect(pull).toHaveBeenCalledTimes(3);
+      for (const call of pull.mock.calls) expect(call[0].token).toBe('ghp_legacyvalue');
+      pull.mockRestore();
+    });
+  });
+
+  describe('token ownership: attached tokens, grants, transfer', () => {
+    async function makeGitDir(appName: string): Promise<void> {
+      await fs.mkdir(path.join(tempDir, 'webapps', appName, '.git'), { recursive: true });
+    }
+    const pullTokens = (pull: jest.SpyInstance) => pull.mock.calls.map((c) => (c[0] as { token?: string }).token);
+
+    async function attachedApp(appName: string, owner: string, tokenOwner: string | undefined, tokenValue: string) {
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main', userId: owner });
+      await makeGitDir(appName);
+      const t = await service.setToken(`${appName}-pat`, tokenValue, tokenOwner);
+      await service.redeploy(appName, { tokenId: t.id }, ADMIN);
+      return t;
+    }
+
+    it('an ownership transfer drops a credential owned by the previous owner', async () => {
+      const t = await attachedApp('transferred', 'alice', 'alice', 'ghp_alices');
+      await getStateManager().updateApp('transferred', { userId: 'carol' } as Record<string, unknown>);
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('transferred', {}, { userId: 'carol', admin: false });
+      await service.redeploy('transferred', {}, null);
+
+      expect(pullTokens(pull)).toEqual([undefined, undefined]);
+      pull.mockRestore();
+      expect(t.id).toBeDefined();
+    });
+
+    it('naming the attached id again resolves as attached, so a transferred credential is refused with the usual error', async () => {
+      const t = await attachedApp('named-again', 'alice', 'alice', 'ghp_alices');
+      await getStateManager().updateApp('named-again', { userId: 'carol' } as Record<string, unknown>);
+
+      await expect(
+        service.redeploy('named-again', { tokenId: t.id }, { userId: 'carol', admin: false })
+      ).rejects.toThrow(`GitHub token '${t.id}' not found`);
+    });
+
+    it('landUnderHold (the platform redeploy) uses the attached token only: the owner\'s or a granted one, never a stranger\'s', async () => {
+      // No tokenId in the actor: this surface cannot choose a token.
+      const land = (name: string): Promise<unknown> =>
+        service.landUnderHold(getStateManager().getApp(name)!, { principalId: 'p-1' }, null);
+
+      // The owner's own token, attached. After a transfer it is a stranger's.
+      await attachedApp('land-owned', 'alice', 'alice', 'ghp_alices');
+      // Another user's token, attached by an admin: the grant makes it usable,
+      // and it is void once the app has another owner.
+      await service.deploy({ repoUrl: 'https://github.com/user/land-granted', branch: 'main', userId: 'alice' });
+      await makeGitDir('land-granted');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      await service.redeploy('land-granted', { tokenId: b.id }, { admin: true, userId: 'root-admin', interactive: true });
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await land('land-owned');
+      await getStateManager().updateApp('land-owned', { userId: 'carol' } as Record<string, unknown>);
+      await land('land-owned');
+      await land('land-granted');
+      await getStateManager().updateApp('land-granted', { userId: 'carol' } as Record<string, unknown>);
+      await land('land-granted');
+
+      expect(pullTokens(pull)).toEqual(['ghp_alices', undefined, 'ghp_bobs', undefined]);
+      pull.mockRestore();
+    });
+
+    it('naming the attached id again works for a legacy token a non-admin could not newly choose', async () => {
+      const t = await attachedApp('legacy-again', 'alice', undefined, 'ghp_legacyvalue');
+
+      await expect(
+        service.redeploy('legacy-again', { tokenId: t.id }, { userId: 'alice', admin: false })
+      ).resolves.toBeDefined();
+      // ...while a different legacy token is still refused.
+      const other = await service.setToken('other-legacy', 'ghp_other');
+      await expect(
+        service.redeploy('legacy-again', { tokenId: other.id }, { userId: 'alice', admin: false })
+      ).rejects.toThrow(/GitHub token .* not found/);
+    });
+
+    it('an admin attaching another user\'s token records the grant, and the grant is honoured and cleared with the token', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/granted', branch: 'main', userId: 'alice' });
+      await makeGitDir('granted');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const admin: TokenCaller = { admin: true, userId: 'root-admin', interactive: true };
+
+      await service.redeploy('granted', { tokenId: b.id }, admin);
+      expect(getStateManager().getApp('granted')?.gitSource?.tokenGrantedBy).toBe('root-admin');
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('granted', {}, { userId: 'alice', admin: false });
+      await service.redeploy('granted', {}, null);
+      expect(pullTokens(pull)).toEqual(['ghp_bobs', 'ghp_bobs']);
+      pull.mockRestore();
+
+      await service.redeploy('granted', { tokenId: null }, admin);
+      const src = getStateManager().getApp('granted')?.gitSource;
+      expect(src?.tokenId).toBeUndefined();
+      expect(src?.tokenGrantedBy).toBeUndefined();
+    });
+
+    it('an admin using the app owner\'s own token records no grant', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/plain', branch: 'main', userId: 'alice' });
+      await makeGitDir('plain');
+      const a = await service.setToken('alice-pat', 'ghp_alices', 'alice');
+
+      await service.redeploy('plain', { tokenId: a.id }, { admin: true, userId: 'root-admin', interactive: true });
+      expect(getStateManager().getApp('plain')?.gitSource?.tokenGrantedBy).toBeUndefined();
+    });
+
+    it('setTokenOwner makes a legacy token usable by its new owner and reports an unknown id', async () => {
+      const legacy = await service.setToken('legacy-pat', 'ghp_legacy');
+      expect(service.listTokens(ALICE)).toEqual([]);
+
+      expect(await service.setTokenOwner(legacy.id, 'alice', 'root-admin')).toMatchObject({ status: 'ok' });
+      expect(service.listTokens(ALICE).map((t) => t.id)).toEqual([legacy.id]);
+      expect(await service.setTokenOwner('git_nope', 'alice', 'root-admin')).toEqual({ status: 'unknown-token' });
+    });
+
+    it('removeTokensOwnedBy deletes only that user\'s tokens and owner records', async () => {
+      const a1 = await service.setToken('a1', 'ghp_a1', 'alice');
+      await service.setToken('a2', 'ghp_a2', 'alice');
+      const b = await service.setToken('b1', 'ghp_b1', 'bob');
+      const legacy = await service.setToken('legacy', 'ghp_l');
+
+      expect(await service.removeTokensOwnedBy('alice')).toBe(2);
+      expect(service.listTokens(ADMIN).map((t) => t.id).sort()).toEqual([b.id, legacy.id].sort());
+      expect(service.listTokens(ALICE)).toEqual([]);
+      expect(a1.id).toBeDefined();
+    });
+
+    it('a queued redeploy runs with the attached token only; a token named in the queue is refused', async () => {
+      await attachedApp('queued-tok', 'alice', 'alice', 'ghp_alices');
+      const bobs = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const flush = (): Promise<void> =>
+        (service as unknown as { flushPending(): Promise<void> }).flushPending();
+      const clone = jest.spyOn(gitClient, 'gitClone');
+
+      service.queueRedeploy('queued-tok', { automation: 'webhook' });
+      await flush();
+      expect(pullTokens(clone)).toEqual(['ghp_alices']);
+
+      // A persisted actor naming someone else's token has no caller to vouch for it.
+      service.queueRedeploy('queued-tok', { automation: 'webhook', tokenId: bobs.id });
+      await flush();
+      expect(pullTokens(clone)).toEqual(['ghp_alices']);
+      expect(getStateManager().getApp('queued-tok')?.gitSource?.tokenId).not.toBe(bobs.id);
+      clone.mockRestore();
+      service.dispose();
+    });
+
+    it('the boot audit flags only ownerless tokens attached to non-admin apps', async () => {
+      await attachedApp('audit-legacy', 'alice', undefined, 'ghp_l');
+      await attachedApp('audit-owned', 'alice', 'alice', 'ghp_o');
+
+      expect(await service.auditLegacyAttachments()).toBe(1);
+    });
+
+    it('assigning an owner grants nothing by itself: cross-owner apps are reported and nothing is written', async () => {
+      const t = await attachedApp('kept-going', 'carol', undefined, 'ghp_legacyvalue');
+
+      const res = await service.setTokenOwner(t.id, 'alice', 'root-admin');
+
+      expect(res).toEqual({ status: 'needs-decision', apps: ['kept-going'] });
+      expect(getStateManager().getApp('kept-going')?.gitSource?.tokenGrantedBy).toBeUndefined();
+      // The owner was not assigned either: the token is still legacy.
+      expect(service.listTokens(ALICE)).toEqual([]);
+    });
+
+    it('keepAttached grants only the named app; an unlisted one then fails closed', async () => {
+      const t = await attachedApp('kept-going', 'carol', undefined, 'ghp_legacyvalue');
+      await service.deploy({ repoUrl: 'https://github.com/user/dropped', branch: 'main', userId: 'dave' });
+      await service.redeploy('dropped', { tokenId: t.id }, ADMIN);
+      await attachedApp('own-app', 'alice', undefined, 'ghp_other');
+
+      const res = await service.setTokenOwner(t.id, 'alice', 'root-admin', ['kept-going']);
+
+      expect(res).toEqual({ status: 'ok', granted: ['kept-going'], failing: ['dropped'] });
+      const kept = getStateManager().getApp('kept-going')?.gitSource;
+      expect(kept?.tokenGrantedBy).toBe('root-admin');
+      expect(kept?.tokenGrantedFor).toBe('carol');
+      expect(getStateManager().getApp('dropped')?.gitSource?.tokenGrantedBy).toBeUndefined();
+      // An app already owned by the new owner needs no grant.
+      expect(getStateManager().getApp('own-app')?.gitSource?.tokenGrantedBy).toBeUndefined();
+
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('kept-going', {}, null);
+      await service.redeploy('dropped', {}, null);
+      expect(pullTokens(pull)).toEqual(['ghp_legacyvalue', undefined]);
+      pull.mockRestore();
+    });
+
+    it('an explicit empty keepAttached proceeds and grants nothing', async () => {
+      const t = await attachedApp('kept-going', 'carol', undefined, 'ghp_legacyvalue');
+
+      expect(await service.setTokenOwner(t.id, 'alice', 'root-admin', [])).toEqual({
+        status: 'ok',
+        granted: [],
+        failing: ['kept-going'],
+      });
+      expect(service.listTokens(ALICE).map((x) => x.id)).toEqual([t.id]);
+    });
+
+    it('a grant is honoured only while the app still has the owner it was made for', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/bound', branch: 'main', userId: 'alice' });
+      await makeGitDir('bound');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      await service.redeploy('bound', { tokenId: b.id }, { admin: true, userId: 'root-admin', interactive: true });
+      expect(getStateManager().getApp('bound')?.gitSource?.tokenGrantedFor).toBe('alice');
+
+      await getStateManager().updateApp('bound', { userId: 'carol' } as Record<string, unknown>);
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      await service.redeploy('bound', {}, null);
+      expect(pullTokens(pull)).toEqual([undefined]);
+      pull.mockRestore();
+    });
+
+    it('an admin who is not in an interactive session may use only their own tokens', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/keyed', branch: 'main', userId: 'alice' });
+      await makeGitDir('keyed');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const mine = await service.setToken('admin-pat', 'ghp_mine', 'root-admin');
+      const keyAdmin: TokenCaller = { admin: true, userId: 'root-admin', interactive: false };
+
+      await expect(service.redeploy('keyed', { tokenId: b.id }, keyAdmin)).rejects.toThrow(/GitHub token .* not found/);
+      await expect(service.redeploy('keyed', { tokenId: mine.id }, keyAdmin)).resolves.toBeDefined();
+    });
+
+    it('a redeploy whose credential was cleared while it pulled does not write the old one back', async () => {
+      const t = await attachedApp('raced', 'alice', 'alice', 'ghp_alices');
+      const original = gitClient.gitClone;
+      const pull = jest.spyOn(gitClient, 'gitClone').mockImplementation(async (...args) => {
+        // The revocation lands mid-pull.
+        const sm = getStateManager();
+        const cur = sm.getApp('raced')!.gitSource!;
+        await sm.updateApp('raced', { gitSource: { ...cur, tokenId: undefined } } as Record<string, unknown>);
+        return original(...(args as Parameters<typeof original>));
+      });
+
+      await service.redeploy('raced', {}, ALICE);
+      pull.mockRestore();
+
+      const src = getStateManager().getApp('raced')?.gitSource;
+      expect(src?.tokenId).toBeUndefined();
+      expect(src?.lastCommitSha).toBeDefined();
+      expect(t.id).toBeDefined();
+    });
+
+    it('a redeploy never restores a grant that setTokenOwner revoked during its clone', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/revoked', branch: 'main', userId: 'alice' });
+      await makeGitDir('revoked');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const admin: TokenCaller = { admin: true, userId: 'root-admin', interactive: true };
+      await service.redeploy('revoked', { tokenId: b.id }, admin);
+      expect(getStateManager().getApp('revoked')?.gitSource?.tokenGrantedBy).toBe('root-admin');
+
+      const original = gitClient.gitClone;
+      let revoked = false;
+      const pull = jest.spyOn(gitClient, 'gitClone').mockImplementation(async (...args) => {
+        if (!revoked) {
+          revoked = true;
+          // The admin hands the token to someone else, keeping nothing attached.
+          await service.setTokenOwner(b.id, 'carol', 'root-admin', []);
+        }
+        return original(...(args as Parameters<typeof original>));
+      });
+
+      await service.redeploy('revoked', {}, null);
+
+      const src = getStateManager().getApp('revoked')?.gitSource;
+      expect(src?.tokenId).toBe(b.id);
+      expect(src?.tokenGrantedBy).toBeUndefined();
+      expect(src?.tokenGrantedFor).toBeUndefined();
+      expect(src?.lastCommitSha).toBeDefined();
+
+      pull.mockClear();
+      await service.redeploy('revoked', {}, null);
+      expect(pullTokens(pull)).toEqual([undefined]);
+      pull.mockRestore();
+    });
+
+    it('setTokenOwner skips an app that detached the token while it awaited the owner write', async () => {
+      const t = await attachedApp('detaching', 'carol', undefined, 'ghp_legacyvalue');
+      const realUpdate = (service as unknown as { updateOwners(m: (o: Record<string, string>) => void): Promise<void> })
+        .updateOwners;
+      const spy = jest
+        .spyOn(service as unknown as { updateOwners(m: (o: Record<string, string>) => void): Promise<void> }, 'updateOwners')
+        .mockImplementation(async function (this: unknown, mutate) {
+          await realUpdate.call(service, mutate);
+          const sm = getStateManager();
+          const cur = sm.getApp('detaching')!.gitSource!;
+          await sm.updateApp('detaching', { gitSource: { ...cur, tokenId: undefined } } as Record<string, unknown>);
+        });
+
+      const res = await service.setTokenOwner(t.id, 'alice', 'root-admin', ['detaching']);
+      spy.mockRestore();
+
+      expect(res).toEqual({ status: 'ok', granted: [], failing: [] });
+      const src = getStateManager().getApp('detaching')?.gitSource;
+      expect(src?.tokenId).toBeUndefined();
+      expect(src?.tokenGrantedBy).toBeUndefined();
+    });
+
+    it('a grant minted by a redeploy is dropped when the token changes owner during its clone', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/void-grant', branch: 'main', userId: 'alice' });
+      await makeGitDir('void-grant');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+      const admin: TokenCaller = { admin: true, userId: 'root-admin', interactive: true };
+
+      const original = gitClient.gitClone;
+      let moved = false;
+      const pull = jest.spyOn(gitClient, 'gitClone').mockImplementation(async (...args) => {
+        if (!moved) {
+          moved = true;
+          await service.setTokenOwner(b.id, 'carol', 'root-admin', []);
+        }
+        return original(...(args as Parameters<typeof original>));
+      });
+
+      await service.redeploy('void-grant', { tokenId: b.id }, admin);
+
+      const src = getStateManager().getApp('void-grant')?.gitSource;
+      expect(src?.tokenId).toBe(b.id);
+      expect(src?.tokenGrantedBy).toBeUndefined();
+      expect(src?.tokenGrantedFor).toBeUndefined();
+
+      pull.mockClear();
+      await service.redeploy('void-grant', {}, null);
+      expect(pullTokens(pull)).toEqual([undefined]);
+      pull.mockRestore();
+    });
+
+    it('an admin-chosen token redeploy still records its grant when nothing races it', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/chosen-grant', branch: 'main', userId: 'alice' });
+      await makeGitDir('chosen-grant');
+      const b = await service.setToken('bob-pat', 'ghp_bobs', 'bob');
+
+      await service.redeploy('chosen-grant', { tokenId: b.id }, { admin: true, userId: 'root-admin', interactive: true });
+
+      const src = getStateManager().getApp('chosen-grant')?.gitSource;
+      expect(src?.tokenGrantedBy).toBe('root-admin');
+      expect(src?.tokenGrantedFor).toBe('alice');
+    });
+
+    it('with an unreadable owner map an attached token is refused (no legacy grandfathering) unless granted', async () => {
+      await attachedApp('closed', 'alice', undefined, 'ghp_legacyvalue');
+      await getSecretManager().set('__drop_git_token_owners', 'owners', '{not json');
+      const pull = jest.spyOn(gitClient, 'gitClone');
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      await service.redeploy('closed', {}, null);
+      expect(pullTokens(pull)).toEqual([undefined]);
+      pull.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it('removeTokensOwnedBy throws on an unreadable owner map instead of reporting zero', async () => {
+      await service.setToken('a1', 'ghp_a1', 'alice');
+      await getSecretManager().set('__drop_git_token_owners', 'owners', '{not json');
+      await expect(service.removeTokensOwnedBy('alice')).rejects.toThrow(/unreadable/);
+    });
+
+    it('the admin list leaves ownerName off when the account does not resolve', async () => {
+      await service.setToken('a1', 'ghp_a1', 'no-such-account');
+      expect(service.listTokens(ADMIN)[0].ownerName).toBeUndefined();
+      expect(service.listTokens(ADMIN)[0].ownerUserId).toBe('no-such-account');
+    });
+
+    it('a corrupt owner map reads as no owners (admin-only) and is never overwritten', async () => {
+      const a = await service.setToken('alice-pat', 'ghp_alices', 'alice');
+      await getSecretManager().set('__drop_git_token_owners', 'owners', '{not json');
+
+      expect(service.listTokens(ALICE)).toEqual([]);
+      expect(service.listTokens(ADMIN).map((t) => t.id)).toEqual([a.id]);
+      await expect(service.setTokenOwner(a.id, 'alice', 'root-admin')).rejects.toThrow(/unreadable/);
+      expect(getSecretManager().get('__drop_git_token_owners', 'owners')).toBe('{not json');
+    });
+  });
+
+  describe('a suspended app (F2 Item 2): refused before any pull or clone', () => {
+    const appDir = (name: string): string => path.join(tempDir, 'webapps', name);
+    const gitCalls = (sub: string): unknown[][] =>
+      (execFile as unknown as jest.Mock).mock.calls.filter((c) => (c[1] as string[]).includes(sub));
+
+    beforeEach(() => {
+      mockCloneFiles = { 'index.html': '<h1>v1</h1>' };
+      mockCloneGate = null;
+    });
+
+    afterEach(() => {
+      resetPlatformOps();
+    });
+
+    async function deployAndSuspend(appName: string): Promise<void> {
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main', autoRedeploy: true });
+      await getSuspensionStore().suspend(appName, 'admin-1');
+      (execFile as unknown as jest.Mock).mockClear();
+      mockCloneFiles = { 'index.html': '<h1>v2 pushed</h1>' };
+    }
+
+    it('redeploy rejects AppSuspendedError: no pull, no clone, no quota, no reservation, tree unchanged', async () => {
+      const appName = 'frozen-git';
+      await deployAndSuspend(appName);
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+
+      await expect(service.redeploy(appName, { automation: 'webhook' }, null)).rejects.toBeInstanceOf(
+        AppSuspendedError
+      );
+
+      expect(gitCalls('clone')).toHaveLength(0);
+      expect(gitCalls('pull')).toHaveLength(0);
+      expect(admit).not.toHaveBeenCalled();
+      expect(reservedNow.size).toBe(0);
+      expect(service.isCloning(appName)).toBe(false);
+      expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+    });
+
+    it('landUnderHold, the platform\'s own door to a pull, refuses it too', async () => {
+      const appName = 'frozen-hold';
+      await deployAndSuspend(appName);
+      const app = getStateManager().getApp(appName)!;
+
+      await expect(service.landUnderHold(app, {}, null)).rejects.toBeInstanceOf(AppSuspendedError);
+
+      expect(gitCalls('clone')).toHaveLength(0);
+      expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+    });
+
+    it('does not queue a push for it', async () => {
+      const appName = 'frozen-queue';
+      await deployAndSuspend(appName);
+
+      service.queueRedeploy(appName, { automation: 'webhook' });
+
+      expect((service as unknown as { pending: Map<string, unknown> }).pending.size).toBe(0);
+    });
+
+    it('the replay drops a push queued BEFORE the suspension: no pull, and not recorded as a failed deploy', async () => {
+      const appName = 'frozen-replay';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      service.queueRedeploy(appName, { automation: 'webhook' });
+      await getSuspensionStore().suspend(appName, 'admin-1');
+      (execFile as unknown as jest.Mock).mockClear();
+      const failed: string[] = [];
+      const unsub = eventBus.subscribe('build:failed', (p) => void failed.push(p.appId));
+
+      try {
+        await (service as unknown as { flushPending(): Promise<void> }).flushPending();
+      } finally {
+        unsub();
+      }
+
+      expect(gitCalls('clone')).toHaveLength(0);
+      expect(failed).toEqual([]);
+      expect((service as unknown as { pending: Map<string, unknown> }).pending.size).toBe(0);
+      expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+    });
+
+    it('a queued request behind a clone that the suspension interrupts is refused before it is charged, and the tree is unchanged', async () => {
+      const appName = 'frozen-chain';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      (execFile as unknown as jest.Mock).mockClear();
+      mockCloneFiles = { 'index.html': '<h1>v2 pushed</h1>' };
+      let open!: () => void;
+      mockCloneGate = new Promise<void>((resolve) => (open = resolve));
+      const admit = jest.spyOn(breakerModule, 'admitDeploy');
+
+      const first = service.redeploy(appName, { automation: 'webhook' }, null);
+      const second = service.redeploy(appName, { automation: 'webhook' }, null);
+      first.catch(() => undefined);
+      second.catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 100));
+      // The first is mid-clone, the second waits behind it: the suspension lands now.
+      await getSuspensionStore().suspend(appName, 'admin-1');
+      open();
+      mockCloneGate = null;
+
+      await expect(first).rejects.toBeInstanceOf(AppSuspendedError);
+      await expect(second).rejects.toBeInstanceOf(AppSuspendedError);
+      // Only the first was admitted (charged); the queued one never was.
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+      expect(reservedNow.size).toBe(0);
+      expect(service.isCloning(appName)).toBe(false);
+    });
+
+    it('a suspension landing during the clone leaves the serving tree unchanged (no files landed)', async () => {
+      const appName = 'frozen-clone';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      let open!: () => void;
+      mockCloneGate = new Promise<void>((resolve) => (open = resolve));
+      mockCloneFiles = { 'index.html': '<h1>v2 pushed</h1>', 'extra.js': 'only in v2' };
+
+      const run = service.redeploy(appName, { automation: 'webhook' }, null);
+      run.catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 100));
+      await getSuspensionStore().suspend(appName, 'admin-1');
+      open();
+      mockCloneGate = null;
+
+      await expect(run).rejects.toBeInstanceOf(AppSuspendedError);
+      expect(await fs.readFile(path.join(appDir(appName), 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+      await expect(fs.access(path.join(appDir(appName), 'extra.js'))).rejects.toThrow();
+    });
+
+    it('the replay keeps a push queued while the store cannot answer: nothing is pulled, recorded or dropped', async () => {
+      const appName = 'frozen-keep';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main' });
+      service.queueRedeploy(appName, { automation: 'webhook' });
+      resetSuspensionStore();
+      const file = path.join(tempDir, 'suspensions.json');
+      await fs.writeFile(file, '{not json');
+      await getSuspensionStore(file).load();
+      (execFile as unknown as jest.Mock).mockClear();
+      const failed: string[] = [];
+      const unsub = eventBus.subscribe('build:failed', (p) => void failed.push(p.appId));
+
+      try {
+        await (service as unknown as { flushPending(): Promise<void> }).flushPending();
+      } finally {
+        unsub();
+      }
+
+      expect(gitCalls('clone')).toHaveLength(0);
+      expect(failed).toEqual([]);
+      expect((service as unknown as { pending: Map<string, unknown> }).pending.has(appName)).toBe(true);
+    });
+
+    it.each([
+      ['record', 'DEPLOY_STOPPED', "Application 'frozen-rec' is suspended by an administrator"],
+      ['store-unreadable', 'DEPLOY_REFUSED', "Starting 'frozen-rec' is refused right now; contact your administrator"],
+    ] as const)(
+      'a queued redeploy refused after the entry check (%s) is recorded as %s with the tenant text',
+      async (reason, code, message) => {
+        resetDeployTracker();
+        getDeployTracker(path.join(tempDir, 'deploys.json'));
+        const events: Array<{ code?: string; message: string }> = [];
+        const unsub = eventBus.subscribe('build:failed', (p) => {
+          events.push({ code: (p as { code?: string }).code, message: p.error.message });
+        });
+
+        try {
+          await (service as unknown as { recordQueuedFailure(a: string, e: unknown): Promise<void> }).recordQueuedFailure(
+            'frozen-rec',
+            new AppSuspendedError('frozen-rec', reason)
+          );
+        } finally {
+          unsub();
+        }
+
+        expect(events).toEqual([{ code, message }]);
+      }
+    );
+
+    it('webhook matching skips it, and matches again once the suspension is lifted', async () => {
+      const appName = 'frozen-hook';
+      await deployAndSuspend(appName);
+
+      expect(service.findAppsForWebhook(`https://github.com/user/${appName}`, 'main')).toEqual([]);
+
+      await getSuspensionStore().unsuspend(appName);
+      expect(service.findAppsForWebhook(`https://github.com/user/${appName}`, 'main')).toEqual([appName]);
+    });
+
+    it('webhook matching skips every app while the store cannot answer', async () => {
+      await service.deploy({ repoUrl: 'https://github.com/user/any-hook', branch: 'main', autoRedeploy: true });
+      resetSuspensionStore();
+      const file = path.join(tempDir, 'suspensions.json');
+      await fs.writeFile(file, '{not json');
+      await getSuspensionStore(file).load();
+
+      expect(service.findAppsForWebhook('https://github.com/user/any-hook', 'main')).toEqual([]);
     });
   });
 

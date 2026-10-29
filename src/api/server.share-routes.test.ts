@@ -43,14 +43,14 @@ describe('dedicated /apps/*/share* rate-limit bucket and role floor (DROP-153)',
   beforeEach(async () => {
     t = await createTestApiServer({ port: 3102, tempPrefix: 'drop-share-ratelimit-' });
 
-    const owner = await createUser('share-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'share-owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('share-owner', 'password123');
 
-    await createUser('share-readonly', 'password123', 'readonly');
+    await createUser({ username: 'share-readonly', role: 'readonly', credential: { password: 'password123' } });
     readonlyToken = await getTestToken('share-readonly', 'password123');
 
-    await createUser('share-admin', 'password123', 'admin');
+    await createUser({ username: 'share-admin', role: 'admin', credential: { password: 'password123' } });
     adminToken = await getTestToken('share-admin', 'password123');
 
     const sm = getStateManager();

@@ -8,7 +8,16 @@ import { Hono } from 'hono';
 import * as crypto from 'crypto';
 import { success, error, ErrorCodes } from '../types';
 import { getActivityLog } from '../../managers/activity';
-import { suspendUser, updateUser, listUsers, isAuthEnabled, AuthContext } from '../middleware/auth';
+import {
+  suspendUser,
+  updateUser,
+  listUsers,
+  isAuthEnabled,
+  hasNoWorkingLoginMethod,
+  NO_LOGIN_METHOD_WARNING,
+  AuthContext,
+} from '../middleware/auth';
+import { interactiveSessionOnly } from '../access';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppRuntime } from '../../managers/runtime';
 import { logActivityFor } from '../../managers/activity';
@@ -20,10 +29,12 @@ import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } fro
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
 import { getPlatformOps } from '../platform-ops';
+import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import {
   getObjectStorageProvisioner,
   getStorageCredentialStore,
   AWS_REGION_RE,
+  AllocationStoreCorruptError,
   BUCKET_PREFIX_RE,
 } from '../../managers/object-storage';
 import type { ObjectStorageSettings } from '../../managers/settings/settings-manager';
@@ -246,7 +257,9 @@ admin.post('/users/:id/unsuspend', async (c) => {
     detail: `Unsuspended user ${userId}`,
   });
 
-  return c.json(success({ suspended: false }));
+  // A passwordless account whose identities predate the suspension has no way in.
+  const warning = hasNoWorkingLoginMethod(userId) ? NO_LOGIN_METHOD_WARNING : undefined;
+  return c.json(success({ suspended: false, ...(warning ? { warning } : {}) }));
 });
 
 // GET /admin/quota - Platform-wide quota / resource summary (df-style)
@@ -286,7 +299,15 @@ admin.get('/quota', async (c) => {
   );
 });
 
-// POST /admin/apps/:name/suspend - Stop an app and mark it suspended
+/** Suspensions match names ignoring case, so an app that differs only in case cannot be told apart from this one. */
+function caseCollisionMessage(appName: string, names: string[]): string {
+  return `'${appName}' differs only in case from ${names.map((n) => `'${n}'`).join(', ')}; suspensions match names ignoring case, so it cannot be changed without affecting them`;
+}
+
+// POST /admin/apps/:name/suspend - Take an app down until an admin lifts it
+// The suspension is a durable, name-keyed record (see managers/suspension):
+// every start path refuses while it exists, so the owner's start does not undo
+// it. The body may carry an optional `{ reason }`.
 admin.post('/apps/:name/suspend', async (c) => {
   const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
   const appName = c.req.param('name');
@@ -297,21 +318,99 @@ admin.post('/apps/:name/suspend', async (c) => {
     return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' not found`), 404);
   }
 
-  const runtime = getAppRuntime();
-  try {
-    await runtime.stop(appName);
-  } catch {
-    // Best-effort — app may already be stopped
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
-  await stateManager.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
+
+  let reason: string | undefined;
+  try {
+    const body = (await c.req.json()) as { reason?: unknown };
+    if (typeof body?.reason === 'string' && body.reason.trim()) reason = body.reason.trim().slice(0, 500);
+  } catch {
+    // No body, or not JSON: a suspension needs no reason.
+  }
+
+  let result;
+  try {
+    result = await ops.suspendApp(appName, authCtx?.userId ?? 'admin', reason);
+  } catch (err) {
+    // The record could not be written, so nothing was stopped: say so.
+    const message = err instanceof Error ? err.message : 'Suspend failed';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, `Could not suspend '${appName}': ${message}`), 500);
+  }
+
+  if ('refused' in result) {
+    if (result.refused === 'case-collision') {
+      return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
+    }
+    return c.json(
+      error(
+        ErrorCodes.CONFLICT,
+        `'${appName}' is a monorepo container and runs nothing itself; suspend its services instead: ` +
+          (result.services.length > 0 ? result.services.join(', ') : '(none)'),
+        { services: result.services }
+      ),
+      409
+    );
+  }
 
   await logActivityFor(authCtx, {
     action: 'suspend',
     appName,
-    detail: 'App suspended by admin',
+    detail:
+      (reason ? `App suspended by admin: ${reason}` : 'App suspended by admin') +
+      (result.stopErrors && result.stopErrors.length > 0 ? `; NOT fully stopped: ${result.stopErrors.join('; ')}` : ''),
   });
 
-  return c.json(success({ appName, suspended: true }));
+  return c.json(
+    success({
+      appName,
+      suspended: true,
+      stopErrors: result.stopErrors && result.stopErrors.length > 0 ? result.stopErrors : undefined,
+    })
+  );
+});
+
+// POST /admin/apps/:name/unsuspend - Lift an app suspension
+// The app is left stopped: its owner starts it deliberately. Human sessions
+// only, like the other admin acts an agent credential must not perform.
+admin.post('/apps/:name/unsuspend', async (c) => {
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const appName = c.req.param('name');
+
+  if (authCtx || isAuthEnabled()) {
+    const gate = interactiveSessionOnly(authCtx, 'Lifting an app suspension');
+    if (!gate.ok) return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  }
+
+  const ops = getPlatformOps();
+  if (!ops) {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  let lifted: boolean;
+  try {
+    const result = await ops.unsuspendApp(appName);
+    if ('refused' in result) {
+      return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
+    }
+    lifted = result.unsuspended;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unsuspend failed';
+    return c.json(error(ErrorCodes.INTERNAL_ERROR, `Could not lift the suspension of '${appName}': ${message}`), 500);
+  }
+  if (!lifted) {
+    return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' is not suspended`), 404);
+  }
+
+  await logActivityFor(authCtx, {
+    action: 'unsuspend',
+    appName,
+    detail: 'App suspension lifted by admin',
+  });
+
+  return c.json(success({ appName, suspended: false }));
 });
 
 // GET /admin/settings - Platform settings: the public base URL / OAuth
@@ -386,6 +485,29 @@ admin.get('/settings', async (c) => {
   );
 });
 
+/**
+ * A new public URL changes which tenant hostnames are refused (names under the
+ * platform's own host), and routes are otherwise only written on deploy. Re-emit
+ * every app that carries drop.yaml `domains` or a verified custom domain so
+ * newly covered names stop being served now. Covers every app with a port, not
+ * just those declaring domains: a default or group hostname can become the
+ * platform host too. Best-effort per app: a deploy in flight writes its own
+ * route.
+ */
+async function reemitHostRoutes(): Promise<void> {
+  const ops = getPlatformOps();
+  const configs = getAppConfigServiceOrNull();
+  if (!ops || !configs) return;
+  for (const config of configs.getAllConfigs()) {
+    if (!config.port) continue;
+    try {
+      await ops.reconfigureRoute(config.name);
+    } catch {
+      // In flight (AppInProgressError) or unroutable; the next deploy re-checks.
+    }
+  }
+}
+
 // PUT /admin/settings/public-url - Set or clear the admin override for
 // DROP_PUBLIC_URL (the OAuth issuer/resource base). Security-adjacent:
 // validated HTTPS-only (except localhost) via normalizePublicUrl, and a
@@ -399,6 +521,7 @@ admin.put('/settings/public-url', async (c) => {
   if (input === null || input === undefined || input === '') {
     await getSettingsManager().setPublicUrl(undefined);
     setPublicUrl(undefined);
+    await reemitHostRoutes();
     return c.json(success(buildSettingsPayload()));
   }
 
@@ -413,6 +536,7 @@ admin.put('/settings/public-url', async (c) => {
 
   await getSettingsManager().setPublicUrl(result.value);
   setPublicUrl(result.value);
+  await reemitHostRoutes();
 
   return c.json(success({ publicUrl: result.value, source: 'stored' as const, storedPublicUrl: result.value }));
 });
@@ -1156,6 +1280,80 @@ admin.post('/object-storage/test', async (c) => {
   const authRefusal = requireAuthForStorageRoutes();
   if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
   return c.json(success(await getObjectStorageProvisioner().testConnection()));
+});
+
+// GET /admin/object-storage/retired - buckets whose app was deleted and which
+// DROP did not destroy: `kept` ones (a keepData delete — the bucket is the
+// owner's data, nobody else is allowed to remove it) and teardown failures the
+// sweep is still retrying. They still bill the operator, and still count
+// against their owner's cap. Metadata only: no key exists on these records.
+admin.get('/object-storage/retired', async (c) => {
+  const authRefusal = requireAuthForStorageRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+  try {
+    const records = await getObjectStorageProvisioner().listRetiredRecords();
+    return c.json(
+      success({
+        retired: records.map(({ id, allocation }) => ({
+          id,
+          appName: allocation.appName,
+          bucket: allocation.bucket,
+          region: allocation.region,
+          ownerUserId: allocation.ownerUserId ?? null,
+          retiredAt: allocation.retired?.at ?? null,
+          reason: allocation.retired?.reason ?? null,
+          accessRevoked: allocation.accessRevoked === true,
+          quarantined: allocation.quarantined === true,
+        })),
+      })
+    );
+  } catch (err) {
+    if (err instanceof AllocationStoreCorruptError) {
+      return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'The object-storage allocation store is unreadable.'), 503);
+    }
+    throw err;
+  }
+});
+
+// DELETE /admin/object-storage/retired/:id - DESTROY a kept bucket: every
+// object, then the bucket. The only way a `kept` record ever goes away.
+admin.delete('/object-storage/retired/:id', async (c) => {
+  const authRefusal = requireAuthForStorageRoutes();
+  if (authRefusal) return c.json(error(ErrorCodes.UNAUTHORIZED, authRefusal), 401);
+  const authCtx = (c.get as Function)('auth') as AuthContext | undefined;
+  const id = c.req.param('id');
+  // The most destructive call in the platform: every object, then the bucket,
+  // with no backup. Same bar as detaching or deleting an app that holds one —
+  // a person at an interactive session who names what is being destroyed — so
+  // neither a stolen API key nor a script's slip can do it.
+  const gate = interactiveSessionOnly(authCtx, 'Destroying a kept bucket');
+  if (!gate.ok) return c.json(error(ErrorCodes.UNAUTHORIZED, gate.message), 403);
+  if (c.req.query('confirm') !== id) {
+    return c.json(
+      error(
+        ErrorCodes.VALIDATION_ERROR,
+        `Destroying a kept bucket permanently deletes it and every object in it, with no backup. Repeat the request with ?confirm=${id} to proceed.`,
+        { reason: 'confirmation-required', confirm: id }
+      ),
+      400
+    );
+  }
+  let result;
+  try {
+    result = await getObjectStorageProvisioner().destroyRetired(id);
+  } catch (err) {
+    if (err instanceof AllocationStoreCorruptError) {
+      return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'The object-storage allocation store is unreadable.'), 503);
+    }
+    // The AWS error NAME only — a raw message can carry request detail.
+    return c.json(
+      error(ErrorCodes.SERVICE_UNAVAILABLE, `The bucket could not be removed (${(err as { name?: string })?.name || 'Error'}); retry once AWS is reachable.`),
+      503
+    );
+  }
+  if (!result) return c.json(error(ErrorCodes.NOT_FOUND, 'No such retired bucket'), 404);
+  await logActivityFor(authCtx, { action: 'object-storage-bucket-destroyed', detail: `Destroyed retired bucket ${id}` });
+  return c.json(success({ destroyed: true, objectsDeleted: result.objectsDeleted, bucketDeleted: result.bucketDeleted }));
 });
 
 export default admin;

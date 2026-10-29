@@ -25,6 +25,11 @@ const OWNER_ERR = /already in use by another account/;
 const PROV_ERR = /belongs to another container/;
 const ADOPT_ERR = /already has apps this container did not create/;
 
+import { loadEmptySuspensionStore } from './__testutils__/suspension';
+
+// An unloaded suspension store fails closed; these tests never start the platform that loads it.
+beforeEach(loadEmptySuspensionStore);
+
 describe('monorepo group provenance (groupContainer)', () => {
   let platform: DropPlatform;
   let tempDir: string;

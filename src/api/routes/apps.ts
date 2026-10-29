@@ -4,7 +4,7 @@
  * CRUD and management endpoints for applications.
  */
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
@@ -12,19 +12,21 @@ import { Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { success, error, ErrorCodes, AppDto, CreateAppDto } from '../types';
 import { NotFoundError, ValidationError } from '../middleware/error';
-import { AuthContext, listUsers, getUserById } from '../middleware/auth';
-import { canAccess } from '../access';
+import { AuthContext, listUsers, getUserById, deleteApiKeysByName, appProvisionKeyName } from '../middleware/auth';
+import { canAccess, interactiveSessionOnly } from '../access';
 import { isValidAppName, validateAppName } from '../middleware/validate';
 import { getAppRuntime } from '../../managers/runtime';
 import {
   getPlatformOps,
   AppInProgressError,
   AppNeedsConfigError,
+  AppSuspendedError,
   needsConfigAction,
   needsConfigDetail,
   StaleDependenciesError,
   type AttachableServiceId,
 } from '../platform-ops';
+import { getSuspensionStore } from '../../managers/suspension';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
@@ -68,9 +70,12 @@ import {
   gateEnforced,
 } from '../../managers/guardrail/access-gate';
 import { DeployRefusedError } from '../../managers/guardrail/deploy-breaker';
+import { redeployFor } from '../redeploy-for';
 import { QuotaExceededError } from '../../managers/guardrail/principal-quota';
 import { pruneOwnerDumpsToFit, predeleteMaxBytes } from '../../managers/guardrail/detach-limits';
 import { runUploadPreflight } from '../upload-preflight';
+import type { RedeployRefusal, RedeployRefusalCode } from '../platform-ops';
+import { appSuspendedResponse } from './suspension-response';
 import type { RuntimeType } from '../../managers/runtime/app-runtime.types';
 import {
   MAX_ACCESS_ALLOW_ENTRIES,
@@ -170,6 +175,31 @@ function sanitizeRepoUrl(repoUrl: string): string {
   }
 }
 
+/**
+ * The suspension as the wire shows it, from the store's one refusal predicate.
+ * Everyone learns THAT the app cannot be started (and, for a real record, since
+ * when); who and why is for admins. A store that is unreadable or not loaded
+ * refuses every app, and only an admin is told that is the cause: anyone else
+ * just sees a suspension, and no detail of the platform's own state.
+ */
+function suspendedDto(appName: string, isAdmin: boolean): AppDto['suspended'] {
+  const store = getSuspensionStore();
+  const refusal = store.refusalFor(appName);
+  if (!refusal) return undefined;
+  if (refusal !== 'record') return isAdmin ? { kind: refusal } : { kind: 'record' };
+  const record = store.get(appName);
+  if (!record) return { kind: 'record' };
+  return isAdmin
+    ? { kind: 'record', at: record.at, by: record.by, reason: record.reason }
+    : { kind: 'record', at: record.at };
+}
+
+/** The refusal a start of this app would meet, for a route that must refuse BEFORE it changes anything. */
+function suspensionRefusal(appName: string): AppSuspendedError | null {
+  const refusal = getSuspensionStore().refusalFor(appName);
+  return refusal ? new AppSuspendedError(appName, refusal) : null;
+}
+
 // Helper to convert AppState to AppDto (role-aware)
 function toAppDto(app: AppState, isAdmin = false): AppDto {
   return {
@@ -197,6 +227,8 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
           ...app.gitSource,
           repoUrl: sanitizeRepoUrl(app.gitSource.repoUrl),
           tokenId: isAdmin ? app.gitSource.tokenId : undefined,
+          tokenGrantedBy: isAdmin ? app.gitSource.tokenGrantedBy : undefined,
+          tokenGrantedFor: isAdmin ? app.gitSource.tokenGrantedFor : undefined,
         }
       : app.gitSource,
     userId: app.userId,
@@ -209,6 +241,7 @@ function toAppDto(app: AppState, isAdmin = false): AppDto {
     groupGitBacked:
       !app.gitSource && app.group && isGroupGitBacked(app.group) ? true : undefined,
     mcp: mcpDtoFor(app),
+    suspended: suspendedDto(app.name, isAdmin),
   };
 }
 
@@ -571,6 +604,7 @@ apps.post('/:name/source', async c => {
   // (apps.source.test.ts is the regression gate).
   const preflight = await runUploadPreflight(auth, name);
   if (!preflight.ok) {
+    if (preflight.error instanceof AppSuspendedError) return appSuspendedResponse(c, preflight.error);
     throw preflight.error;
   }
 
@@ -642,7 +676,10 @@ apps.post('/:name/source', async c => {
     if (err instanceof UploadNotFoundError) {
       return c.json(error(ErrorCodes.NOT_FOUND, err.message), 404);
     }
-    if (err instanceof UploadConflictError) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
+    if (err instanceof UploadConflictError || err instanceof AppInProgressError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
     if (err instanceof InsufficientDiskSpaceError) {
@@ -697,6 +734,66 @@ apps.put('/:name', async c => {
 
   return c.json(success(toAppDto(updated, auth?.role === 'admin')));
 });
+
+/**
+ * The gate for the one action here that destroys data with no backup: an
+ * object-storage bucket and every object in it (#301). Two requirements, both
+ * enforced on the server because the dashboard's dialog is only a courtesy:
+ *
+ *  - an INTERACTIVE session (`interactiveSessionOnly`, i.e. the dashboard):
+ *    no API key — the CLI's own included — OAuth token or agent token ever
+ *    reaches this, however privileged its role. Destroying a bucket is
+ *    dashboard-only; the CLI can delete the app with `--keep-data` instead;
+ *  - an explicit `?confirm=<target>` naming what is being destroyed, so a
+ *    script or a stray DELETE cannot trigger it by accident.
+ *
+ * Returns the refusal to send, or null to proceed.
+ */
+function bucketDestructionRefusal(
+  c: Context,
+  auth: AuthContext | undefined,
+  target: string,
+  action: string
+): Response | null {
+  const gate = interactiveSessionOnly(auth, action);
+  if (!gate.ok) {
+    return c.json(
+      error(
+        ErrorCodes.UNAUTHORIZED,
+        `${gate.message} Destroying an object-storage bucket can only be done from the dashboard` +
+          (action.startsWith('Detaching') ? '.' : ', or pass keepData=true to delete the app and keep the bucket.'),
+        { reason: 'dashboard-only' }
+      ),
+      403
+    );
+  }
+  if (c.req.query('confirm') !== target) {
+    return c.json(
+      error(
+        ErrorCodes.VALIDATION_ERROR,
+        `${action} permanently deletes the object-storage bucket and every object in it, with no backup. ` +
+          `Repeat the request with ?confirm=${target} to proceed` +
+          (action.startsWith('Detaching') ? '.' : ', or pass keepData=true to keep the bucket.'),
+        { reason: 'confirmation-required', confirm: target }
+      ),
+      400
+    );
+  }
+  return null;
+}
+
+/** The delete cannot be proven safe: the object-storage allocation store is unreadable. */
+function objectStorageUnreadable(c: Context): Response {
+  return c.json(
+    error(
+      ErrorCodes.SERVICE_UNAVAILABLE,
+      "The object-storage allocation store is unreadable, so DROP cannot tell whether this app holds a bucket and will not delete it. " +
+        'An operator needs to repair the store (data/drop-svc/object-storage.json); to delete the app anyway and keep any bucket it may hold, pass keepData=true.',
+      { reason: 'object-storage-unreadable' }
+    ),
+    503
+  );
+}
 
 // DELETE /apps/:name - Remove application (group-aware, M4)
 apps.delete('/:name', async c => {
@@ -762,6 +859,18 @@ apps.delete('/:name', async c => {
       );
     }
 
+    // A group delete destroys every child's bucket too (keepData is not
+    // offered here), so it needs the same confirmation as a single app.
+    for (const child of groupChildren) {
+      const risk = await ops.objectStorageDeleteRisk(child.name);
+      if (risk === 'unknown') return objectStorageUnreadable(c);
+      if (risk === 'bucket') {
+        const refusal = bucketDestructionRefusal(c, auth, name, `Deleting group '${groupName}'`);
+        if (refusal) return refusal;
+        break;
+      }
+    }
+
     const { removed } = await ops.removeGroup(groupName);
 
     await logActivityFor(auth, {
@@ -776,205 +885,248 @@ apps.delete('/:name', async c => {
     throw new NotFoundError(`Application '${name}' not found`);
   }
 
-  // Stop the process if running
-  const pm = getAppRuntime();
-  try {
-    await pm.stop(name);
-    await pm.delete(name);
-  } catch {
-    // Process might not exist in PM2
+  // An app whose bucket this delete would destroy needs an interactive session
+  // and an explicit confirmation — checked before anything is stopped or
+  // reserved. `keepData` keeps the bucket, so it is not destruction. An
+  // unreadable allocation store cannot be proven safe, but a confirmation
+  // would not make it so either (the person has nothing to confirm): the
+  // delete is refused with a 503 that says why, and keepData is the way out.
+  if (c.req.query('keepData') !== 'true') {
+    const risk = (await getPlatformOps()?.objectStorageDeleteRisk(name)) ?? 'none';
+    if (risk === 'unknown') return objectStorageUnreadable(c);
+    if (risk === 'bucket') {
+      const refusal = bucketDestructionRefusal(c, auth, name, `Deleting '${name}'`);
+      if (refusal) return refusal;
+    }
   }
 
-  // Dump-then-drop the app's provisioned database (if any) BEFORE removing
-  // app state. This must run before stateManager.removeApp so a same-named
-  // recreate can't race in and inherit a still-live/retained database.
-  // `?keepData=true` skips the drop entirely — the DB is left intact.
-  // Non-fatal: a failure here still lets the rest of the delete proceed; the
-  // database is simply retained (the safe outcome — see
-  // docs/plans/2026-07-07-dump-then-drop-on-delete.md).
-  const keepData = c.req.query('keepData') === 'true';
-  let dbStatus: 'dropped' | 'retained' | 'preserved' | 'none' = 'none';
-  if (keepData) {
-    dbStatus = 'preserved';
-  } else {
-    try {
-      const provisioner = getDatabaseProvisioner();
-      if (!provisioner) {
-        // In a running server the provisioner is never null. A null here means
-        // the database layer didn't initialise and we're SILENTLY skipping the
-        // drop — the exact orphan-leak this feature exists to prevent, and
-        // indistinguishable in the response from the legitimate "no database"
-        // case. Make it loud instead of collapsing it into 'none'.
-        console.warn(
-          `[apps.delete] database provisioner unavailable — DB teardown SKIPPED for ${name} (database NOT dropped)`
-        );
-        dbStatus = 'none';
-      } else {
-        // Meter, don't refuse: an unmetered create->attach->delete loop
-        // reproduces the exact per-owner dump-byte amplification DROP-151
-        // Phase 3's detach-limit budget exists to bound — a delete must never
-        // be BLOCKED by the budget, so this prunes THIS APP'S OWN oldest
-        // dumps first rather than checking the budget. Scoped to
-        // `dbNamePrefix` (this app only), never the
-        // owner's whole directory — pruning to make room for a delete must
-        // not evict a SIBLING app's only surviving dump (the cross-app-
-        // eviction finding the per-owner directory layout closes; see
-        // detach-limits.ts's module doc). Skipped for an ephemeral app: its
-        // dump is skipped below too via `skipBackup` (nothing new is being
-        // written that needs room made for it).
-        // Read defensively via the null-returning accessor — an
-        // uninitialised AppConfigService (tests / early failures) must NOT
-        // abort the real drop below; default to "not ephemeral" (pruning
-        // still proceeds, which is always safe).
-        const isEphemeral = getAppConfigServiceOrNull()?.getConfig(name)?.ephemeral === true;
-        if (!isEphemeral) {
-          try {
-            const ownerDir = provisioner.ownerDumpDir(app.userId);
-            const dbNamePrefix = provisioner.dbNameForApp(name);
-            await pruneOwnerDumpsToFit(ownerDir, predeleteMaxBytes(), 0, dbNamePrefix);
-          } catch (err) {
-            // pruneOwnerDumpsToFit is already best-effort per file; this only
-            // guards a directory-level throw from blocking the delete itself.
-            console.warn(`[apps.delete] dump-budget prune threw for ${name}:`, err);
-          }
-        }
+  // Hold the app against deploy/restart/attach/detach for the whole teardown.
+  // Attach and detach both read the object-storage allocation this moves, and
+  // the isAppInProgress check at the top is only a read, not a reservation.
+  // An unwired platform (standalone ApiServer in tests) has nothing to reserve.
+  const deleteOps = getPlatformOps();
+  const releaseApp = deleteOps?.tryReserveApp(name) ?? null;
+  if (deleteOps && !releaseApp) {
+    return c.json(
+      error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying — retry once it settles`),
+      409
+    );
+  }
+  try {
+    const keepData = c.req.query('keepData') === 'true';
 
-        const outcome = await provisioner.backupAndDeleteAppDatabase(name, {
-          skipBackup: isEphemeral,
-          ownerUserId: app.userId ?? null,
-        });
-        // Re-keyed on databaseDropped, not the combined `dropped` (DROP-151):
-        // `dropped` is true only when BOTH the database and its role were
-        // dropped, so a database-dropped-but-role-drop-failed outcome used to
-        // report 'retained' for a database that was actually gone and no
-        // longer tracked anywhere.
-        if (outcome.databaseDropped) {
-          dbStatus = 'dropped';
-        } else if (outcome.reason === 'no database provisioned') {
+    // Stop the process if running
+    const pm = getAppRuntime();
+    try {
+      await pm.stop(name);
+      await pm.delete(name);
+    } catch {
+      // Process might not exist in PM2
+    }
+
+    // Object storage (#301): move the bucket's record off the app's name
+    // BEFORE the database drop, the state removal or anything else that can
+    // fail — the name is freed by this delete, and a record still sitting on it
+    // is what a later registrant would inherit. Revokes the IAM key; the bucket
+    // itself drains in the background (or, with keepData, stays for an admin).
+    try {
+      await deleteOps?.retireObjectStorage(name, { keepData });
+    } catch (err) {
+      console.warn(`[apps.delete] object storage retirement threw for ${name}:`, err);
+    }
+
+    // Dump-then-drop the app's provisioned database (if any) BEFORE removing
+    // app state. This must run before stateManager.removeApp so a same-named
+    // recreate can't race in and inherit a still-live/retained database.
+    // `?keepData=true` skips the drop entirely — the DB is left intact.
+    // Non-fatal: a failure here still lets the rest of the delete proceed; the
+    // database is simply retained (the safe outcome — see
+    // docs/plans/2026-07-07-dump-then-drop-on-delete.md).
+    let dbStatus: 'dropped' | 'retained' | 'preserved' | 'none' = 'none';
+    if (keepData) {
+      dbStatus = 'preserved';
+    } else {
+      try {
+        const provisioner = getDatabaseProvisioner();
+        if (!provisioner) {
+          // In a running server the provisioner is never null. A null here means
+          // the database layer didn't initialise and we're SILENTLY skipping the
+          // drop — the exact orphan-leak this feature exists to prevent, and
+          // indistinguishable in the response from the legitimate "no database"
+          // case. Make it loud instead of collapsing it into 'none'.
+          console.warn(
+            `[apps.delete] database provisioner unavailable — DB teardown SKIPPED for ${name} (database NOT dropped)`
+          );
           dbStatus = 'none';
         } else {
-          dbStatus = 'retained';
-        }
-        // A database that was dropped but whose role survived is a tracked
-        // orphan, not a silent no-op — logged distinctly from the "nothing
-        // happened" warning below so it isn't lost in an identical message.
-        if (outcome.databaseDropped && !outcome.roleDropped) {
-          console.warn(
-            `[apps.delete] database dropped for ${name} but its role survived (orphaned): ${outcome.reason ?? 'unknown'}`
-          );
-        }
-        // The full reason (which may embed raw pg_dump stderr, i.e. a path leak)
-        // is logged server-side only — never returned to the client.
-        if (!outcome.databaseDropped && outcome.reason !== 'no database provisioned') {
-          console.warn(`[apps.delete] database retained for ${name}: ${outcome.reason}`);
-        }
-      }
-    } catch (err) {
-      dbStatus = 'retained';
-      console.warn(`[apps.delete] database teardown threw for ${name}:`, err);
-    }
-
-    // Free the app's managed-Redis logical DB (FLUSHDB + release the number).
-    // Idempotent + fail-soft; a no-op when the app had no Redis. `?keepData=true`
-    // skips it (handled by the enclosing `else`).
-    try {
-      await getRedisProvisioner()?.deprovisionAppRedis(name);
-    } catch (err) {
-      console.warn(`[apps.delete] redis teardown threw for ${name}:`, err);
-    }
-  }
-
-  // Remove from state
-  await stateManager.removeApp(name);
-
-  // Clean up secrets so a future same-named app doesn't inherit them
-  try {
-    await getSecretManager().deleteAll(name);
-  } catch {
-    // Secret manager may not be initialised (tests / early failures)
-  }
-
-  // Purge deploy history so a future same-named app doesn't inherit the
-  // deleted app's deploy timeline (and, more importantly, its owner-scoped
-  // episodes leaking to whoever registers the name next).
-  try {
-    getDeployTracker().purgeApp(name);
-  } catch {
-    // Deploy tracker may not be initialised (tests / early failures)
-  }
-
-  // Remove app config (e.g. appconf/webapps/ezsign.yaml)
-  try {
-    const configService = getAppConfigService();
-    await configService.deleteConfig(name);
-  } catch {
-    // Config may not exist
-  }
-
-  // Delete the app folder from the filesystem so the watcher doesn't re-detect it
-  if (app.path) {
-    try {
-      await fs.rm(app.path, { recursive: true, force: true });
-    } catch {
-      // Folder may already be gone
-    }
-  }
-
-  // Remove the name-keyed artifacts that live outside the app folder (logs,
-  // and DROP_DATA_DIR unless keepData). This route does its own inline
-  // teardown rather than calling platform.teardownApp, so without this the
-  // previous tenant's logs and persistent data survive under a name that is
-  // now free for anyone to re-register. Best-effort — never fails the delete.
-  try {
-    await getPlatformOps()?.purgeAppArtifacts(name, { keepData });
-  } catch {
-    // Platform not wired (direct ApiServer construction in tests) or cleanup
-    // failed; the delete itself has already succeeded.
-  }
-
-  // If this app was a monorepo group child and is now the LAST remaining
-  // child of its group, also remove the group's CONTAINER folder
-  // (webapps/<group>/, holding the root drop.yaml with `services:`) — left
-  // behind, it would regenerate the just-deleted child on the watcher's next
-  // scan. The container's own state entry carries the group tag too and must
-  // not count as a sibling; with no real children left it goes as well, or it
-  // would linger as an invisible orphan.
-  if (app.group) {
-    const groupApps = stateManager.getAllApps().filter(a => a.group === app.group);
-    const remainingSiblings = groupApps.filter(a => !a.isGroupContainer);
-    if (remainingSiblings.length === 0) {
-      // Only containers the requester may access: group tags are
-      // tenant-influenced, so a child delete must not cascade into another
-      // user's colliding container entry/folder.
-      for (const container of groupApps.filter(a => a.isGroupContainer && canAccess(auth, a))) {
-        try {
-          await stateManager.removeApp(container.name);
-          if (container.path) {
-            await fs.rm(container.path, { recursive: true, force: true });
+          // Meter, don't refuse: an unmetered create->attach->delete loop
+          // reproduces the exact per-owner dump-byte amplification DROP-151
+          // Phase 3's detach-limit budget exists to bound — a delete must never
+          // be BLOCKED by the budget, so this prunes THIS APP'S OWN oldest
+          // dumps first rather than checking the budget. Scoped to
+          // `dbNamePrefix` (this app only), never the
+          // owner's whole directory — pruning to make room for a delete must
+          // not evict a SIBLING app's only surviving dump (the cross-app-
+          // eviction finding the per-owner directory layout closes; see
+          // detach-limits.ts's module doc). Skipped for an ephemeral app: its
+          // dump is skipped below too via `skipBackup` (nothing new is being
+          // written that needs room made for it).
+          // Read defensively via the null-returning accessor — an
+          // uninitialised AppConfigService (tests / early failures) must NOT
+          // abort the real drop below; default to "not ephemeral" (pruning
+          // still proceeds, which is always safe).
+          const isEphemeral = getAppConfigServiceOrNull()?.getConfig(name)?.ephemeral === true;
+          if (!isEphemeral) {
+            try {
+              const ownerDir = provisioner.ownerDumpDir(app.userId);
+              const dbNamePrefix = provisioner.dbNameForApp(name);
+              await pruneOwnerDumpsToFit(ownerDir, predeleteMaxBytes(), 0, dbNamePrefix);
+            } catch (err) {
+              // pruneOwnerDumpsToFit is already best-effort per file; this only
+              // guards a directory-level throw from blocking the delete itself.
+              console.warn(`[apps.delete] dump-budget prune threw for ${name}:`, err);
+            }
           }
-          // The container is detected and built before expansion, so it can
-          // have deploy details of its own — and its log directory. This
-          // cascade never went through purgeAppArtifacts, so those details
-          // kept live name-keyed log offsets with no retention stamp, which
-          // also put them outside the serve-time guard.
-          await getPlatformOps()?.purgeAppArtifacts(container.name, { keepData });
-        } catch {
-          // Container entry/folder may already be gone
+
+          const outcome = await provisioner.backupAndDeleteAppDatabase(name, {
+            skipBackup: isEphemeral,
+            ownerUserId: app.userId ?? null,
+          });
+          // Re-keyed on databaseDropped, not the combined `dropped` (DROP-151):
+          // `dropped` is true only when BOTH the database and its role were
+          // dropped, so a database-dropped-but-role-drop-failed outcome used to
+          // report 'retained' for a database that was actually gone and no
+          // longer tracked anywhere.
+          if (outcome.databaseDropped) {
+            dbStatus = 'dropped';
+          } else if (outcome.reason === 'no database provisioned') {
+            dbStatus = 'none';
+          } else {
+            dbStatus = 'retained';
+          }
+          // A database that was dropped but whose role survived is a tracked
+          // orphan, not a silent no-op — logged distinctly from the "nothing
+          // happened" warning below so it isn't lost in an identical message.
+          if (outcome.databaseDropped && !outcome.roleDropped) {
+            console.warn(
+              `[apps.delete] database dropped for ${name} but its role survived (orphaned): ${outcome.reason ?? 'unknown'}`
+            );
+          }
+          // The full reason (which may embed raw pg_dump stderr, i.e. a path leak)
+          // is logged server-side only — never returned to the client.
+          if (!outcome.databaseDropped && outcome.reason !== 'no database provisioned') {
+            console.warn(`[apps.delete] database retained for ${name}: ${outcome.reason}`);
+          }
         }
+      } catch (err) {
+        dbStatus = 'retained';
+        console.warn(`[apps.delete] database teardown threw for ${name}:`, err);
       }
+
+      // Free the app's managed-Redis logical DB (FLUSHDB + release the number).
+      // Idempotent + fail-soft; a no-op when the app had no Redis. `?keepData=true`
+      // skips it (handled by the enclosing `else`).
       try {
-        await fs.rm(path.join(getAppsDirectory(), app.group), { recursive: true, force: true });
-      } catch {
-        // Container folder may already be gone
+        await getRedisProvisioner()?.deprovisionAppRedis(name);
+      } catch (err) {
+        console.warn(`[apps.delete] redis teardown threw for ${name}:`, err);
       }
     }
-  }
 
-  await logActivityFor(auth, {
-    action: 'delete',
-    appName: name,
-  });
-  return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
+    // Remove from state
+    await stateManager.removeApp(name);
+
+    // Clean up secrets so a future same-named app doesn't inherit them
+    try {
+      await getSecretManager().deleteAll(name);
+    } catch {
+      // Secret manager may not be initialised (tests / early failures)
+    }
+
+    // Purge deploy history so a future same-named app doesn't inherit the
+    // deleted app's deploy timeline (and, more importantly, its owner-scoped
+    // episodes leaking to whoever registers the name next).
+    try {
+      getDeployTracker().purgeApp(name);
+    } catch {
+      // Deploy tracker may not be initialised (tests / early failures)
+    }
+
+    // Remove app config (e.g. appconf/webapps/ezsign.yaml)
+    try {
+      const configService = getAppConfigService();
+      await configService.deleteConfig(name);
+    } catch {
+      // Config may not exist
+    }
+
+    // Delete the app folder from the filesystem so the watcher doesn't re-detect it
+    if (app.path) {
+      try {
+        await fs.rm(app.path, { recursive: true, force: true });
+      } catch {
+        // Folder may already be gone
+      }
+    }
+
+    // Remove the name-keyed artifacts that live outside the app folder (logs,
+    // and DROP_DATA_DIR unless keepData). This route does its own inline
+    // teardown rather than calling platform.teardownApp, so without this the
+    // previous tenant's logs and persistent data survive under a name that is
+    // now free for anyone to re-register. Best-effort — never fails the delete.
+    try {
+      await getPlatformOps()?.purgeAppArtifacts(name, { keepData });
+    } catch {
+      // Platform not wired (direct ApiServer construction in tests) or cleanup
+      // failed; the delete itself has already succeeded.
+    }
+
+    // If this app was a monorepo group child and is now the LAST remaining
+    // child of its group, also remove the group's CONTAINER folder
+    // (webapps/<group>/, holding the root drop.yaml with `services:`) — left
+    // behind, it would regenerate the just-deleted child on the watcher's next
+    // scan. The container's own state entry carries the group tag too and must
+    // not count as a sibling; with no real children left it goes as well, or it
+    // would linger as an invisible orphan.
+    if (app.group) {
+      const groupApps = stateManager.getAllApps().filter(a => a.group === app.group);
+      const remainingSiblings = groupApps.filter(a => !a.isGroupContainer);
+      if (remainingSiblings.length === 0) {
+        // Only containers the requester may access: group tags are
+        // tenant-influenced, so a child delete must not cascade into another
+        // user's colliding container entry/folder.
+        for (const container of groupApps.filter(a => a.isGroupContainer && canAccess(auth, a))) {
+          try {
+            await stateManager.removeApp(container.name);
+            if (container.path) {
+              await fs.rm(container.path, { recursive: true, force: true });
+            }
+            // The container is detected and built before expansion, so it can
+            // have deploy details of its own — and its log directory. This
+            // cascade never went through purgeAppArtifacts, so those details
+            // kept live name-keyed log offsets with no retention stamp, which
+            // also put them outside the serve-time guard.
+            await getPlatformOps()?.purgeAppArtifacts(container.name, { keepData });
+          } catch {
+            // Container entry/folder may already be gone
+          }
+        }
+        try {
+          await fs.rm(path.join(getAppsDirectory(), app.group), { recursive: true, force: true });
+        } catch {
+          // Container folder may already be gone
+        }
+      }
+    }
+
+    await logActivityFor(auth, {
+      action: 'delete',
+      appName: name,
+    });
+    return c.json(success({ message: `Application '${name}' removed`, database: dbStatus }));
+  } finally {
+    releaseApp?.();
+  }
 });
 
 // POST /apps/:name/start - Start application
@@ -1004,6 +1156,9 @@ apps.post('/:name/start', async c => {
     });
     return c.json(success({ message: `Application '${name}' started`, status }));
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1105,8 +1260,19 @@ apps.post('/:name/promote', async c => {
     });
     return c.json(success({ app: name, promoted: true }));
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+    }
+    // promoteApp claims the app before it touches anything, so a build that
+    // started in the meantime surfaces here (not as a 500).
+    if (err instanceof AppInProgressError) {
+      return c.json(
+        error(ErrorCodes.CONFLICT, `Application '${name}' is building or deploying - retry once it settles`),
+        409
+      );
     }
     const message = err instanceof Error ? err.message : 'Promote failed';
     if (message.includes('awaiting promotion')) {
@@ -1139,6 +1305,9 @@ apps.post('/:name/restart', async c => {
     });
     return c.json(success({ message: `Application '${name}' restarted`, status }));
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1154,6 +1323,91 @@ apps.post('/:name/restart', async c => {
     const message = err instanceof Error ? err.message : 'Failed to restart';
     return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
+});
+
+// ============ Explicit redeploy (#359) ============
+
+/** Status and API code for each way an explicit redeploy can be refused. */
+const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 400 | 404 | 409 | 429 | 503 | 507; code: string }> = {
+  NOT_FOUND: { status: 404, code: ErrorCodes.NOT_FOUND },
+  // The app exists but its folder does not: a conflict with the app's state, not an unknown app (404).
+  APP_SOURCE_MISSING: { status: 409, code: 'APP_SOURCE_MISSING' },
+  APP_BUSY: { status: 409, code: 'APP_BUSY' },
+  APP_STOPPED: { status: 409, code: 'APP_STOPPED' },
+  // Rendered by appSuspendedResponse (see redeployRefusalResponse); the entry keeps the Record total.
+  APP_SUSPENDED: { status: 409, code: 'APP_SUSPENDED' },
+  INVALID_GIT_SOURCE: { status: 400, code: ErrorCodes.VALIDATION_ERROR },
+  // Reached only by a caller that skipped the route's resolution to the container.
+  REDEPLOY_VIA_CONTAINER: { status: 409, code: 'REDEPLOY_VIA_CONTAINER' },
+  SERVICE_UNAVAILABLE: { status: 503, code: ErrorCodes.SERVICE_UNAVAILABLE },
+  RATE_LIMITED: { status: 429, code: ErrorCodes.RATE_LIMITED },
+  INSUFFICIENT_DISK: { status: 507, code: 'INSUFFICIENT_DISK' },
+};
+
+function redeployRefusalResponse(c: Context, refusal: RedeployRefusal, appName: string) {
+  if (refusal.code === 'APP_SUSPENDED') {
+    return appSuspendedResponse(c, new AppSuspendedError(appName, refusal.suspension));
+  }
+  const { status, code } = REDEPLOY_REFUSALS[refusal.code];
+  if (refusal.retryAfterSeconds !== undefined) c.header('Retry-After', String(refusal.retryAfterSeconds));
+  return c.json(
+    error(
+      code,
+      refusal.message,
+      refusal.retryAfterSeconds !== undefined ? { retryAfterSeconds: refusal.retryAfterSeconds } : undefined
+    ),
+    status as 404
+  );
+}
+
+// POST /apps/:name/redeploy - rebuild an app and swap it in. A git-backed app
+// first lands its repository's newest commit (its stored token only: this
+// surface has no tokenId to choose one); any other app is rebuilt from the
+// source already on disk. The platform waits up to 10s for a builder slot: in
+// time the 202 carries the deploy id; otherwise it says `accepted` and the
+// redeploy carries on in the background. Either way `follow` (omitted for a
+// role-none caller, which cannot read /deploys) is the app + since stream
+// (GET /deploys/stream), NOT the by-id stream: between the mint and the build's
+// first event the deploy has no episode, and the by-id stream 404s there, while
+// the since-stream waits for it (and shows a refusal after the wait). Nothing
+// that is slow runs inside the request: a git-backed app is answered
+// `accepted` as soon as it is admitted, and its clone, land and build carry
+// on in the background (a failure there is a failed deploy on the since-stream).
+// A monorepo container is not built: it is re-expanded in the background, and
+// the 202 says `group` with the container's name. Its services deploy under
+// their own names, so follow them per service; the container's own stream shows
+// only a refusal. A service of a git-deployed group is redeployed through its
+// container, as /git/redeploy does: the answer then names the container.
+apps.post('/:name/redeploy', async c => {
+  const auth = (c.get as Function)('auth') as AuthContext | undefined;
+  const name = c.req.param('name');
+
+  // Authorization, git-group resolution and the actor live in redeployFor, shared with the MCP tool.
+  const outcome = await redeployFor(auth, name);
+  if (outcome.kind === 'not-found') throw new NotFoundError(`Application '${name}' not found`);
+  if (outcome.kind === 'unavailable') {
+    return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+  const { target, acceptedAt, result, detail } = outcome;
+  if ('refused' in result) return redeployRefusalResponse(c, result.refused, target);
+
+  await logActivityFor(auth, { action: 'redeploy', appName: target, detail });
+  // A scope-only caller (role 'none') cannot read /deploys at all (its floor is
+  // 'readonly'), so a URL into it would only 403: it gets the facts and no link.
+  const follow =
+    auth?.role === 'none'
+      ? undefined
+      : `/api/v1/deploys/stream?app=${encodeURIComponent(target)}&since=${encodeURIComponent(acceptedAt)}`;
+  if ('group' in result) {
+    return c.json(
+      success({ group: true, container: result.group.container, acceptedAt, ...(follow ? { follow } : {}) }),
+      202
+    );
+  }
+  if ('accepted' in result) {
+    return c.json(success({ accepted: true, acceptedAt, ...(follow ? { follow } : {}) }), 202);
+  }
+  return c.json(success({ deployId: result.started, acceptedAt, ...(follow ? { follow } : {}) }), 202);
 });
 
 // ============ Rollback (#296) ============
@@ -1223,6 +1477,9 @@ apps.post('/:name/rollback', async c => {
         409
       );
     }
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1241,7 +1498,7 @@ apps.post('/:name/rollback', async c => {
  * module) so an unrecognized id is rejected with a clear message before ever
  * reaching the platform op.
  */
-const ATTACHABLE_SERVICE_IDS = ['postgres', 'redis'] as const;
+const ATTACHABLE_SERVICE_IDS = ['postgres', 'redis', 'object-storage'] as const;
 
 // POST /apps/:name/services/:id - Attach a backing service (DROP-151 Phase 2).
 // Quota check -> provision -> persist intent -> restart; see
@@ -1297,6 +1554,9 @@ apps.post('/:name/services/:id', async c => {
       success({ message: `${serviceId} attached to '${name}'`, envVarNames: result.envVarNames })
     );
   } catch (err) {
+    if (err instanceof AppSuspendedError) {
+      return appSuspendedResponse(c, err);
+    }
     if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
       return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
     }
@@ -1357,6 +1617,13 @@ apps.delete('/:name/services/:id', async c => {
   const ops = getPlatformOps();
   if (!ops) {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
+  }
+
+  // Detaching object storage deletes the bucket and its objects, with no
+  // backup (postgres dumps first; redis is a cache). See bucketDestructionRefusal.
+  if (serviceId === 'object-storage') {
+    const refusal = bucketDestructionRefusal(c, auth, name, 'Detaching object storage');
+    if (refusal) return refusal;
   }
 
   try {
@@ -1758,6 +2025,23 @@ apps.put('/:name/capabilities', async c => {
     throw new ValidationError(`Unknown scope(s): ${unknownScopes.join(', ')}`);
   }
 
+  // Before the grant is written: the restart below would refuse, but by then the
+  // grant (a credential the app is handed on its next start) would already be stored.
+  // A refused app may still have its grant NARROWED or cleared (the safe direction,
+  // and the only way to take a credential back from a suspended app): the new scopes
+  // must be a subset of the stored ones, and nothing is restarted.
+  const suspended = suspensionRefusal(name);
+  if (suspended) {
+    const stored = getAppConfigService().getConfig(name)?.grantedApiScopes ?? [];
+    if (scopes.some(s => !stored.includes(s))) return appSuspendedResponse(c, suspended);
+    // The key the app was last started with carries the old, wider scopes, and nothing
+    // restarts to re-mint it: a narrowing revokes it, whatever refused the start, before
+    // anything else can fail. An unchanged PUT keeps a working key.
+    if (stored.some(s => !scopes.includes(s))) {
+      await deleteApiKeysByName(appProvisionKeyName(name));
+    }
+  }
+
   // grantedApiScopes is a SYSTEM_CONFIG_FIELD — updateConfig strips it, so
   // this uses its unstripped mirror. updateSystemConfig (not
   // upsertSystemConfig): the null-on-missing check has to happen INSIDE the
@@ -1777,28 +2061,34 @@ apps.put('/:name/capabilities', async c => {
     return c.json(error(ErrorCodes.SERVICE_UNAVAILABLE, 'Platform operations unavailable'), 503);
   }
 
-  try {
-    await ops.restartApp(name);
-  } catch (err) {
-    if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
-      return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+  if (!suspended) {
+    try {
+      await ops.restartApp(name);
+    } catch (err) {
+      if (err instanceof AppSuspendedError) {
+        return appSuspendedResponse(c, err);
+      }
+      if (err instanceof AppInProgressError || err instanceof StaleDependenciesError) {
+        return c.json(error(ErrorCodes.CONFLICT, err.message), 409);
+      }
+      if (err instanceof AppNeedsConfigError) {
+        return c.json(
+          error(
+            ErrorCodes.CONFLICT,
+            needsConfigDetail(err, name)
+          ),
+          409
+        );
+      }
+      const message = err instanceof Error ? err.message : 'Failed to restart';
+      return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
     }
-    if (err instanceof AppNeedsConfigError) {
-      return c.json(
-        error(
-          ErrorCodes.CONFLICT,
-          needsConfigDetail(err, name)
-        ),
-        409
-      );
-    }
-    const message = err instanceof Error ? err.message : 'Failed to restart';
-    return c.json(error(ErrorCodes.INTERNAL_ERROR, message), 500);
   }
 
   await logActivityFor(auth, {
     action: 'grant-capabilities',
     appName: name,
+    ...(suspended ? { detail: 'Narrowed while the app is suspended; not restarted' } : {}),
   });
 
   return c.json(

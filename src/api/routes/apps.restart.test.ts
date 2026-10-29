@@ -71,7 +71,7 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
     await server.initialize();
     hono = server.getApp();
 
-    const owner = await createUser('owner', 'password123', 'user');
+    const owner = await createUser({ username: 'owner', role: 'user', credential: { password: 'password123' } });
     ownerId = owner.id;
     ownerToken = await getTestToken('owner', 'password123');
 
@@ -269,7 +269,7 @@ describe('POST /apps/:name/start and /apps/:name/restart (platform ops)', () => 
 
   describe('role guard (item 5)', () => {
     it('blocks a readonly-role token with 403', async () => {
-      await createUser('viewer', 'password123', 'readonly');
+      await createUser({ username: 'viewer', role: 'readonly', credential: { password: 'password123' } });
       const viewerToken = await getTestToken('viewer', 'password123');
       setPlatformOps(makeOps());
 

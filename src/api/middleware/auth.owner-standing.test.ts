@@ -82,7 +82,7 @@ describe('owner-derived API-key standing', () => {
       // always minted role:'none' regardless of who mints them. An "owner
       // wins" (max-of-the-two) implementation would promote this to 'admin'
       // and pass straight through; minRole (lower-of-the-two) must not.
-      const admin = await createUser('root-agent-owner', 'password123', 'admin');
+      const admin = await createUser({ username: 'root-agent-owner', role: 'admin', credential: { password: 'password123' } });
       const { key } = await createApiKey(
         'agent-bot',
         'none',
@@ -101,7 +101,7 @@ describe('owner-derived API-key standing', () => {
       // Proves the role clamp does not collide with the legitimate agent
       // path: mcpAuthMiddleware admits rank-0 agent tokens on kind+scope, a
       // check that is entirely independent of the role clamp above.
-      const admin = await createUser('root-agent-owner-2', 'password123', 'admin');
+      const admin = await createUser({ username: 'root-agent-owner-2', role: 'admin', credential: { password: 'password123' } });
       const { key } = await createApiKey(
         'agent-bot-2',
         'none',
@@ -132,7 +132,7 @@ describe('owner-derived API-key standing', () => {
       // class is built from. Without resolveAgentToken's own floor check, a
       // token minted while its owner was 'user' kept full deploy/create-app
       // authority forever, even after the owner was demoted to 'readonly'.
-      const owner = await createUser('ivan-agent-owner', 'password123', 'user');
+      const owner = await createUser({ username: 'ivan-agent-owner', role: 'user', credential: { password: 'password123' } });
       const { key } = await createApiKey(
         'ivan-agent-bot',
         'none',
@@ -155,7 +155,7 @@ describe('owner-derived API-key standing', () => {
     });
 
     it('an admin-owned agent token is unaffected — the owner still ranks at least user', async () => {
-      const owner = await createUser('ivan-agent-owner-2', 'password123', 'admin');
+      const owner = await createUser({ username: 'ivan-agent-owner-2', role: 'admin', credential: { password: 'password123' } });
       const { key } = await createApiKey(
         'ivan-agent-bot-2',
         'none',
@@ -173,7 +173,7 @@ describe('owner-derived API-key standing', () => {
   });
 
   it("a demoted owner's admin-role key loses admin standing on the very next request", async () => {
-    const owner = await createUser('carol-demoted', 'password123', 'admin');
+    const owner = await createUser({ username: 'carol-demoted', role: 'admin', credential: { password: 'password123' } });
     const { key } = await createApiKey('carol-admin-key', 'admin', undefined, undefined, owner.id);
 
     const before = await probeWith(adminGate, key);
@@ -186,7 +186,7 @@ describe('owner-derived API-key standing', () => {
   });
 
   it("attributes an owned key's request to the OWNER's username, not the key's own name", async () => {
-    const owner = await createUser('grace-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'grace-owner', role: 'user', credential: { password: 'password123' } });
     const { key } = await createApiKey('grace-ci-key', 'user', undefined, undefined, owner.id);
 
     const { auth } = await probeWith(anyAuth, key);
@@ -218,7 +218,7 @@ describe('owner-derived API-key standing', () => {
     // alone leaves this frozen, because requireCapability's scope arm
     // (`auth.role === 'admin' || auth.scopes?.includes(cap)`) never
     // consults role at all.
-    const owner = await createUser('dave-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'dave-owner', role: 'user', credential: { password: 'password123' } });
     const { key } = await createApiKey(
       'dave-cap-key',
       'user',
@@ -244,7 +244,7 @@ describe('owner-derived API-key standing', () => {
     // AT that one rank) would satisfy the demotion test above and still
     // leave a `role:'none'` key free to carry 'users:create' forever, which
     // is precisely finding F's escalation shape.
-    const owner = await createUser('holly-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'holly-owner', role: 'user', credential: { password: 'password123' } });
     const { key } = await createApiKey(
       'holly-scoped-none-key',
       'none',
@@ -265,7 +265,7 @@ describe('owner-derived API-key standing', () => {
     // agent-grammar scope with a control-plane one. A role:'none' key's
     // clamped role is always 'none' (below 'user'), so this is the case that
     // would break EVERY agent token if the suppression were too broad.
-    const owner = await createUser('erin-owner', 'password123', 'user');
+    const owner = await createUser({ username: 'erin-owner', role: 'user', credential: { password: 'password123' } });
     const { key } = await createApiKey(
       'erin-agent-key',
       'none',
@@ -288,7 +288,7 @@ describe('owner-derived API-key standing', () => {
     // 403ing with no signal anywhere is not acceptable.
     it('warns, naming the key, when its role outranks its owner', async () => {
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
-      const ro = await createUser('eve-mismatch-owner', 'password123', 'readonly');
+      const ro = await createUser({ username: 'eve-mismatch-owner', role: 'readonly', credential: { password: 'password123' } });
       await createApiKey('mismatched-key', 'admin', undefined, undefined, ro.id);
 
       warnSpy.mockClear();
@@ -313,7 +313,7 @@ describe('owner-derived API-key standing', () => {
       // boot with agent tokens in play does not spam a false "outranks"
       // warning for every one of them.
       const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
-      const admin = await createUser('frank-admin-owner', 'password123', 'admin');
+      const admin = await createUser({ username: 'frank-admin-owner', role: 'admin', credential: { password: 'password123' } });
       await createApiKey('agent-token-key', 'none', undefined, ['app:demo:deploy'], admin.id, {
         kind: 'agent',
       });

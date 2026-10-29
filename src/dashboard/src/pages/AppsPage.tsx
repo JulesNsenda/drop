@@ -17,7 +17,8 @@ import {
   Trash2,
   User,
 } from 'lucide-react';
-import { useApps, appAction, deleteApp } from '../hooks/useApi';
+import { useApps, appAction, deleteApp, appBucketRisk } from '../hooks/useApi';
+import { describeDeleteBucketWarning } from '../components/attach-state';
 import type { App } from '../hooks/useApi';
 import { useAuth } from '../hooks/useAuth';
 import { appLinkInfo } from '../api/client';
@@ -89,16 +90,19 @@ function AppListCard({
   };
 
   const remove = async () => {
+    const bucketRisk = await appBucketRisk(app.name);
     const confirmed = await confirmDialog({
       title: `Delete ${app.name}?`,
-      message: 'This removes the app and its routing. Deployed files are not recoverable from here.',
+      message:
+        'This removes the app and its routing. Deployed files are not recoverable from here.' +
+        describeDeleteBucketWarning(bucketRisk),
       confirmText: 'Delete',
       variant: 'danger',
     });
     if (!confirmed) return;
     setBusy('delete');
     try {
-      const okDelete = await deleteApp(app.name);
+      const okDelete = await deleteApp(app.name, { confirmBucket: bucketRisk !== 'none' });
       toast(okDelete ? 'success' : 'error', okDelete ? `Deleted ${app.name}` : `Failed to delete ${app.name}`);
       if (okDelete) onChanged();
     } catch {

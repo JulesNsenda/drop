@@ -203,26 +203,36 @@ export interface AppErrorPayload extends BaseEvent {
   context?: string;
 }
 
+/** What started a deploy, as the deploy tracker reports it (the existing wire values). */
+export type DeployTriggerTag = 'deploy' | 'hot-reload' | 'upload';
+
 // Build event payloads
+
 export interface BuildQueuedPayload extends BaseEvent {
   appId: string;
   buildId: string;
 }
 
-/**
- * The platform-minted deploy id, threaded from the call site that began this
- * deploy through the build to DeployTracker, so one deploy is addressable end
- * to end (build log file, episode, structured result).
- *
- * OPTIONAL on purpose. DeployTracker keeps its mint-a-fresh-one fallback for
- * any publisher that doesn't supply it — tests constructing payloads by hand,
- * and any future publisher — so the fallback stays live code rather than
- * becoming unreachable. The tracker logs when it takes that path.
- */
 export interface BuildStartedPayload extends BaseEvent {
   appId: string;
   buildId: string;
+  /**
+   * The platform-minted deploy id, threaded from the call site that began this
+   * deploy through the build to DeployTracker, so one deploy is addressable end
+   * to end (build log file, episode, structured result).
+   *
+   * OPTIONAL on purpose. DeployTracker keeps its mint-a-fresh-one fallback for
+   * any publisher that doesn't supply it — tests constructing payloads by hand,
+   * and any future publisher — so the fallback stays live code rather than
+   * becoming unreachable. The tracker logs when it takes that path.
+   */
   deployId?: string;
+  /**
+   * What started this deploy, when the publisher knows. The tracker prefers it
+   * over the transient tag it inferred from the preceding app:detected /
+   * app:update, which an explicit redeploy (it publishes neither) never sets.
+   */
+  trigger?: DeployTriggerTag;
 }
 
 export interface BuildProgressPayload extends BaseEvent {

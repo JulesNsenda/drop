@@ -16,6 +16,8 @@
  * drop-site `public/llms.txt` (dropkit.sh/llms.txt) in the same change.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { buildMcpServer } from './tools';
 import { DEPLOY_ERROR_CODES } from './deploy-result';
@@ -34,6 +36,7 @@ const PUBLISHED_MCP_TOOLS = [
   'get_deploy_logs',
   'restart_app',
   'rollback_app',
+  'redeploy_app',
   'custom_domain',
 ];
 
@@ -68,6 +71,10 @@ const PUBLISHED_DEPLOY_ERROR_CODES = [
   'READINESS_FAILED',
   'GUARDRAIL_TRIPPED',
   'QUOTA_EXCEEDED',
+  // Owed to drop-site public/llms.txt (#359 Item 5): published here first.
+  'DEPLOY_REFUSED',
+  // Owed to drop-site public/llms.txt (follow-up F2 Item 5): published here first.
+  'DEPLOY_STOPPED',
   'INSTALL_MISSING_DEP',
   'BUILD_TYPE_ERROR',
   'MIGRATION_FAILED',
@@ -97,6 +104,22 @@ function expectPublished(what: string, shipped: string[], published: string[]): 
   if (problems.length) throw new Error(problems.join('\n'));
 }
 
+const AGENT_DEPLOY_DOC = path.resolve(__dirname, '../../../docs/AGENT-DEPLOY.md');
+
+/** Tool names in the first column of the "Hosted MCP" Tools table, and nothing else in the doc. */
+function toolsInAgentDeployDoc(): string[] {
+  const lines = fs.readFileSync(AGENT_DEPLOY_DOC, 'utf8').split(/\r?\n/);
+  const start = lines.findIndex((l) => /^###\s+Tools\s*$/.test(l));
+  if (start < 0) throw new Error('No "### Tools" heading in docs/AGENT-DEPLOY.md');
+  const names: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^#{1,6}\s/.test(line)) break;
+    const m = /^\|\s*`([a-z0-9_]+)`\s*\|/.exec(line);
+    if (m) names.push(m[1]);
+  }
+  return names;
+}
+
 describe('published agent surface matches the code (#303)', () => {
   it('every registered MCP tool is published, and nothing else is', () => {
     const registered: string[] = [];
@@ -115,6 +138,34 @@ describe('published agent surface matches the code (#303)', () => {
     // Guard against the spy silently capturing nothing.
     expect(registered.length).toBeGreaterThan(0);
     expectPublished('MCP tool(s)', registered, PUBLISHED_MCP_TOOLS);
+  });
+
+  it('every registered MCP tool has a row in the docs/AGENT-DEPLOY.md Tools table, and nothing else does', () => {
+    const registered: string[] = [];
+    const spy = jest
+      .spyOn(McpServer.prototype, 'registerTool')
+      .mockImplementation(function (this: McpServer, name: string) {
+        registered.push(name);
+        return {} as ReturnType<McpServer['registerTool']>;
+      } as McpServer['registerTool']);
+    try {
+      buildMcpServer(undefined);
+    } finally {
+      spy.mockRestore();
+    }
+
+    const documented = toolsInAgentDeployDoc();
+    expect(documented.length).toBeGreaterThan(0);
+    const missing = registered.filter((x) => !documented.includes(x));
+    const extra = documented.filter((x) => !registered.includes(x));
+    const problems: string[] = [];
+    if (missing.length) {
+      problems.push(`MCP tool(s) shipped but missing from the Tools table in docs/AGENT-DEPLOY.md: ${missing.join(', ')}.`);
+    }
+    if (extra.length) {
+      problems.push(`MCP tool(s) in the Tools table in docs/AGENT-DEPLOY.md but no longer shipped: ${extra.join(', ')}.`);
+    }
+    if (problems.length) throw new Error(problems.join('\n'));
   });
 
   it('every REST ErrorCodes member is published, and nothing else is', () => {

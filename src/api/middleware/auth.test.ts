@@ -76,7 +76,7 @@ describe('Auth Middleware', () => {
       });
 
       // Create a user
-      await createUser('testuser', 'password123', 'user');
+      await createUser({ username: 'testuser', role: 'user', credential: { password: 'password123' } });
 
       // Re-initialize (simulating restart)
       await initializeAuth({
@@ -96,7 +96,7 @@ describe('Auth Middleware', () => {
 
       // A populated credentials store exists on disk...
       await initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
-      await createUser('realuser', 'password123', 'user');
+      await createUser({ username: 'realuser', role: 'user', credential: { password: 'password123' } });
       expect(await fs.readFile(credentialsPath, 'utf-8')).toContain('realuser');
 
       // ...then it gets corrupted on disk. On restart we must NOT wipe it and
@@ -155,7 +155,7 @@ describe('Auth Middleware', () => {
     });
 
     it('should create a new user', async () => {
-      const user = await createUser('newuser', 'password123', 'user');
+      const user = await createUser({ username: 'newuser', role: 'user', credential: { password: 'password123' } });
 
       expect(user.username).toBe('newuser');
       expect(user.role).toBe('user');
@@ -164,28 +164,28 @@ describe('Auth Middleware', () => {
     });
 
     it('should throw if user already exists', async () => {
-      await createUser('duplicate', 'password123', 'user');
+      await createUser({ username: 'duplicate', role: 'user', credential: { password: 'password123' } });
 
-      await expect(createUser('duplicate', 'password456', 'user')).rejects.toThrow(
+      await expect(createUser({ username: 'duplicate', role: 'user', credential: { password: 'password456' } })).rejects.toThrow(
         "User 'duplicate' already exists"
       );
     });
 
     it('should create users with different roles', async () => {
-      const adminUser = await createUser('adminuser', 'password123', 'admin');
-      const readonlyUser = await createUser('readonlyuser', 'password123', 'readonly');
+      const adminUser = await createUser({ username: 'adminuser', role: 'admin', credential: { password: 'password123' } });
+      const readonlyUser = await createUser({ username: 'readonlyuser', role: 'readonly', credential: { password: 'password123' } });
 
       expect(adminUser.role).toBe('admin');
       expect(readonlyUser.role).toBe('readonly');
     });
 
     it('DROP-130 Item 6: does not stamp createdByScope by default', async () => {
-      const user = await createUser('unmarked-user', 'password123', 'user');
+      const user = await createUser({ username: 'unmarked-user', role: 'user', credential: { password: 'password123' } });
       expect(user.createdByScope).toBeUndefined();
     });
 
     it('DROP-130 Item 6: stamps createdByScope only when the caller explicitly requests it', async () => {
-      const user = await createUser('marked-user', 'password123', 'user', undefined, true, true);
+      const user = await createUser({ username: 'marked-user', role: 'user', credential: { password: 'password123' }, mustChangePassword: true, createdByScope: true });
       expect(user.createdByScope).toBe(true);
     });
   });
@@ -199,7 +199,7 @@ describe('Auth Middleware', () => {
         enableJwt: true,
         enableApiKeys: true,
       });
-      await createUser('testuser', 'correctpassword', 'user');
+      await createUser({ username: 'testuser', role: 'user', credential: { password: 'correctpassword' } });
     });
 
     afterEach(() => {
@@ -225,19 +225,19 @@ describe('Auth Middleware', () => {
     });
 
     it('DROP-130 Item 6: refuses login for a createdByScope account, even with the correct password', async () => {
-      await createUser('scoped-account', 'correctpassword2', 'user', undefined, true, true);
+      await createUser({ username: 'scoped-account', role: 'user', credential: { password: 'correctpassword2' }, mustChangePassword: true, createdByScope: true });
       const result = await authenticateUser('scoped-account', 'correctpassword2');
       expect(result.status).toBe('awaiting_admin_password');
     });
 
     it('DROP-130 Item 6: a wrong password on a createdByScope account still reports plain invalid (no enumeration)', async () => {
-      await createUser('scoped-account-2', 'correctpassword3', 'user', undefined, true, true);
+      await createUser({ username: 'scoped-account-2', role: 'user', credential: { password: 'correctpassword3' }, mustChangePassword: true, createdByScope: true });
       const result = await authenticateUser('scoped-account-2', 'wrongpassword');
       expect(result.status).toBe('invalid');
     });
 
     it('DROP-130 Item 6: resetUserPassword clears the marker, and login then succeeds', async () => {
-      const user = await createUser('scoped-account-3', 'correctpassword4', 'user', undefined, true, true);
+      const user = await createUser({ username: 'scoped-account-3', role: 'user', credential: { password: 'correctpassword4' }, mustChangePassword: true, createdByScope: true });
 
       const blocked = await authenticateUser('scoped-account-3', 'correctpassword4');
       expect(blocked.status).toBe('awaiting_admin_password');
@@ -261,7 +261,7 @@ describe('Auth Middleware', () => {
         enableJwt: true,
         enableApiKeys: true,
       });
-      await createUser('testuser', 'password123', 'user');
+      await createUser({ username: 'testuser', role: 'user', credential: { password: 'password123' } });
       validToken = await getTestToken('testuser', 'password123');
     });
 
@@ -395,8 +395,8 @@ describe('Auth Middleware', () => {
     });
 
     it('should list users without revealing password hashes', async () => {
-      await createUser('user1', 'password1', 'user');
-      await createUser('user2', 'password2', 'admin');
+      await createUser({ username: 'user1', role: 'user', credential: { password: 'password1' } });
+      await createUser({ username: 'user2', role: 'admin', credential: { password: 'password2' } });
 
       const users = listUsers();
       // Admin user + 2 created users
@@ -447,7 +447,7 @@ describe('Auth Middleware', () => {
         enableJwt: true,
         enableApiKeys: true,
       });
-      await createUser('testuser', 'password123', 'user');
+      await createUser({ username: 'testuser', role: 'user', credential: { password: 'password123' } });
       validToken = await getTestToken('testuser', 'password123');
       const { key } = await createApiKey('test-api-key', 'admin');
       validApiKey = key;

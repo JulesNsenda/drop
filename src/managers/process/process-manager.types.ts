@@ -18,6 +18,7 @@ export type ProcessStatusValue =
   | 'stopped'
   | 'errored'
   | 'launching'
+  | 'waiting restart'
   | 'one-launch-status';
 
 /**
@@ -52,6 +53,13 @@ export interface ProcessConfig {
   watch?: boolean;
   /** Ignore watch patterns */
   ignoreWatch?: string[];
+  /**
+   * Inherited environment variables to REMOVE before the app starts: PM2 starts
+   * a process with its own client's environment underneath `env`, so the
+   * platform's secrets reach tenant code unless they are filtered here. A name
+   * that appears in `env` is explicit and is kept.
+   */
+  filterEnv?: readonly string[];
   /** Log file path */
   logFile?: string;
   /** Error log file path */
@@ -190,6 +198,8 @@ export interface PM2StartOptions {
   interpreter?: string;
   watch?: boolean;
   ignore_watch?: string[];
+  /** PM2 drops every inherited variable whose name contains one of these (explicit `env` is layered back on top). */
+  filter_env?: string[];
   log_file?: string;
   error_file?: string;
   out_file?: string;

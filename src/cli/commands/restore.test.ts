@@ -283,6 +283,20 @@ describe('drop restore', () => {
     }
   });
 
+  it('restores the object-storage allocation store, never the credential, and says to re-enter it (#301)', async () => {
+    await seedBackupFileStores(backupDir);
+    await fs.writeFile(path.join(backupDir, 'object-storage.json'), '{"site":{}}');
+    // Even a stray copy in a hand-made backup is not restored.
+    await fs.writeFile(path.join(backupDir, 'object-storage-credential.json'), '{"enc":1}');
+
+    await runRestore(dropRoot, backupDir, ['--confirm']);
+
+    const restoredFiles = await readDirSafe(svcDirOf(dropRoot));
+    expect(restoredFiles).toContain('object-storage.json');
+    expect(restoredFiles).not.toContain('object-storage-credential.json');
+    expect(consoleText()).toMatch(/AWS admin credential is NOT part of a backup/);
+  });
+
   it('copies backupDir/webapps to data/appconf/webapps recursively', async () => {
     await seedBackupFileStores(backupDir);
     const webappsSrc = path.join(backupDir, 'webapps', 'myapp');

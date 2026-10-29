@@ -3,6 +3,7 @@ import { apiJson, apiJsonWithStatus, jsonBody } from '../api/client';
 import { redeployBody } from '../lib/redeploy-credential';
 import { createPollTracker, PollTracker } from '../lib/poll-tracker';
 import { asArray, asArrayOr } from '../lib/api-shape';
+import type { BucketDeleteRisk } from '../components/attach-state';
 
 export interface GitSource {
   repoUrl: string;
@@ -51,6 +52,8 @@ export interface App {
    * its own. Lets the dashboard offer a "Redeploy group" action on any child.
    */
   groupGitBacked?: boolean;
+  /** Present while an administrator has suspended the app; `by` and `reason` only for admins. */
+  suspended?: AppSuspensionDto;
   /**
    * Present when the app speaks MCP (Step 11). `url` is composed server-side
    * from the app's own hostname and a validated path. `auth: 'none'` means DROP
@@ -65,6 +68,16 @@ export interface App {
   /** Live uptime in ms since the current process started (present only while status === 'running'). */
   uptime?: number | null;
 }
+
+/**
+ * Why an app cannot be started. `record` is a suspension (`at` for everyone,
+ * `by` and `reason` for admins only); the other two kinds, shown to admins only,
+ * mean the platform's suspension store cannot answer and every app is refused.
+ */
+export type AppSuspensionDto =
+  | { kind: 'record'; at?: string; by?: string; reason?: string }
+  | { kind: 'store-unreadable' }
+  | { kind: 'not-loaded' };
 
 export interface ComponentHealth {
   status: 'up' | 'down' | 'unknown';
@@ -320,8 +333,29 @@ export async function appAction(
   return json.success;
 }
 
-export async function deleteApp(name: string): Promise<boolean> {
-  const json = await apiJson(`/apps/${name}`, { method: 'DELETE' });
+/**
+ * Whether deleting the app would destroy an object-storage bucket (#301), read
+ * from the same panel endpoint the Database tab uses. A failed or unreadable
+ * lookup is `unknown`, never `none`: the dialog must not claim there is
+ * nothing to lose because it could not look.
+ */
+export async function appBucketRisk(name: string): Promise<BucketDeleteRisk> {
+  const json = await apiJson<{ objectStorage?: { provisioned?: boolean; unreadable?: boolean } }>(
+    `/db/${encodeURIComponent(name)}`
+  );
+  const state = json.success ? json.data?.objectStorage : undefined;
+  if (!state) return 'unknown';
+  return state.provisioned || state.unreadable ? 'bucket' : 'none';
+}
+
+/**
+ * `confirmBucket` sends the explicit `?confirm=<app>` the server demands before
+ * it will delete an app that may hold a bucket. Pass it only after the dialog
+ * has told the person (see `describeDeleteBucketWarning`).
+ */
+export async function deleteApp(name: string, opts?: { confirmBucket?: boolean }): Promise<boolean> {
+  const qs = opts?.confirmBucket ? `?confirm=${encodeURIComponent(name)}` : '';
+  const json = await apiJson(`/apps/${name}${qs}`, { method: 'DELETE' });
   return json.success;
 }
 
@@ -339,6 +373,15 @@ export interface GitTokenInfo {
   id: string;
   name: string;
   createdAt: string;
+  /** Owning user id; only an admin's list carries it. Absent on a legacy token. */
+  ownerUserId?: string;
+  /** The owner's username (admin view); absent if the account no longer resolves. */
+  ownerName?: string;
+}
+
+/** How an admin sees a token in a picker or list: its owner, or "legacy" when it has none. */
+export function gitTokenOwnerLabel(t: GitTokenInfo): string {
+  return t.ownerUserId ? `owner ${t.ownerName ?? 'unknown user'}` : 'legacy';
 }
 
 export async function gitDeploy(request: {

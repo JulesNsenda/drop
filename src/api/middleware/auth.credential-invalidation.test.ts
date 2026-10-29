@@ -161,7 +161,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
 
   describe('verifyApiKey', () => {
     it('fails CLOSED when the stored key record has no createdAt at all', async () => {
-      const bob = await createUser('bob-key-nocreated', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-key-nocreated', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
       // Minted AFTER re-enable — would authenticate fine if createdAt were trusted.
@@ -181,7 +181,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('fails CLOSED when the stored key record has an unparseable createdAt', async () => {
-      const bob = await createUser('bob-key-badcreated', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-key-badcreated', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
       await clockTick();
@@ -203,7 +203,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
 
   describe('rotateRefreshToken', () => {
     it('rejects a refresh token issued BEFORE suspension, even after re-enable', async () => {
-      const bob = await createUser('bob-refresh', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-refresh', role: 'user', credential: { password: PASSWORD } });
       const refreshToken = await issueRefreshToken(bob.id, 'client-1', 'sid-1');
       await clockTick();
 
@@ -214,7 +214,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('accepts a refresh token issued AFTER re-enable', async () => {
-      const bob = await createUser('bob-refresh-2', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-refresh-2', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
       await clockTick();
@@ -225,7 +225,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('fails CLOSED when the stored record has no createdAt at all', async () => {
-      const bob = await createUser('bob-refresh-3', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-refresh-3', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
       // Minted AFTER re-enable — would authenticate fine if createdAt were trusted.
@@ -246,7 +246,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
 
   describe('verifyOAuthAccessToken', () => {
     it('rejects an access token minted BEFORE suspension, for the rest of its lifetime', async () => {
-      const bob = await createUser('bob-oauth', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-oauth', role: 'user', credential: { password: PASSWORD } });
       const token = await mintOAuthAccessToken(bob, AUD, 'sid-oauth-1');
       await clockTick();
       expect(await verifyOAuthAccessToken(token, AUD)).not.toBeNull();
@@ -258,7 +258,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('accepts an access token minted AFTER re-enable', async () => {
-      const bob = await createUser('bob-oauth-2', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-oauth-2', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
       await waitPastSecondBoundary();
@@ -269,7 +269,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     }, 10_000);
 
     it('fails CLOSED when the token carries no iat claim', async () => {
-      const bob = await createUser('bob-oauth-3', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-oauth-3', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
 
@@ -297,7 +297,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
 
   describe('verifyAppMcpAccessToken', () => {
     it('rejects an app-mcp token minted BEFORE a forced password reset', async () => {
-      const bob = await createUser('bob-appmcp', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-appmcp', role: 'user', credential: { password: PASSWORD } });
       const token = await mintAppMcpAccessToken(bob, AUD, 'my-app', 'sid-app-1');
       expect(await verifyAppMcpAccessToken(token, AUD, 'my-app')).not.toBeNull();
 
@@ -307,7 +307,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('accepts an app-mcp token minted AFTER the reset', async () => {
-      const bob = await createUser('bob-appmcp-2', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-appmcp-2', role: 'user', credential: { password: PASSWORD } });
       await resetUserPassword(bob.id, 'new-password-123456');
       await waitPastSecondBoundary();
 
@@ -321,7 +321,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // tests above, for the fourth predatesInvalidationStamp call site: a
       // token live AT suspension time must not come back to life just because
       // the account was later re-enabled.
-      const bob = await createUser('bob-appmcp-3', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-appmcp-3', role: 'user', credential: { password: PASSWORD } });
       const token = await mintAppMcpAccessToken(bob, AUD, 'my-app', 'sid-app-3');
       expect(await verifyAppMcpAccessToken(token, AUD, 'my-app')).not.toBeNull();
 
@@ -332,7 +332,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('accepts an app-mcp token minted AFTER re-enable', async () => {
-      const bob = await createUser('bob-appmcp-4', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-appmcp-4', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
       await waitPastSecondBoundary();
@@ -364,7 +364,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     };
 
     it('rejects a session JWT issued BEFORE suspension, even after re-enable — the resurrection case', async () => {
-      const bob = await createUser('bob-jwt-suspend', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-jwt-suspend', role: 'user', credential: { password: PASSWORD } });
       const before = await loginToken('bob-jwt-suspend', PASSWORD);
       await clockTick();
 
@@ -375,7 +375,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('accepts a session JWT issued AFTER re-enable', async () => {
-      const bob = await createUser('bob-jwt-suspend-2', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-jwt-suspend-2', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
       await waitPastSecondBoundary();
@@ -386,7 +386,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     }, 10_000);
 
     it('rejects a session JWT issued BEFORE a forced password reset', async () => {
-      const bob = await createUser('bob-jwt-reset-pre', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-jwt-reset-pre', role: 'user', credential: { password: PASSWORD } });
       const before = await loginToken('bob-jwt-reset-pre', PASSWORD);
 
       await resetUserPassword(bob.id, 'new-password-123456');
@@ -395,7 +395,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('fails CLOSED when the JWT carries no iat claim', async () => {
-      const bob = await createUser('bob-jwt-noiat', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-jwt-noiat', role: 'user', credential: { password: PASSWORD } });
       await resetUserPassword(bob.id, 'new-password-123456');
 
       // Hand-crafted to match the `jose` mock's format (header.payload.signature,
@@ -415,7 +415,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
 
   describe('resetUserPassword — containment, not onboarding', () => {
     it('kills a pre-existing API key (a forced reset must reach non-JWT credentials too)', async () => {
-      const bob = await createUser('bob-reset', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-reset', role: 'user', credential: { password: PASSWORD } });
       const { key } = await createApiKey('bob-reset-ci', 'user', undefined, undefined, bob.id);
       expect(await verifyApiKey(key)).not.toBeNull();
 
@@ -428,7 +428,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // The exact scenario Item 5 exists to keep working: an admin can still
       // mint/use a CI key for this user without the human first completing
       // the interactive PUT /auth/password flow.
-      const bob = await createUser('bob-reset-2', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-reset-2', role: 'user', credential: { password: PASSWORD } });
       await resetUserPassword(bob.id, 'new-password-123456');
 
       const { key } = await createApiKey('bob-reset-2-ci', 'user', undefined, undefined, bob.id);
@@ -440,7 +440,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // An admin creating an account and immediately minting a key for it
       // (before the human ever logs in) must not find that key DOA — only a
       // CONTAINMENT reset does that, never onboarding.
-      const carol = await createUser('carol-onboarding', PASSWORD, 'user', undefined, true);
+      const carol = await createUser({ username: 'carol-onboarding', role: 'user', credential: { password: PASSWORD }, mustChangePassword: true });
       expect(carol.mustChangePassword).toBe(true);
 
       const { key } = await createApiKey('carol-onboarding-ci', 'user', undefined, undefined, carol.id);
@@ -449,7 +449,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('changePassword (self-service) does NOT clear the stamp — a contained credential stays dead', async () => {
-      const bob = await createUser('bob-reset-3', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-reset-3', role: 'user', credential: { password: PASSWORD } });
       const { key } = await createApiKey('bob-reset-3-ci', 'user', undefined, undefined, bob.id);
 
       await resetUserPassword(bob.id, 'temp-password-123456');
@@ -458,7 +458,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // Bob completes the forced change — this must not resurrect the key
       // that was live before the reset.
       const changed = await changePassword(bob.id, 'temp-password-123456', 'final-password-123456');
-      expect(changed).toBe(true);
+      expect(changed).toBe('changed');
 
       expect(await verifyApiKey(key)).toBeNull();
 
@@ -469,7 +469,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
 
   describe('listApiKeys — DROP-130 MEDIUM-7: killed credentials must not list as live', () => {
     it('flags a key invalidated once it predates the owner\'s containment stamp', async () => {
-      const bob = await createUser('bob-listed', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-listed', role: 'user', credential: { password: PASSWORD } });
       const { apiKey } = await createApiKey('bob-listed-ci', 'user', undefined, undefined, bob.id);
 
       const before = listApiKeys().find((k) => k.id === apiKey.id);
@@ -482,7 +482,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('does not flag a fresh key minted AFTER the stamp', async () => {
-      const bob = await createUser('bob-listed-2', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-listed-2', role: 'user', credential: { password: PASSWORD } });
       await suspendUser(bob.id);
       await updateUser(bob.id, { enabled: true });
 
@@ -513,7 +513,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // A completely unrelated user is under containment at the same time —
       // proves the ownerless key's fate is not accidentally tied to whatever
       // OTHER user happens to be mid-incident.
-      const victim = await createUser('victim-under-reset', PASSWORD, 'user');
+      const victim = await createUser({ username: 'victim-under-reset', role: 'user', credential: { password: PASSWORD } });
       await resetUserPassword(victim.id, 'new-password-123456');
 
       const { status, auth } = await probeWithKey(ownerlessKey);
@@ -530,7 +530,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // key would 403 forever — the owner's mustChangePassword flag only
       // clears on an interactive PUT /auth/password, which a key can never do
       // on its owner's behalf.
-      const bob = await createUser('bob-owned-key-post-reset', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-owned-key-post-reset', role: 'user', credential: { password: PASSWORD } });
       await resetUserPassword(bob.id, 'new-password-123456');
       const { key } = await createApiKey('bob-owned-key-post-reset-ci', 'user', undefined, undefined, bob.id);
 
@@ -564,14 +564,14 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     };
 
     it('403s a non-exempt route for a JWT session whose user must change their password', async () => {
-      await createUser('dave-mustchange-1', PASSWORD, 'user', undefined, true);
+      await createUser({ username: 'dave-mustchange-1', role: 'user', credential: { password: PASSWORD }, mustChangePassword: true });
       const token = await loginToken('dave-mustchange-1', PASSWORD);
 
       expect((await probeJwt(token)).status).toBe(403);
     });
 
     it('exempts PUT /auth/password and GET /auth/me from the gate', async () => {
-      await createUser('dave-mustchange-2', PASSWORD, 'user', undefined, true);
+      await createUser({ username: 'dave-mustchange-2', role: 'user', credential: { password: PASSWORD }, mustChangePassword: true });
       const token = await loginToken('dave-mustchange-2', PASSWORD);
 
       expect((await probeJwt(token, { method: 'PUT', path: '/auth/password' })).status).toBe(200);
@@ -579,7 +579,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
     });
 
     it('does not 403 once mustChangePassword is false (normal onboarded/self-signed-up session)', async () => {
-      await createUser('dave-mustchange-3', PASSWORD, 'user');
+      await createUser({ username: 'dave-mustchange-3', role: 'user', credential: { password: PASSWORD } });
       const token = await loginToken('dave-mustchange-3', PASSWORD);
 
       expect((await probeJwt(token)).status).toBe(200);
@@ -596,7 +596,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // check exists, per `predatesInvalidationStamp`'s fail-closed contract
       // and `waitPastSecondBoundary`'s documented granularity limit (not
       // test flakiness — see its docstring above).
-      const bob = await createUser('bob-jwt-reset', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-jwt-reset', role: 'user', credential: { password: PASSWORD } });
       const before = await loginToken('bob-jwt-reset', PASSWORD);
       expect((await probeJwt(before)).status).toBe(200);
 
@@ -621,7 +621,7 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       // Proves the mustChangePassword gate itself is untouched by HIGH-3 —
       // only a JWT minted close enough to the stamp to lose the
       // second-granularity race gets the 401 above.
-      const bob = await createUser('bob-jwt-reset-2', PASSWORD, 'user');
+      const bob = await createUser({ username: 'bob-jwt-reset-2', role: 'user', credential: { password: PASSWORD } });
       const before = await loginToken('bob-jwt-reset-2', PASSWORD);
       expect((await probeJwt(before)).status).toBe(200);
 
@@ -632,5 +632,81 @@ describe('credentialsInvalidBefore (DROP-130 Items 4 & 5)', () => {
       expect((await probeJwt(after)).status).toBe(403);
       expect((await probeJwt(after, { method: 'PUT', path: '/auth/password' })).status).toBe(200);
     }, 10_000);
+  });
+
+  describe('updateUser - role change invalidation', () => {
+    const probeJwt = async (token: string): Promise<number> => {
+      const app = new Hono<TestEnv>();
+      app.get('/probe', authMiddleware(), (c) => c.json({ ok: true }));
+      const res = await app.request('/probe', { headers: { Authorization: `Bearer ${token}` } });
+      return res.status;
+    };
+
+    const loginToken = async (username: string): Promise<string> => {
+      const result = await authenticateUser(username, PASSWORD);
+      if (result.status !== 'ok') throw new Error(`login failed: ${JSON.stringify(result)}`);
+      return result.token;
+    };
+
+    it('demotion (user -> readonly) kills the existing OAuth grant and session JWT', async () => {
+      const bob = await createUser({ username: 'bob-demote', role: 'user', credential: { password: PASSWORD } });
+      const oauth = await mintOAuthAccessToken(bob, AUD, 'sid-demote');
+      const jwt = await loginToken('bob-demote');
+      await clockTick();
+      expect(await verifyOAuthAccessToken(oauth, AUD)).not.toBeNull();
+
+      await updateUser(bob.id, { role: 'readonly' });
+
+      expect(await verifyOAuthAccessToken(oauth, AUD)).toBeNull();
+      expect(await probeJwt(jwt)).toBe(401);
+    });
+
+    it('demotion (admin -> user) stamps the invalidation too', async () => {
+      const root = await createUser({ username: 'root-demote', role: 'admin', credential: { password: PASSWORD } });
+      await createUser({ username: 'root-demote-2', role: 'admin', credential: { password: PASSWORD } });
+      const oauth = await mintOAuthAccessToken(root, AUD, 'sid-demote-admin');
+      await clockTick();
+
+      await updateUser(root.id, { role: 'user' });
+
+      expect(await verifyOAuthAccessToken(oauth, AUD)).toBeNull();
+    });
+
+    it('demotion kills the refresh token (session/connector class) but not the API key, which is clamped', async () => {
+      const bob = await createUser({ username: 'bob-demote-key', role: 'user', credential: { password: PASSWORD } });
+      const { key } = await createApiKey('bob-demote-key-ci', 'user', undefined, undefined, bob.id);
+      const refresh = await issueRefreshToken(bob.id, 'client-demote', 'sid-demote-key');
+      await clockTick();
+      expect((await probeWithKey(key)).auth?.role).toBe('user');
+
+      await updateUser(bob.id, { role: 'readonly' });
+
+      const after = await probeWithKey(key);
+      expect(after.status).toBe(200);
+      expect(after.auth?.role).toBe('readonly');
+      expect(await rotateRefreshToken(refresh)).toBeNull();
+    });
+
+    it('promotion (readonly -> user) does NOT log the user out', async () => {
+      const bob = await createUser({ username: 'bob-promote', role: 'readonly', credential: { password: PASSWORD } });
+      const oauth = await mintOAuthAccessToken(bob, AUD, 'sid-promote');
+      const jwt = await loginToken('bob-promote');
+      await clockTick();
+
+      await updateUser(bob.id, { role: 'user' });
+
+      expect(await verifyOAuthAccessToken(oauth, AUD)).not.toBeNull();
+      expect(await probeJwt(jwt)).toBe(200);
+    });
+
+    it('re-sending the same role does NOT log the user out', async () => {
+      const bob = await createUser({ username: 'bob-same', role: 'user', credential: { password: PASSWORD } });
+      const oauth = await mintOAuthAccessToken(bob, AUD, 'sid-same');
+      await clockTick();
+
+      await updateUser(bob.id, { role: 'user', maxApps: 5 });
+
+      expect(await verifyOAuthAccessToken(oauth, AUD)).not.toBeNull();
+    });
   });
 });

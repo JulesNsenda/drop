@@ -27,6 +27,213 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-29
+
+### Security
+
+- **An admin's app suspension now sticks, and a suspended app is refused
+  everywhere (#386, #387, #388).** A suspension used to stop the app only
+  until its owner started it again. Now a suspended app stays down until an
+  administrator lifts it, including across a platform restart, and every start
+  and deploy path refuses it with `409 APP_SUSPENDED` before anything lands:
+  start, restart, redeploy, upload, git push, rollback, attach and promote.
+  A refused request is never charged against a deploy quota.
+- **A redeploy can no longer bring back a git token grant that was revoked
+  while it ran (#376).** If an administrator withdrew an app's use of a stored
+  token while that app's repository was being cloned, the redeploy used to put
+  the old grant back when it finished. The revocation now holds, and the next
+  redeploy pulls without the token.
+- **MCP tools that change something now need at least the `user` role
+  (#381).** `deploy_files`, `deploy_from_git`, `redeploy_app`, `restart_app`,
+  `rollback_app` and `custom_domain` are refused for a `readonly` account,
+  matching the REST API; read-only tools stay available. Lowering a user's
+  role now signs them out of their sessions and connector grants, which must be
+  authorized again; their API keys and agent tokens keep working, limited to
+  the new role.
+- **An upload and a build can no longer write the same app folder at once
+  (#383).** An upload in progress now counts as the app being busy, so a
+  build, restart or rollback waits for it. A redeploy upload that arrives while
+  the app is building is refused with 409.
+- **A monorepo service counts as busy while its files are being copied
+  (#384).** A file change seen mid-copy could start a build on a half-written
+  service. That build is now refused until the copy finishes, and a service
+  whose build is still running is skipped with a warning rather than
+  overwritten.
+- Hardened how git-deployed apps are updated: a redeploy now downloads a fresh shallow copy into a private platform folder and copies the repository's files into the app, instead of running git inside the app's own folder. The copy is size- and entry-limited like an upload, refuses to write through links, and records which files it wrote so it only ever deletes those.
+- Hostnames under the platform's own public host can no longer be claimed as an app's custom domain.
+- **Stored git tokens are now scoped to the user who added them.** Listing,
+  deleting, and choosing a token for a git deploy or redeploy are limited to its
+  owner, and an administrator can manage any token. A token that is not yours
+  answers exactly like one that does not exist. Storing, deleting and
+  reassigning tokens needs a signed-in session, not an API key. Tokens added
+  before this change have no recorded owner, so they are administrator-only to
+  list, delete, or newly attach until an administrator assigns one with
+  `PUT /api/v1/git/tokens/:id/owner`; apps already attached to one keep using
+  it for redeploys, including webhook redeploys. Assigning an owner grants
+  nothing by itself: if apps with a different owner are attached to the token,
+  the request is refused (409) with their names, and `keepAttached` lists the
+  ones that should keep pulling with it. Those are marked as granted by the
+  administrator who assigned the owner; the others stop, and the response and
+  server log say which. A token an app already has follows its
+  owner: if the app changes hands, a token owned by someone else stops being
+  used for it, unless an administrator attached it on purpose; that grant is
+  recorded on the app and counts only for the owner it was made for. Choosing
+  another user's token needs an administrator in a signed-in session, not an
+  API key.
+- **Deleting an account now also deletes the git tokens it added.** Any app
+  that had one attached fails its next pull with the ordinary
+  "GitHub token ... not found" error until a new token is attached.
+
+### Upgrading
+
+- Git-deployed apps no longer have a `.git` folder in their app directory (an existing one is removed on the first redeploy). Builds that read git metadata, such as `git describe`, can use the `DROP_GIT_COMMIT` environment variable, which holds the deployed commit.
+- A redeploy removes files that were deleted upstream, but only ones DROP itself copied from the repository. Files an app wrote into its own folder are left alone; use `DROP_DATA_DIR` for state. The first redeploy after upgrading removes nothing.
+- Every redeploy re-downloads a shallow clone of the branch. A repository checkout is limited to 200,000 entries and `DROP_MAX_GIT_CHECKOUT_MB` megabytes (default: twice `DROP_MAX_UPLOAD_UNPACKED_MB`); larger repositories are refused.
+- A Dockerfile build receives the deployed commit as the `DROP_GIT_COMMIT` build argument (declare `ARG DROP_GIT_COMMIT`); monorepo services get the group's commit.
+- A redeploy that arrives while the app is building or deploying (a push webhook, for instance) is queued and run when the app is free, instead of being dropped. The queue survives a restart, and a queued redeploy that fails is recorded as a failed deploy and in the activity log.
+- A git checkout is sized from the repository before any file is written and refused if it is over the limits; a new app's files appear in the apps folder in a single step.
+- Files a redeploy has not changed are no longer rewritten, and changed files are replaced in place without a gap.
+- A rollback also restores the commit shown for the app and the list of files the next git redeploy may delete.
+- Build containers are now labelled `drop.build=<app>`; the platform finds and clears them by that label.
+- Symbolic links tracked in a repository are not recreated in the app folder (a warning names them).
+- A git redeploy is refused (409) while the app is building or deploying.
+- **`isolation: none` only: apps no longer inherit the platform's `DROP_`,
+  `AWS_` and `CF_` environment.** A PM2 app used to receive every variable the
+  platform process was started with, which put the platform's secrets (the
+  operator's AWS keys, Cloudflare tokens, `DROP_*` settings) in reach of tenant
+  code. Variables with those three prefixes are now removed (and passed as
+  empty on a hot reload, where PM2 re-seeds from the platform), the same list
+  the build step already used, unless the app is given them explicitly (as a
+  secret, in `drop.yaml` `env:`, by DROP itself such as `DROP_DATA_DIR`, or by
+  attaching object storage). That includes `AWS_REGION` and `AWS_PROFILE`: an
+  app that relied on picking AWS settings up from the host's environment must
+  set them as secrets. Container isolation was never affected.
+- On servers with several accounts, review which apps have a stored token
+  attached (admins: see the boot log and the token list) and rotate any personal
+  access token you did not expect to be in use. Tokens stored before this
+  release are admin-managed until an admin assigns an owner. At boot, one
+  warning line names each app (and token id, never the value) whose attached
+  token has no owner and whose owner is not an admin.
+
+### Added
+
+- **Redeploy an existing app (#359).** `POST /api/v1/apps/:name/redeploy`
+  rebuilds an app and swaps it in, without uploading anything. A git-backed app
+  first pulls its repository's newest commit, a monorepo container is
+  re-expanded in the background, and any other app is rebuilt from the source
+  already on disk. It answers 202 with a `deployId` once a builder slot is free,
+  or `accepted` if the redeploy carries on in the background, plus a `follow`
+  link to the deploy stream. A service of a git-deployed group is redeployed
+  through its container. The new MCP `redeploy_app` tool does the same for
+  agents, waits for the build like `deploy_files`, and needs the `deploy` scope
+  for the app. A refused redeploy says why, with a retry hint where waiting
+  helps: `APP_BUSY`, `APP_STOPPED`, `APP_SOURCE_MISSING`, `INVALID_GIT_SOURCE`,
+  `REDEPLOY_VIA_CONTAINER`, `RATE_LIMITED` or `INSUFFICIENT_DISK`.
+- **Lift an app suspension, and see which apps are suspended (#386, #387,
+  #388).** `POST /api/v1/admin/apps/:name/unsuspend` lifts a suspension; it
+  needs an administrator signed in through the dashboard, not an API key or
+  agent token, and leaves the app stopped for its owner to start. `GET /apps`
+  reports a `suspended` field for each app, and only administrators see who
+  suspended it and why. Suspensions are included in backup and restore, so
+  restoring an older backup lifts any suspension made after it. A deploy cut
+  short because its app was stopped or suspended mid-deploy is recorded with
+  the new error code `DEPLOY_STOPPED`; it does not count as the app failing.
+- **Attach object storage to an app (#301).** Once an operator has set object
+  storage up, an app owner can attach a private S3 bucket from the app's
+  Database tab or `POST /api/v1/apps/:name/services/object-storage`. The app
+  is restarted with `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+  and `S3_BUCKET`, which every AWS SDK reads with no code; its key reaches
+  that one bucket and nothing else. Attach-only: there is no `drop.yaml` key,
+  because the bucket bills the operator. It is refused for ephemeral apps,
+  monorepo group apps, apps that already set any of those variables or any
+  other AWS credential, region or endpoint variable (`AWS_SESSION_TOKEN`,
+  `AWS_PROFILE`, `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3`), and past
+  `DROP_MAX_OBJECT_STORAGE_PER_USER` (default 3). **Detaching
+  (`DELETE .../services/object-storage`) or deleting the app deletes the
+  bucket and every object in it, with no backup**, and the dashboard's
+  confirm dialog says so. A delete with `keepData=true` keeps the bucket but
+  unties it from the app's name. A teardown AWS refuses is retried every 15
+  minutes. In both cases a new app with the same name gets a new bucket,
+  never the old one. Apps with object storage attached are exempt from idle
+  reaping. The extension catalog lists object storage, marked unavailable
+  until an operator sets it up.
+
+  Hardening that ships with it (the review of the first draft):
+  - **Only under container isolation, and only with API auth on.** Object
+    storage holds the AWS admin key, so it reports unavailable (`isolation` /
+    `auth-disabled`) under `isolation: none`, where a PM2 app inherits the
+    platform's environment. A PM2 app also no longer inherits the platform's
+    `DROP_`/`AWS_`/`CF_` environment at all (see Upgrading).
+  - **Destroying a bucket is dashboard-only.** Detaching, or deleting an app
+    (or group) that holds a bucket, requires an interactive dashboard session
+    and `?confirm=<name>`, checked server-side before anything is stopped. Every
+    API key (the CLI's included), OAuth token and agent token is refused, so
+    `drop remove <app>` on such an app prints that it holds a bucket: use
+    `--keep-data` to delete the app and keep the bucket, or delete it from the
+    dashboard to destroy the bucket. An unreadable allocation store answers 503
+    rather than asking. The dashboard dialogs say so and send the confirmation.
+  - **A delete retires the record before touching AWS.** The allocation is
+    moved off the app's name first, the IAM key is revoked, and the bucket is
+    drained in the background rather than while the DELETE waits. Records carry
+    the owner and the app's creation time, and are never reused by another app
+    of the same name. The delete route holds the app against concurrent
+    attach/detach.
+  - **`keepData` keeps only the bucket.** Its IAM key and user are deleted, and
+    kept buckets still count against the owner's cap. Admins can list and
+    destroy them: `GET /admin/object-storage/retired`, `DELETE
+    /admin/object-storage/retired/:id`.
+  - **A half-finished detach is recorded and finished.** The key is revoked and
+    that is persisted; attach is refused until the detach completes; a
+    single-flight background sweep drains the bucket only while the owner's
+    intent is still `detached`; shutdown waits for it.
+  - **Backup and restore include the allocation store** (`object-storage.json`).
+    The AWS admin credential is deliberately left out, since it would sit in
+    the archive next to `encryption.key`; `drop restore` tells you to re-enter
+    it. A boot warning flags apps that are attached with no allocation.
+  - The allocation store is safe against app names like `constructor`; teardown
+    refuses any bucket or IAM user whose name DROP did not generate (an empty
+    user name would make IAM act on the caller's own keys); attach waits for the
+    new IAM key to be accepted before restarting the app; the AWS-credentials
+    guard also covers `AWS_REGION`, `AWS_SESSION_TOKEN`, `AWS_PROFILE`,
+    `AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3`.
+
+### Changed
+
+- **An in-place redeploy under PM2 no longer emits `app:stopping` / `app:stopped`.**
+  It now replaces the old process the way a restart and the Docker runtime
+  already do, so a tenant webhook subscribed to `app:stopped` no longer fires
+  on a redeploy. A restart or in-place redeploy now also fails visibly if the
+  old process is still present after it was removed, instead of recording a
+  success over the survivor. Detaching a service counts any runtime state
+  other than stopped or errored as live, so a crash-looping app is stopped
+  before its data is removed and restarted afterwards.
+
+### Fixed
+
+- **Object storage now uses the platform's own root (#301).** Its credential
+  and allocation stores were located from the `DROP_ROOT` environment
+  variable, so a platform started with `--root` (and every test platform)
+  read and wrote a different store from the one the admin routes used. They
+  are now bound to the platform's root at boot. The IAM user DROP creates per
+  app now carries the same random suffix as its bucket
+  (`drop-<prefix>-<app>-<suffix>`), so a recreated app can never collide with
+  a user still waiting to be removed.
+- **Two apps' domain routes can no longer overwrite each other (#377).** An
+  app's route was identified by a name built from the app and the hostname,
+  and because app names may contain dashes, two different apps (`shop` serving
+  `www.example.com` and `shop-www` serving `example.com`, for example) could
+  end up with the same name, so one app's route silently replaced the
+  other's. Each route now keeps its own name, and DROP refuses, with a
+  warning, to replace a route that belongs to another app.
+- **GitHub push webhooks no longer show as failed (#382).** GitHub waits only
+  10 seconds for a webhook to answer, and a redeploy's fresh clone can take
+  longer, so deliveries were marked failed even though the redeploy ran. The
+  webhook still checks the signature and finds the matching apps before it
+  answers, then answers at once with `redeploying` for each app and runs the
+  redeploys in the background. A redeploy refused after that point (a quota or
+  disk limit, for example) is now reported in the server log, not in GitHub's
+  delivery view.
+
 ## [1.7.1] - 2026-10-26
 
 A security release. Ownership of apps and monorepo groups is enforced more strictly; read the Upgrading notes before taking it if other accounts deploy to your server.

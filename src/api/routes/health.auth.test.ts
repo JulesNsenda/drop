@@ -41,7 +41,7 @@ describe('health route auth gating', () => {
     await server.initialize();
     app = server.getApp();
 
-    const alice = await createUser('alice', 'password123', 'readonly');
+    const alice = await createUser({ username: 'alice', role: 'readonly', credential: { password: 'password123' } });
     void alice;
     token = await getTestToken('alice', 'password123');
   });

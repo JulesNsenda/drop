@@ -653,6 +653,29 @@ describe('BuilderService Integration', () => {
     expect(started!.payload.appId).toBe('no-strategy-app');
   });
 
+  it("carries the caller's trigger onto build:started", async () => {
+    const { eventBus } = jest.requireMock('../event-bus');
+    (eventBus.publish as jest.Mock).mockClear();
+
+    const service = new BuilderService();
+    await service.build({
+      appName: 'trigger-app',
+      appPath: tempDir,
+      appType: 'unknown',
+      framework: null,
+      config: {},
+      env: {},
+      execCommand: undefined,
+      toolchainId: null,
+      nodeModulesAsideDir: undefined,
+      deployId: 'd-1',
+      trigger: 'deploy',
+    });
+
+    const started = (eventBus.publish as jest.Mock).mock.calls.find(([name]: [string]) => name === 'build:started');
+    expect(started![1]).toMatchObject({ appId: 'trigger-app', deployId: 'd-1', trigger: 'deploy' });
+  });
+
   it('publishes the failing STAGE, not a constant (Gap A)', async () => {
     // builder.ts always knew which stage failed but published only
     // {appId, buildId, error}, so DeployTracker hardcoded a category. A

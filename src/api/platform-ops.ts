@@ -15,11 +15,14 @@
 
 import { AppProcessInfo } from '../managers/runtime';
 import type { RollbackSnapshotMeta } from '../managers/rollback';
+import type { SuspensionRefusal } from '../managers/suspension/suspension-store';
 // Only the three the PlatformOps interface below actually references —
 // DetachServiceOutcome/DetachServiceRestartOutcome are re-exported (below)
 // but not used in this file's own signatures.
 import type { AttachableServiceId, AttachServiceResult, DetachServiceResult } from './services-wire.types';
 import type { AccessGateVerdict } from '../managers/guardrail/access-gate';
+import type { DeployActorInfo } from '../managers/guardrail/deploy-breaker';
+import type { TokenCaller } from '../core/git-deploy/git-deploy.types';
 
 /**
  * The attach/detach wire contract itself lives in `services-wire.types.ts` —
@@ -44,6 +47,54 @@ export class AppInProgressError extends Error {
   constructor(appName: string) {
     super(`Application '${appName}' has an operation in progress`);
     this.name = 'AppInProgressError';
+  }
+}
+
+/**
+ * Thrown when an administrator has suspended the app: nothing may start it
+ * (a start, restart, deploy step or the health prober) until it is unsuspended.
+ * Thrown by the platform's single start choke point, so no start path can skip it.
+ *
+ * `reason` says WHY: a `record` is an administrator's act; `store-unreadable`
+ * means the suspension store cannot be read, so every app is refused until it is
+ * repaired; `not-loaded` means it has not been loaded yet (early boot). They must
+ * not be conflated, or an operator hunts for an administrator who suspended an
+ * app that nobody suspended.
+ */
+export type AppSuspendedReason = SuspensionRefusal;
+
+export class AppSuspendedError extends Error {
+  readonly code = 'APP_SUSPENDED';
+
+  constructor(
+    readonly appName: string,
+    readonly reason: AppSuspendedReason = 'record'
+  ) {
+    super(
+      reason === 'record'
+        ? `Application '${appName}' is suspended by an administrator`
+        : reason === 'not-loaded'
+          ? `Starting '${appName}' is refused: suspension store not loaded yet`
+          : `The suspension store is unreadable, so starting '${appName}' is refused until it is repaired`
+    );
+    this.name = 'AppSuspendedError';
+  }
+
+  /**
+   * What a caller who is not an administrator may be told. A `record` is an
+   * administrator's act and already shows on the app; the suspension store's own
+   * state (unreadable, not loaded) is the platform's, and is for admins and the
+   * server log only.
+   */
+  get tenantMessage(): string {
+    return this.reason === 'record'
+      ? this.message
+      : `Starting '${this.appName}' is refused right now; contact your administrator`;
+  }
+
+  /** The one renderer: the specific text for an administrator, the tenant-safe one for anyone else. */
+  messageFor(isAdmin: boolean): string {
+    return isAdmin ? this.message : this.tenantMessage;
   }
 }
 
@@ -134,6 +185,58 @@ export function needsConfigDetail(err: AppNeedsConfigError, appName: string): st
   return `Application '${appName}' needs configuration — ${needsConfigAction(err)}, then retry`;
 }
 
+/** Why an explicit redeploy was refused. The route maps each code to its status. */
+export type RedeployRefusalCode =
+  | 'NOT_FOUND'
+  | 'APP_SOURCE_MISSING'
+  | 'APP_BUSY'
+  | 'SERVICE_UNAVAILABLE'
+  | 'APP_STOPPED'
+  // An administrator suspended the app: retrying cannot help, and it is never the "start it" hint.
+  | 'APP_SUSPENDED'
+  // A git-backed app whose recorded repository URL no longer validates.
+  | 'INVALID_GIT_SOURCE'
+  // A service of a git-deployed group: its container holds the repository.
+  | 'REDEPLOY_VIA_CONTAINER'
+  | 'RATE_LIMITED'
+  | 'INSUFFICIENT_DISK';
+
+export type RedeployRefusal =
+  | {
+      code: Exclude<RedeployRefusalCode, 'APP_SUSPENDED'>;
+      message: string;
+      retryAfterSeconds?: number;
+      suspension?: undefined;
+    }
+  // Why, so each surface renders it through AppSuspendedError.messageFor.
+  | { code: 'APP_SUSPENDED'; message: string; retryAfterSeconds?: undefined; suspension: AppSuspendedReason };
+
+/**
+ * What an explicit redeploy came to: started (it has a builder slot and the
+ * deploy id it builds under), accepted (it carries on in the background and has
+ * no id yet: no slot within the wait, or a git-backed app, whose clone never
+ * runs inside the request), a group (the app is a monorepo container, which is
+ * re-expanded rather than built, in the background: its services deploy under
+ * their own names), or refused.
+ */
+export type RedeployStart =
+  | { started: string }
+  | { accepted: true }
+  | { group: { container: string } }
+  | { refused: RedeployRefusal };
+
+/** What `suspendApp` did: the app is down, or the suspension was refused. */
+export type SuspendAppResult =
+  /** `stopErrors` names instances still live afterwards; the suspension is recorded regardless. */
+  | { suspended: true; at: string; stopErrors?: string[] }
+  /** A monorepo container runs nothing itself - its services are the runtime apps. */
+  | { refused: 'group-container'; services: string[] }
+  /** Another existing app differs only in case; the store matches ignoring case, so it would be suspended too. */
+  | { refused: 'case-collision'; names: string[] };
+
+/** What `unsuspendApp` did: whether a record was lifted, or the same case-collision refusal. */
+export type UnsuspendAppResult = { unsuspended: boolean } | { refused: 'case-collision'; names: string[] };
+
 export interface PlatformOps {
   /**
    * Stop-if-running, rebuild the start spec from current state (secrets,
@@ -144,6 +247,22 @@ export interface PlatformOps {
    * to a fresh start. Rejects with AppInProgressError when the app is busy.
    */
   restartApp(appName: string): Promise<AppProcessInfo>;
+
+  /**
+   * Suspend an app (admin): record the suspension FIRST (a failed write
+   * rejects, and nothing is touched), then stop the prober and crash-loop
+   * watch, delete both runtime slots, remove its routes and its minted
+   * DROP_API_KEY, and leave it `stopped`. The record is name-keyed and
+   * outlives the app's config; every start path refuses while it exists.
+   * A monorepo container is refused (returned), naming its services.
+   */
+  suspendApp(appName: string, by: string, reason?: string): Promise<SuspendAppResult>;
+
+  /**
+   * Lift a suspension (admin). Writes `stopped` explicitly, so the owner then
+   * starts the app deliberately. `unsuspended: false` when there was no suspension.
+   */
+  unsuspendApp(appName: string): Promise<UnsuspendAppResult>;
 
   /**
    * Attach a backing service (postgres|redis) to an app: quota check,
@@ -197,6 +316,40 @@ export interface PlatformOps {
   isAppInProgress(appName: string): boolean;
 
   /**
+   * Atomically claim the app's slot in the platform's in-progress set, so no
+   * build, restart or deploy can start while the caller writes its folder.
+   * Returns the release function, or `null` when the app is already busy (or
+   * the platform is quiesced). A build that arrives meanwhile is deferred, not
+   * dropped. The holder MUST call the release.
+   */
+  tryReserveApp(appName: string): (() => void) | null;
+
+  /**
+   * Whether a build container for the app exists right now (running, or left
+   * behind by a crash). Only meaningful under docker isolation; resolves false
+   * elsewhere.
+   */
+  hasLiveBuildContainer(appName: string): Promise<boolean>;
+
+  /**
+   * Whether deleting the app (without keepData) would destroy an
+   * object-storage bucket: `bucket` when it has one, `unknown` when the
+   * allocation store cannot be read (it cannot be proven otherwise, so callers
+   * treat it as `bucket`), `none` otherwise. Lets the delete route demand an
+   * explicit confirmation before it stops anything.
+   */
+  objectStorageDeleteRisk(appName: string): Promise<'none' | 'bucket' | 'unknown'>;
+
+  /**
+   * Retire the app's object-storage allocation off its name and revoke its
+   * IAM key (#301). Called by the delete route BEFORE any other teardown step,
+   * so the name is free of the previous tenant's bucket the moment the app
+   * stops. The bucket drains in the background unless `keepData`. Idempotent;
+   * never throws for an AWS failure.
+   */
+  retireObjectStorage(appName: string, opts?: { keepData?: boolean }): Promise<void>;
+
+  /**
    * Put a held (built-but-unpromoted) build in front of traffic.
    *
    * Starts exactly what was built rather than rebuilding — a rebuild could pick
@@ -220,6 +373,38 @@ export interface PlatformOps {
    * or the snapshot — without doing it; null when there is nothing.
    */
   describeRollback(appName: string): Promise<RollbackSnapshotMeta | null>;
+
+  /**
+   * Redeploy an app explicitly (rebuilt as it stands; a git-backed app first
+   * lands its repository's newest commit). ONE operation, and the reservation
+   * never leaves the platform: it takes the app's slot, decides under it that
+   * the app exists, is not busy, passes the stopped rule, has disk and is
+   * admitted by the deploy guardrails (once), lands a git-backed app, and
+   * starts. A monorepo container is re-expanded instead of built. An admitted
+   * request counts against the caller's deploy quota whatever becomes of it -
+   * the quota counts volume, not outcome. `options.caller` is who is asking,
+   * for the git token rules; the app's stored token is the only one used.
+   *
+   * Waits for a builder slot, at most DROP_REDEPLOY_START_WAIT_MS (10 seconds). In time:
+   * `started`, with the id the build runs under (its episode follows within
+   * moments). Not in time: `accepted` - the redeploy carries on in the
+   * background, a refusal after the wait is recorded as a failed deploy
+   * (DEPLOY_REFUSED) the caller can follow, and a throw is logged. Refusals are
+   * returned, never thrown; the slot and the breaker keys are given back on
+   * every path. Authorization is the caller's.
+   */
+  redeployApp(
+    appName: string,
+    actor: DeployActorInfo,
+    options?: { caller?: TokenCaller | null }
+  ): Promise<RedeployStart>;
+
+  /**
+   * Whether any app in the same monorepo group as `appName` is busy in a way
+   * that forbids touching it: for a container, any of its children; for a
+   * child, its container. False for an app outside any group.
+   */
+  isGroupBusy(appName: string): boolean;
 
   /**
    * Tear down every app belonging to a monorepo group (M4): stop+delete each

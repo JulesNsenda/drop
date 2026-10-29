@@ -18,12 +18,19 @@
  * `makeOps` that bakes one in) rather than the other way round.
  */
 
-import type { PlatformOps, AttachServiceResult, DetachServiceResult } from '../platform-ops';
+import type {
+  PlatformOps,
+  AttachServiceResult,
+  DetachServiceResult,
+  RedeployStart,
+} from '../platform-ops';
 import type { AccessGateVerdict } from '../../managers/guardrail/access-gate';
 
 export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformOps {
   return {
     restartApp: jest.fn(),
+    suspendApp: jest.fn().mockResolvedValue({ suspended: true, at: '2026-01-01T00:00:00.000Z' }),
+    unsuspendApp: jest.fn().mockResolvedValue({ unsuspended: true }),
     // P2-5b. Stubbed rather than omitted so every route test that builds a
     // PlatformOps keeps compiling; the quiesce behaviour itself is covered in
     // platform.quiesce.test.ts against the real platform.
@@ -41,9 +48,15 @@ export function makePlatformOpsStub(overrides?: Partial<PlatformOps>): PlatformO
     } satisfies DetachServiceResult),
     getServiceIntent: jest.fn().mockReturnValue(undefined),
     isAppInProgress: jest.fn().mockReturnValue(false),
+    objectStorageDeleteRisk: jest.fn().mockResolvedValue('none'),
+    retireObjectStorage: jest.fn().mockResolvedValue(undefined),
+    tryReserveApp: jest.fn().mockReturnValue(() => undefined),
+    hasLiveBuildContainer: jest.fn().mockResolvedValue(false),
     promoteApp: jest.fn().mockResolvedValue(undefined),
     rollbackApp: jest.fn(),
     describeRollback: jest.fn().mockResolvedValue(null),
+    redeployApp: jest.fn().mockResolvedValue({ started: 'stub-deploy-id' } satisfies RedeployStart),
+    isGroupBusy: jest.fn().mockReturnValue(false),
     removeGroup: jest.fn().mockResolvedValue({ removed: [] }),
     purgeAppArtifacts: jest.fn().mockResolvedValue(undefined),
     reconfigureRoute: jest.fn().mockResolvedValue(undefined),

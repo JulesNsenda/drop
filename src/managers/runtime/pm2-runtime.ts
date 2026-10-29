@@ -7,6 +7,7 @@
  * types and PM2's.
  */
 
+import { RESERVED_ENV_PREFIXES, withReservedEnvBlanked } from '../../utils/reserved-env';
 import { ProcessManager, getProcessManager } from '../process';
 import {
   ProcessConfig,
@@ -25,6 +26,7 @@ import {
 const PM2_STATE_MAP: Record<ProcessStatusValue, AppRuntimeState> = {
   online: 'running',
   launching: 'starting',
+  'waiting restart': 'starting',
   stopping: 'stopping',
   stopped: 'stopped',
   errored: 'errored',
@@ -115,7 +117,16 @@ export class Pm2Runtime implements AppRuntime {
       interpreter: spec.interpreter,
       args: spec.args,
       port: spec.port,
-      env: spec.env,
+      // PM2 starts the app with the platform's OWN environment underneath
+      // spec.env. Two layers keep the platform's secrets (DROP_*, AWS_*, CF_*)
+      // out of tenant code, because PM2 has two start paths and only one of
+      // them honours the first: `filter_env` removes them on a fresh start,
+      // and an explicit empty value for each inherited one wins on a restart
+      // over an existing entry. Whatever the app was explicitly given in
+      // spec.env (DROP_DATA_DIR, its secrets, an attached bucket's AWS_*) is
+      // kept by both.
+      env: withReservedEnvBlanked(process.env, spec.env ?? {}),
+      filterEnv: RESERVED_ENV_PREFIXES,
       autorestart: spec.autorestart,
       killTimeout: spec.killTimeout,
       outFile: spec.outFile,

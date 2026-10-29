@@ -35,10 +35,64 @@ export function bucketNameFor(prefix: string, appName: string, suffix = randomBy
   return `${prefix}-${slug(appName, budget)}-${suffix}`;
 }
 
-/** `drop-<prefix>-<app>`, unique per install and app. */
-export function iamUserNameFor(prefix: string, appName: string): string {
-  const budget = 64 - prefix.length - 'drop--'.length;
-  return `drop-${prefix}-${appName.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, budget)}`;
+/**
+ * `drop-<prefix>-<app>-<suffix>` — the same random suffix as the bucket.
+ * Without it, deleting an app whose teardown failed (its user retired, not
+ * yet removed) would make a recreated app of the same name collide with the
+ * old user on `CreateUser` and fail to attach until the retry sweep caught up.
+ */
+export function iamUserNameFor(prefix: string, appName: string, suffix: string): string {
+  const budget = 64 - prefix.length - suffix.length - 'drop---'.length;
+  const app = appName.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, budget);
+  return `drop-${prefix}-${app}-${suffix}`;
+}
+
+/** A fresh random suffix, shared by an allocation's bucket and IAM user. */
+export function newResourceSuffix(): string {
+  return randomBytes(4).toString('hex');
+}
+
+const SUFFIX_RE = /[0-9a-f]{8}$/;
+/** `<prefix>-<app>-<8 hex>`: S3-valid, dot-free, 3-63 characters. */
+const GENERATED_BUCKET_RE = /^[a-z0-9][a-z0-9-]*-[0-9a-f]{8}$/;
+/** `drop-<prefix>-<app>-<8 hex>`, at most 64 characters. */
+const GENERATED_USER_RE = /^drop-[a-z0-9][a-z0-9-]*-[A-Za-z0-9_-]+-[0-9a-f]{8}$/;
+
+/**
+ * Whether a bucket/user pair has the shape DROP itself generates, with the
+ * one shared suffix. Teardown acts on names read back from a file, and an
+ * empty user name is not a harmless no-op: IAM `ListAccessKeys` with no
+ * `UserName` lists the CALLER's keys — the admin credential's own — and the
+ * delete loop would then revoke them. Deliberately NOT tied to the current
+ * `bucketPrefix` setting: an operator who changes it must still be able to
+ * remove what the old prefix created.
+ */
+export function isGeneratedResourcePair(bucket: unknown, userName: unknown): boolean {
+  if (!isGeneratedUserName(userName) || typeof bucket !== 'string') return false;
+  if (bucket.length < 3 || bucket.length > 63 || !GENERATED_BUCKET_RE.test(bucket)) return false;
+  return bucket.match(SUFFIX_RE)?.[0] === userName.match(SUFFIX_RE)?.[0];
+}
+
+/** The user half of the check, for revoking a user without touching its bucket. */
+export function isGeneratedUserName(userName: unknown): userName is string {
+  return typeof userName === 'string' && userName.length <= 64 && GENERATED_USER_RE.test(userName);
+}
+
+export class UnsafeResourceNameError extends Error {
+  constructor() {
+    super('Refusing to tear down a bucket or IAM user whose name is not one DROP generated');
+    this.name = 'UnsafeResourceNameError';
+  }
+}
+
+/** Throws UnsafeResourceNameError unless the pair has the shape DROP generates. */
+export function assertGeneratedResourcePair(bucket: unknown, userName: unknown): void {
+  if (!isGeneratedResourcePair(bucket, userName)) throw new UnsafeResourceNameError();
+}
+
+/** Throws UnsafeResourceNameError unless the user name has the shape DROP generates. */
+export function assertGeneratedUserName(userName: unknown): void {
+  if (!isGeneratedUserName(userName)) throw new UnsafeResourceNameError();
 }
 
 /** A policy granting object read/write/list on one bucket, and nothing else. */

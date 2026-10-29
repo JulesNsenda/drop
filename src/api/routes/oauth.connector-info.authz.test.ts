@@ -114,9 +114,9 @@ describe('GET /oauth/connector-info (DROP-131 Item 4)', () => {
     });
     await server.start();
 
-    await createUser('ci-admin', 'adminpass123', 'admin');
-    await createUser('ci-user', 'userpass123', 'user');
-    await createUser('ci-readonly', 'readonlypass123', 'readonly');
+    await createUser({ username: 'ci-admin', role: 'admin', credential: { password: 'adminpass123' } });
+    await createUser({ username: 'ci-user', role: 'user', credential: { password: 'userpass123' } });
+    await createUser({ username: 'ci-readonly', role: 'readonly', credential: { password: 'readonlypass123' } });
 
     adminToken = await login('ci-admin', 'adminpass123');
     userToken = await login('ci-user', 'userpass123');

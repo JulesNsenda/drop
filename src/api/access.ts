@@ -4,7 +4,8 @@
  * routes that must never be reachable with an API key or OAuth token.
  */
 
-import { AuthContext } from './middleware/auth';
+import { AuthContext, isAuthEnabled } from './middleware/auth';
+import type { TokenCaller } from '../core/git-deploy/git-deploy.types';
 import { AppState } from '../managers/app/state-manager';
 import { scopesAllow, AgentVerb } from './agent-scopes';
 import type { AppAccessPolicy } from '../managers/app/app-config';
@@ -20,6 +21,21 @@ export function canAccess(auth: AuthContext | undefined, app: Pick<AppState, 'us
   if (!auth) return true; // No auth enabled
   if (auth.role === 'admin') return true;
   return app.userId === auth.userId;
+}
+
+/**
+ * Who is acting, as far as stored git tokens are concerned (see TokenCaller).
+ *
+ * `admin: true` for an admin, and ALSO for an absent context -- but only when
+ * auth is disabled by configuration, where there is no principal at all and
+ * every management route is open to the operator (`canAccess`'s rule). With
+ * auth ENABLED, an absent context is a wiring mistake and yields undefined, so
+ * the caller refuses rather than treating a missing identity as an admin.
+ */
+export function tokenCallerOf(auth: AuthContext | undefined): TokenCaller | undefined {
+  if (!auth) return isAuthEnabled() ? undefined : { admin: true, interactive: true };
+  if (auth.role === 'admin') return { admin: true, userId: auth.userId, interactive: auth.authMethod === 'jwt' };
+  return { admin: false, userId: auth.userId };
 }
 
 /**

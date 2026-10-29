@@ -10,10 +10,10 @@ import * as fs from 'fs/promises';
 import * as yaml from 'yaml';
 import * as crypto from 'crypto';
 import { EventBus, eventBus, Unsubscribe, AppDeletedPayload, AppDetectedPayload } from './event-bus';
-import { isReservedHost } from '../utils/reserved-hosts';
+import { platformHostProblem, platformHostWarning } from '../utils/reserved-hosts';
 import { isValidEnvVarName } from '../utils/env-var-names';
 import { getPublicUrl } from '../api/runtime-config';
-import type { DeployFailureReason } from './event-bus/event-bus.types';
+import type { DeployFailureReason, DeployTriggerTag } from './event-bus/event-bus.types';
 import { WatcherService } from './watcher';
 // Imported from the concrete file, NOT the './watcher' barrel: several test
 // suites mock './watcher' wholesale (only exporting WatcherService), and this
@@ -35,7 +35,7 @@ import {
 } from './detector';
 import { getProcfileWebCommand } from './detector/procfile';
 import { BuilderService, getBuilder, resetBuilder } from './builder';
-import { RouterService, getRouterService, resetRouterService } from './router';
+import { RouterService, RouteConflictError, getRouterService, resetRouterService } from './router';
 import { AppRuntime, AppProcessInfo, AppStartSpec, getAppRuntime, resetAppRuntime } from '../managers/runtime';
 import {
   instanceName,
@@ -44,7 +44,12 @@ import {
   isInstanceName,
   type InstanceSlot,
 } from '../managers/runtime/instance';
-import { AppStateManager, AppStatus, getStateManager, resetStateManager } from '../managers/app/state-manager';
+import {
+  AppStateManager,
+  AppStatus,
+  getStateManager,
+  resetStateManager,
+} from '../managers/app/state-manager';
 import { SettingsManager, getSettingsManager, resetSettingsManager } from '../managers/settings/settings-manager';
 import { AppConfig, AppConfigService, getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import type {
@@ -68,10 +73,31 @@ import {
   getRedisProvisioner,
   resetRedisProvisioner,
 } from '../managers/redis';
+import {
+  ObjectStorageProvisioner,
+  ObjectStorageDetachIncompleteError,
+  ObjectStorageIncarnationError,
+  ObjectStorageUnavailableError,
+  APP_OWNED_AWS_NAMES,
+  configureObjectStorage,
+  resetObjectStorageProvisioner,
+  resetStorageCredentialStore,
+} from '../managers/object-storage';
+import { assertNever } from '../utils/assert-never';
 import { CaddyServer, getCaddyServer, resetCaddyServer } from '../managers/router';
 import { SecretManager, getSecretManager, resetSecretManager } from '../managers/secret';
 import { WebhookManager, getWebhookManager, resetWebhookManager } from './webhooks';
-import { GitDeployService, getGitDeployService, resetGitDeployService } from './git-deploy';
+import { gitManifestDir, gitManifestPath } from './git-deploy/land';
+import type { TokenCaller } from './git-deploy/git-deploy.types';
+import { resolveGitBackedName } from './git-backed';
+import {
+  GitDeployService,
+  getGitDeployService,
+  resetGitDeployService,
+  gitCheckoutCaps,
+  deployActorOfInfo,
+  publishRedeployUpdate,
+} from './git-deploy';
 import { UploadDeployService, getUploadDeployService, resetUploadDeployService } from './upload-deploy';
 import { getActivityLog, resetActivityLog } from '../managers/activity';
 import { tryLogActivity } from '../managers/activity';
@@ -87,6 +113,7 @@ import {
   getInviteQuota,
   resetInviteQuota,
   resetMailQuota,
+  QuotaExceededError,
 } from '../managers/guardrail/principal-quota';
 import { isExpired } from '../managers/guardrail/ephemeral';
 import { checkDetachCooldown, checkDumpByteBudget } from '../managers/guardrail/detach-limits';
@@ -117,6 +144,8 @@ import {
   guardrailKeysFor,
   checkGuardrailKeys,
   resetDeployBreaker,
+  admitDeploy,
+  DeployRefusedError,
   type GuardrailKey,
   type DeployActorInfo,
 } from '../managers/guardrail/deploy-breaker';
@@ -131,6 +160,7 @@ import {
   AppInProgressError,
   AppManifestInvalidError,
   AppNeedsConfigError,
+  AppSuspendedError,
   needsConfigAction,
   StaleDependenciesError,
   setPlatformOps,
@@ -140,6 +170,10 @@ import {
   type DetachServiceOutcome,
   type DetachServiceResult,
   type DetachServiceRestartOutcome,
+  type RedeployRefusal,
+  type RedeployStart,
+  type SuspendAppResult,
+  type UnsuspendAppResult,
 } from '../api/platform-ops';
 import { planSecretPreflight, generateSecretValue } from '../managers/secret/secret-preflight';
 import { Logger, createLogger } from '../utils/logger';
@@ -152,8 +186,8 @@ import {
   validateDomainFormat,
   isLocalhostDomain,
 } from '../utils/domain-validator';
-import { createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
-import { isNameTaken } from './app-names';
+import { appProvisionKeyName, createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
+import { caseVariantsOf, isNameTaken } from './app-names';
 import { resetDeployReservations } from './deploy-reservations';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
 // check: this decides whether a name is safe to write into a Caddy literal.
@@ -163,7 +197,11 @@ import {
   assertStartupConstraints,
   reportDaemonHardening,
 } from './startup-constraints';
-import { createContainerExecCommand } from './builder/container-build-runner';
+import {
+  createContainerExecCommand,
+  hasBuildContainer,
+  reapBuildContainers,
+} from './builder/container-build-runner';
 import {
   NODE_MODULES_ASIDE_DIR,
   PRE_MARKER_DOCKER_TOOLCHAIN,
@@ -192,6 +230,7 @@ import {
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAccessLog, resetAccessLog } from '../managers/access-log/access-log';
 import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
+import { getSuspensionStore, resetSuspensionStore, type SuspensionRefusal } from '../managers/suspension';
 import { sessionCookieName as appSessionCookieName } from '../api/app-access/names';
 import {
   assessAccessGate,
@@ -313,6 +352,11 @@ export interface PlatformConfig {
   redisPort: number;
   /** Max managed-Redis logical DBs a single user may provision (0 = unlimited). */
   maxRedisPerUser: number;
+  /**
+   * Max object-storage buckets a single user may attach (0 = unlimited) —
+   * #301. Each one is a bucket in the OPERATOR's AWS account, billed to them.
+   */
+  maxObjectStoragePerUser: number;
   /**
    * Run the secret preflight (PRD-051): before starting an app, auto-generate
    * declared generatable secrets and PARK the app in `needs-config` if a
@@ -445,6 +489,7 @@ const DEFAULT_CONFIG: PlatformConfig = {
   enableRedis: process.env.DROP_ENABLE_REDIS !== 'false',
   redisPort: parseInt(process.env.DROP_REDIS_PORT || '6380', 10),
   maxRedisPerUser: parseInt(process.env.DROP_MAX_REDIS_PER_USER || '3', 10),
+  maxObjectStoragePerUser: parseInt(process.env.DROP_MAX_OBJECT_STORAGE_PER_USER || '3', 10),
   enableSecretPreflight: process.env.DROP_ENABLE_SECRET_PREFLIGHT !== 'false',
   strictManifest: process.env.DROP_STRICT_MANIFEST === 'true',
   bootReconcileMode: parseBootReconcileMode(process.env.DROP_BOOT_RECONCILE),
@@ -774,6 +819,213 @@ export function decideBootReconciliation(input: BootReconcileInput): BootReconci
 }
 
 
+/** What handleAppUpdate admitted, read by the stages after the claim (all of it from entry). */
+interface AdmittedUpdate {
+  appPath: string;
+  /** The status at entry; an app already stopped then is an explicit stale-tree rebuild. */
+  statusAtEntry: AppStatus;
+  appState: NonNullable<ReturnType<AppStateManager['getApp']>>;
+  wasRunning: boolean;
+  originalPort: number | undefined;
+  /** What started the deploy, when it is not the watcher's ordinary update (see BuildStartedPayload.trigger). */
+  trigger?: DeployTriggerTag;
+  /**
+   * An explicit redeploy also refuses, after the slot wait, when the app's
+   * monorepo group became busy. NOT checked for the anonymous path: a
+   * container's expansion calls handleAppUpdate for its children while it
+   * holds the container's own claim.
+   */
+  groupGuard?: boolean;
+  /**
+   * An explicit redeploy (not the watcher's or an upload's update). Its
+   * refusals and pre-build failures after acceptance open an episode of their
+   * own - see failDeployEpisode's `newEpisode`.
+   */
+  explicit?: boolean;
+}
+
+/**
+ * A reservation of one app's in-progress slot, from `reserve`. `release` and
+ * `consume` act only while the owner map still names THIS reservation, so a
+ * stale one can never free a later owner's claim. `consume` is one-shot: it
+ * hands the claim to the build and returns the callback that gives it back,
+ * after which `release` is a no-op (null when it was already consumed,
+ * released or replaced). `beginLand` marks the span in which a git deploy is
+ * writing the folder (`gitReserved`; `release` clears it) and `endLand` ends
+ * it while the hold goes on - a redeploy that lands then builds under the same
+ * hold, and its own marker would refuse that build; a files redeploy never marks.
+ */
+interface PlatformHold {
+  readonly app: string;
+  /** Still held: not consumed, not released, not replaced. */
+  held(): boolean;
+  release(): void;
+  consume(): (() => void) | null;
+  beginLand(): void;
+  endLand(): void;
+}
+
+/** What acquireSlotAndRecheck hands to buildAndSwap: the build slot, which the caller then owns. */
+interface AcquiredSlot {
+  releaseSlot: () => void;
+}
+
+/** Why acquireSlotAndRecheck declined to go on; the claim's holder gives the claim back. */
+type UpdateRefusal =
+  | 'quiesced'
+  | 'stopping'
+  | 'busy'
+  | 'group-busy'
+  | 'gone'
+  | 'stopped'
+  | 'suspended'
+  | 'disk'
+  | 'guardrail';
+
+/**
+ * A refusal from acquireSlotAndRecheck: the reason, how long to wait when it is
+ * a tripped breaker, and (for `suspended`) the store's own reason, which decides
+ * how much of it a tenant may be told.
+ */
+type UpdateRefused =
+  | { refused: Exclude<UpdateRefusal, 'suspended'>; retryAfterSeconds?: number; suspension?: undefined }
+  | { refused: 'suspended'; suspension: SuspensionRefusal; retryAfterSeconds?: undefined };
+
+/**
+ * The episode code for a suspended refusal: DEPLOY_STOPPED only for an
+ * administrator's record. When the store merely cannot answer, nobody stopped
+ * anything and the old instance may still be serving, so it is a refusal.
+ */
+function suspensionEpisodeCode(reason: SuspensionRefusal): 'DEPLOY_STOPPED' | 'DEPLOY_REFUSED' {
+  return reason === 'record' ? 'DEPLOY_STOPPED' : 'DEPLOY_REFUSED';
+}
+
+/**
+ * The refusal a suspended app's update or redeploy meets, or null. FIRST at
+ * every entry, ahead of the stale-tree and container exemptions (a stopped
+ * app's stale marker is tenant-forgeable), and uncharged: no quota, no breaker.
+ */
+function suspendedUpdateRefusal(appName: string): UpdateRefused | null {
+  const suspension = getSuspensionStore().refusalFor(appName);
+  return suspension ? { refused: 'suspended', suspension } : null;
+}
+
+/**
+ * runClaimedUpdate's answer: refused (claim already given back), or started
+ * with the id the deploy was minted under; `done` settles when the build and
+ * swap have, with the claim and the keys given back by then.
+ */
+type ClaimedUpdate = UpdateRefused | { started: string; done: Promise<boolean> };
+
+/** Whether a runtime reading shows a process that is up or coming up (anything but absent, stopped or errored). */
+function isLiveRuntimeState(info: AppProcessInfo | null): boolean {
+  return !!info && info.status !== 'stopped' && info.status !== 'errored';
+}
+
+/**
+ * Why a start was cut short, which decides the status text and what to do with
+ * an instance that is still live (see settleRefusedStart). Only `suspended`
+ * has callers today; `stopped` is the user-stop cause the closer is shaped for.
+ */
+type StartRefusalCause =
+  | { kind: 'suspended'; reason: SuspensionRefusal }
+  | { kind: 'stopped'; error?: string };
+
+/**
+ * The text a cause leaves behind: `shown` is what a tenant reads (AppState.error,
+ * the episode detail) and never names the suspension store's state; `logged` is
+ * the specific one, for the server log.
+ */
+function startRefusalText(appName: string, cause: StartRefusalCause): { shown: string; logged: string } {
+  if (cause.kind === 'stopped') {
+    const text = cause.error ?? 'Stopped';
+    return { shown: text, logged: text };
+  }
+  const err = new AppSuspendedError(appName, cause.reason);
+  return { shown: cause.reason === 'record' ? 'Suspended by admin' : err.tenantMessage, logged: err.message };
+}
+
+/** How long a redeploy waits for a builder slot before answering `accepted` (DROP_REDEPLOY_START_WAIT_MS). */
+const DEFAULT_REDEPLOY_START_WAIT_MS = 10_000;
+
+function redeployStartWaitMs(): number {
+  const parsed = parseInt(process.env.DROP_REDEPLOY_START_WAIT_MS ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_REDEPLOY_START_WAIT_MS;
+}
+const TIMED_OUT = Symbol('timed-out');
+
+function redeployRefusal(
+  code: Exclude<RedeployRefusal['code'], 'APP_SUSPENDED'>,
+  message: string,
+  retryAfterSeconds?: number
+): { refused: RedeployRefusal } {
+  return { refused: { code, message, ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}) } };
+}
+
+/** What a refusal from the slot stage means to an explicit-redeploy caller. */
+function redeployRefusalOf(appName: string, refused: UpdateRefused): { refused: RedeployRefusal } {
+  switch (refused.refused) {
+    case 'quiesced':
+      return redeployRefusal('SERVICE_UNAVAILABLE', 'Deploys are paused for a backup; retry shortly');
+    case 'stopping':
+      return redeployRefusal('SERVICE_UNAVAILABLE', 'The platform is shutting down; retry once it is back');
+    case 'busy':
+      return redeployRefusal(
+        'APP_BUSY',
+        `Application '${appName}' is being updated by a git pull or an upload - retry once it settles`
+      );
+    case 'group-busy':
+      return redeployRefusal(
+        'APP_BUSY',
+        `Application '${appName}' belongs to a monorepo group that became busy - retry once it settles`
+      );
+    case 'gone':
+      return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
+    case 'stopped':
+      return redeployRefusal('APP_STOPPED', `Application '${appName}' was stopped while it waited for a build slot`);
+    case 'suspended': {
+      // The message is the tenant-safe one (the store's own state is not for a
+      // tenant); a surface that may say more renders `suspension` itself.
+      return {
+        refused: {
+          code: 'APP_SUSPENDED',
+          message: new AppSuspendedError(appName, refused.suspension).tenantMessage,
+          suspension: refused.suspension,
+        },
+      };
+    }
+    case 'disk':
+      return redeployRefusal(
+        'INSUFFICIENT_DISK',
+        `Insufficient disk space to rebuild '${appName}' (${getMinFreeDiskMb()} MB must be free)`
+      );
+    case 'guardrail':
+      return redeployRefusal(
+        'RATE_LIMITED',
+        'Too many failed deploys. Retry later.',
+        refused.retryAfterSeconds
+      );
+  }
+}
+
+/** What buildAndSwap has done that runClaimedUpdate needs if its failure handler throws. */
+interface UpdateProgress {
+  builderEntered: boolean;
+  /** failDeployEpisode has already closed this deploy's episode. */
+  episodeClosed: boolean;
+}
+
+/**
+ * Whether a parsed drop.yaml makes its folder a monorepo CONTAINER: a group
+ * descriptor with at least one `services:` entry, never itself a buildable app.
+ * The one rule, so every caller that must tell a container from an app agrees.
+ */
+function isMonorepoContainer(
+  parsed: DropYamlParseResult
+): parsed is DropYamlParseResult & { config: DropYamlConfig } {
+  return parsed.success && !!parsed.config?.services && Object.keys(parsed.config.services).length > 0;
+}
+
 /** A cutover that did not happen; `exited` = the new instance died, vs never proved ready. */
 class CutoverError extends Error {
   constructor(message: string, readonly exited: boolean) {
@@ -799,6 +1051,14 @@ export class DropPlatform {
   private dbProvisioner: DatabaseProvisioner | null = null;
   private redisServer: RedisServer | null = null;
   private redisProvisioner: RedisProvisioner | null = null;
+  /** #301. Always constructed (it holds no connection); `availability()` says whether it can provision. */
+  private objectStorage: ObjectStorageProvisioner | null = null;
+  /** The object-storage sweep in flight (single-flight), so `stop()` can wait for it. */
+  private storageSweep: Promise<void> | null = null;
+  /** A sweep was requested while one was running: go round once more, it may have missed the new work. */
+  private storageSweepAgain = false;
+  /** Set when `stop()` begins: the object-storage sweep starts nothing new and winds down. */
+  private stopping = false;
   private caddyServer: CaddyServer | null = null;
   private secretManager: SecretManager | null = null;
   private webhookManager: WebhookManager | null = null;
@@ -880,6 +1140,22 @@ export class DropPlatform {
   private toolchainBackfill: Promise<void> | null = null;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
+  /** Apps whose folder a git deploy is writing (a subset of appsInProgress). */
+  private gitReserved: Set<string> = new Set();
+  /**
+   * Monorepo children whose files `expandMonorepo` is copying right now. Held for
+   * the copy only, never across the expansion's own build dispatch (that would make
+   * handleAppUpdate drop the child's own build). Not in `appsInProgress`: that set
+   * holds the CONTAINER for the whole expansion.
+   */
+  private materializing: Set<string> = new Set();
+  /**
+   * Who holds each reserved app's slot (tryReserveApp, reserveForUpdate): one
+   * owner token per live reservation. A reservation's release acts only while
+   * the map still names it, so a stale release can never free a later owner's
+   * claim.
+   */
+  private readonly holdOwners: Map<string, object> = new Map();
   // Builds deferred because the concurrent-build cap was full (appName -> its
   // path + type hint). A first-boot or single-drop burst can briefly saturate
   // the cap — in docker mode especially, where a first-time base-image pull
@@ -983,6 +1259,7 @@ export class DropPlatform {
     }
 
     this.isStarting = true;
+    this.stopping = false;
     this.logger.platformEvent('starting');
     this.logger.info(`Drop root: ${this.config.dropRoot}`, 'CONFIG');
     this.logger.info(`Apps directory: ${this.config.appsDirectory}`, 'CONFIG');
@@ -1125,8 +1402,33 @@ export class DropPlatform {
         ),
       }).load();
 
+      // App suspensions: loaded before anything can start an app, and bound to
+      // THIS platform's root (reset first, as for the guest stores above). An
+      // unreadable file does not throw here: the store reports every app as
+      // suspended instead, so a start is refused rather than let through.
+      resetSuspensionStore();
+      await getSuspensionStore(
+        path.join(this.config.dropRoot, 'data', 'drop-svc', 'suspensions.json')
+      ).load();
+
+      // Object storage (#301): bind its stores to THIS platform's root before
+      // anything can reach them — same reasoning as the guest stores above.
+      // Left to their defaults they resolve DROP_ROOT from the environment,
+      // which a `--root` boot (or a test platform) does not set, and the
+      // admin routes would then read a different store from the platform's.
+      // The provisioner is told what this platform is, rather than reading
+      // the environment itself: object storage holds the operator's AWS admin
+      // key, so it is available only under container isolation and with API
+      // auth on (read live, so a config reload cannot leave it stale).
+      this.objectStorage = configureObjectStorage(this.config.dropRoot, () => ({
+        isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
+        authEnabled: this.config.enableApiAuth,
+      }));
+
       // Initialize services
       await this.initializeServices();
+
+      this.warnPlatformHostConfig();
 
       // In docker mode, stop any PM2-managed apps before the watcher starts so
       // containers can bind to the same ports without conflict.
@@ -1161,6 +1463,9 @@ export class DropPlatform {
       // exist after `initializeServices()`.
       await this.pruneStaleGuestGrants();
       await this.sweepGuestRetention();
+      await this.warnOnMissingObjectStorage();
+      // Not awaited: it talks to AWS, and boot must not wait on a network.
+      void this.sweepRetiredObjectStorage();
 
       // M1 boot reconciliation (DROP_BOOT_RECONCILE): decide skip vs redeploy
       // per known app BEFORE the watcher starts, so a stable app's own
@@ -1230,6 +1535,9 @@ export class DropPlatform {
 
     this.logger.platformEvent('stopping');
     this.eventBus.publish('platform:stopping', { timestamp: new Date() });
+    // From here the object-storage sweep drains nothing new: it finishes the
+    // record it is on and returns, instead of racing the teardown below.
+    this.stopping = true;
 
     // Stop certificate monitoring
     if (this.certExpiryTimer) {
@@ -1276,7 +1584,32 @@ export class DropPlatform {
     // Let any in-flight build/start finish (best-effort, bounded) before we
     // tear down the builder/state so apps aren't left half-deployed.
     await this.drainInProgress(10_000);
+
+    // A sweep still draining a bucket must be over before appsInProgress is
+    // cleared (its shouldDrain reads that set, and a cleared set would read as
+    // "nothing is holding any app") and before the provisioner, the stores and
+    // the state it holds are reset below. Bounded: a huge bucket must not hold
+    // shutdown hostage — the unfinished record is simply still there for the
+    // next boot's sweep.
+    if (this.storageSweep) {
+      let timer: NodeJS.Timeout | undefined;
+      const outcome = await Promise.race([
+        this.storageSweep.then(() => 'done' as const),
+        new Promise<'timeout'>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), 30_000);
+          timer.unref?.();
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (outcome === 'timeout') {
+        this.logger.warn('Shutdown proceeding with an object-storage sweep still draining', 'STORAGE');
+      }
+    }
     this.appsInProgress.clear();
+    // The reservations go with the claims they back: a stale owner entry would
+    // refuse to free the next owner's.
+    this.holdOwners.clear();
+    this.gitReserved.clear();
 
     if (this.router) {
       this.router.stop();
@@ -1327,6 +1660,9 @@ export class DropPlatform {
       resetRedisProvisioner();
       this.redisProvisioner = null;
     }
+    resetObjectStorageProvisioner();
+    resetStorageCredentialStore();
+    this.objectStorage = null;
 
     // Stop Caddy server
     if (this.caddyServer) {
@@ -1444,6 +1780,13 @@ export class DropPlatform {
       resetSettingsManager();
     }
 
+    // After the API server too, for the same reason: the store answers "is this
+    // app suspended" and an unloaded one fails CLOSED, so reset while a route
+    // can still be served and a start would be refused for no reason, or a
+    // default-path store would be built that knows nothing. Every write is
+    // awaited by its caller before it acknowledges anything, so nothing is lost.
+    resetSuspensionStore();
+
     this.isRunning = false;
     this.eventBus.publish('platform:stopped', { timestamp: new Date() });
     this.logger.platformEvent('stopped');
@@ -1522,7 +1865,116 @@ export class DropPlatform {
    * rule can be tested without standing up `initializeServices()`.
    */
   private isDeployLocked(name: string): boolean {
-    return this.isQuiesced() || this.appsInProgress.has(name);
+    return this.isQuiesced() || this.appsInProgress.has(name) || this.materializing.has(name);
+  }
+
+  /**
+   * The ONE busy predicate. An app is busy while it is in the in-progress set OR
+   * held by a git deploy land. Every claim of the slot re-checks it on the line
+   * directly before the `add` (a Set add is idempotent, so a claim that finds
+   * the app already held would otherwise "succeed", build beside the holder, and
+   * delete the holder's entry when it finished).
+   */
+  private isBusy(name: string): boolean {
+    return (
+      this.appsInProgress.has(name) ||
+      this.gitReserved.has(name) ||
+      this.materializing.has(name) ||
+      this.uploadDeployService?.isUploading(name) === true
+    );
+  }
+
+  /**
+   * The reservation factory for a claim that is HELD across awaits and handed
+   * around: not while quiesced, not while busy, not while an upload is writing
+   * the folder. The hold (see PlatformHold) is backed by a per-name owner map.
+   * Its claim sites are `tryReserveApp` (git deploy, the DELETE route) and the
+   * explicit redeploy, so those exclude each other. It is NOT the only way the
+   * slot is claimed: handleAppUpdate, handleBuildApp, restartApp, attach/detach
+   * and a monorepo expansion add to `appsInProgress` inline, each re-checking
+   * `isBusy` on the line before the add; their claims have no owner entry.
+   */
+  private reserve(name: string): PlatformHold | null {
+    if (this.isQuiesced() || this.isBusy(name)) return null;
+    // An upload in flight is writing the same folder.
+    if (this.uploadDeployService?.isUploading(name)) return null;
+    this.appsInProgress.add(name);
+    const owner = {};
+    this.holdOwners.set(name, owner);
+    let consumed = false;
+    const owns = (): boolean => this.holdOwners.get(name) === owner;
+    const giveBack = (): void => {
+      if (!owns()) return;
+      this.holdOwners.delete(name);
+      this.gitReserved.delete(name);
+      this.appsInProgress.delete(name);
+    };
+    return {
+      app: name,
+      held: () => !consumed && owns(),
+      release: () => {
+        if (!consumed) giveBack();
+      },
+      consume: () => {
+        if (consumed || !owns()) return null;
+        consumed = true;
+        return giveBack;
+      },
+      beginLand: () => {
+        if (!consumed && owns()) this.gitReserved.add(name);
+      },
+      endLand: () => {
+        if (!consumed && owns()) this.gitReserved.delete(name);
+      },
+    };
+  }
+
+  /**
+   * Claim an app's in-progress slot for a git deploy that is about to write its
+   * folder. Null when the app is busy or the platform is quiesced. While held,
+   * `handleBuildApp` defers the app's builds (see `gitReserved`). The external
+   * contract (git-deploy, the DELETE route): a release function, idempotent,
+   * with the land marked from the moment of the claim.
+   */
+  private tryReserveApp(name: string): (() => void) | null {
+    const hold = this.reserve(name);
+    if (!hold) return null;
+    hold.beginLand();
+    return () => hold.release();
+  }
+
+  /**
+   * Whether the app's monorepo group is busy in a way that forbids touching
+   * the app: for a container, any of its children; for a child, its container.
+   * False outside any group. The one rule behind git's folder reservation and
+   * the explicit redeploy's admission.
+   */
+  private isGroupBusy(name: string): boolean {
+    const stateManager = this.stateManager;
+    const app = stateManager?.getApp(name);
+    if (!stateManager || !app?.group) return false;
+    const apps = stateManager.getAllApps();
+    if (app.isGroupContainer) {
+      return apps.some((a) => a.group === app.group && !a.isGroupContainer && this.isBusy(a.name));
+    }
+    const container = apps.find((a) => a.isGroupContainer && a.group === app.group);
+    return !!container && this.isBusy(container.name);
+  }
+
+  /** Whether a build container for the app exists (docker isolation only). */
+  private async hasLiveBuildContainer(name: string): Promise<boolean> {
+    if (this.config.isolation !== 'docker') return false;
+    // FAIL CLOSED: under docker isolation an unavailable runtime means we
+    // cannot rule a build container out.
+    if (this.runtime?.type !== 'docker') return true;
+    try {
+      return await hasBuildContainer(
+        (this.runtime as import('../managers/runtime').ContainerManager).docker,
+        name
+      );
+    } catch {
+      return true;
+    }
   }
 
   /** Release the hold early. Safe to call when not quiesced. */
@@ -1973,8 +2425,18 @@ backup:
     // Initialize git deploy service
     this.gitDeployService = getGitDeployService({
       appsDirectory: this.config.appsDirectory,
+      tempDirectory: path.join(this.config.dropRoot, 'data', 'temp'),
+      manifestDirectory: gitManifestDir(path.join(this.config.dropRoot, 'data')),
+      ...gitCheckoutCaps(this.config.maxUploadUnpackedMb),
+      sweepCloneBase: true,
+      resumeQueue: true,
+      credentialsPath: this.credentialsStorePath(),
     });
     await this.gitDeployService.initialize();
+    // Surface grandfathered (ownerless) git tokens still in use by non-admin apps.
+    await this.gitDeployService
+      .auditLegacyAttachments()
+      .catch((err) => this.logger.warn(`Git token audit failed: ${err instanceof Error ? err.message : err}`, 'GIT-DEPLOY'));
 
     // Initialize upload deploy service (PRD-039). Staging lives under
     // data/temp — same root as getBuildWorkDir, well outside the watched
@@ -2053,6 +2515,16 @@ backup:
       if (slot === 'b') this.runtime.setLiveInstance(cfg.name, 'b');
     }
     await this.removeOrphanInstances();
+    if (this.config.isolation === 'docker' && this.runtime.type === 'docker') {
+      try {
+        const reaped = await reapBuildContainers(
+          (this.runtime as import('../managers/runtime').ContainerManager).docker
+        );
+        if (reaped > 0) this.logger.warn(`Removed ${reaped} orphan build container(s)`, 'BUILD');
+      } catch (error) {
+        this.logger.warn('Could not reap orphan build containers', 'BUILD', error);
+      }
+    }
 
     // Load used ports from existing PM2 processes
     await this.loadUsedPorts();
@@ -2157,6 +2629,7 @@ backup:
       // runtime-config so a route file never has to re-derive them.
       maxDbsPerUser: this.config.maxDbsPerUser,
       maxRedisPerUser: this.config.maxRedisPerUser,
+      maxObjectStoragePerUser: this.config.maxObjectStoragePerUser,
       // DROP-152: the access-gate route refuses to enable a gate outside
       // docker isolation. Passed through rather than re-read from the env in
       // the route, so the route and the platform can never disagree about
@@ -2175,7 +2648,15 @@ backup:
     // platform-ops seam — a direct import would be circular (platform → api → routes).
     setPlatformOps({
       restartApp: (name) => this.restartApp(name),
-      isAppInProgress: (name) => this.appsInProgress.has(name),
+      suspendApp: (name, by, reason) => this.suspendApp(name, by, reason),
+      unsuspendApp: (name) => this.unsuspendApp(name),
+      isAppInProgress: (name) => this.isBusy(name),
+      tryReserveApp: (name) => this.tryReserveApp(name),
+      redeployApp: (name, actor, options) => this.redeployApp(name, actor, options),
+      isGroupBusy: (name) => this.isGroupBusy(name),
+      hasLiveBuildContainer: (name) => this.hasLiveBuildContainer(name),
+      objectStorageDeleteRisk: (name) => this.objectStorageDeleteRisk(name),
+      retireObjectStorage: (name, opts) => this.retireObjectStorageOfDeletedApp(name, opts?.keepData),
       promoteApp: (name) => this.promoteApp(name),
       rollbackApp: (name) => this.rollbackApp(name),
       describeRollback: (name) => this.describeRollback(name),
@@ -3068,8 +3549,15 @@ backup:
       }
 
       if (payload.success === false) {
-        // Failed build — handleBuildApp already marked it errored and cleaned up.
-        this.appsInProgress.delete(payload.appId);
+        // Failed build. Deliberately does NOT release appsInProgress: this runs
+        // synchronously inside builder.build()'s publish, BEFORE handleBuildApp
+        // has marked the app errored, discarded its target and recorded the
+        // outcome. Releasing here let a watcher or explicit update be admitted
+        // mid-cleanup and have its keys, marker, target and status clobbered by
+        // that tail. handleBuildApp releases the guard itself on every failure
+        // path (failed result, MAX_BUILDS re-queue, throw), and handleAppUpdate's
+        // builds never get here (selfManagedUpdates above). Those are the only
+        // two callers of builder.build().
         return;
       }
 
@@ -3087,7 +3575,16 @@ backup:
         // owns appsInProgress cleanup. outputPath rides the payload because
         // this dispatch happens synchronously inside build() — before
         // handleBuildApp can persist it to the app config.
-        await this.handleStartApp(payload.appId, payload.outputPath);
+        try {
+          await this.handleStartApp(payload.appId, payload.outputPath, {
+            closeEpisode: true,
+            callerOwnsTarget: false,
+          });
+        } catch (error) {
+          // Already settled by handleStartApp (the app is stopped, the episode closed).
+          if (!(error instanceof AppSuspendedError)) throw error;
+          this.logger.info(`Start of ${payload.appId} refused: ${error.message}`, 'SUSPENSION');
+        }
       } else {
         if (app?.status === 'stopped') {
           this.logger.info(`Skipping auto-start for ${payload.appId} - app was stopped by user`, 'APP');
@@ -3202,7 +3699,7 @@ backup:
    */
   private appServiceIntent(
     appName: string,
-    serviceId: 'postgres' | 'redis'
+    serviceId: AttachableServiceId
   ): 'attached' | 'detached' | undefined {
     return this.appConfigService?.getConfig(appName)?.services?.[serviceId];
   }
@@ -3638,6 +4135,227 @@ backup:
   }
 
   /**
+   * Object-storage per-user quota (#301). Truthy-gated like checkDbQuota, NOT
+   * `!== undefined` like Redis: an ownerless app was deployed by the operator
+   * (a `DROP_API_KEY`/`cli-local` deploy), and the operator is who pays for
+   * the bucket — capping them against their own account would protect no one.
+   * Async because allocations live on disk, not in a provisioner's memory;
+   * a corrupt store THROWS (fails closed) rather than reading as zero used.
+   */
+  private async checkObjectStorageQuota(
+    ownerUserId: string | undefined
+  ): Promise<{ allowed: true } | { allowed: false; used: number; limit: number }> {
+    if (!ownerUserId || this.config.maxObjectStoragePerUser <= 0 || !this.objectStorage) {
+      return { allowed: true };
+    }
+    // The provisioner's own count, shared with the dashboard's display: it
+    // includes buckets kept by a keepData delete, which no longer have an app
+    // to be counted through but still bill the operator.
+    const used = await this.objectStorage.countForOwner(ownerUserId);
+    if (used >= this.config.maxObjectStoragePerUser) {
+      return { allowed: false, used, limit: this.config.maxObjectStoragePerUser };
+    }
+    return { allowed: true };
+  }
+
+  /**
+   * The object-storage mirror of `appDatabaseUrlSource`/`appRedisUrlSource`:
+   * which of the injected names the app already sets for itself. Any one is
+   * enough to refuse — an app with its own `AWS_ACCESS_KEY_ID` is talking to
+   * SOME bucket already, and handing it ours would silently move it.
+   */
+  private async appAwsCredentialSource(
+    appName: string,
+    appPath: string
+  ): Promise<{ name: string; source: 'secret' | 'drop.yaml env' } | null> {
+    // Every name an AWS SDK reads credentials, a region or an endpoint from —
+    // not just the four DROP injects. An app that sets AWS_PROFILE, a session
+    // token or its own endpoint is already talking to some AWS of its own.
+    const names = APP_OWNED_AWS_NAMES;
+    try {
+      for (const name of names) {
+        if (this.secretManager?.get(appName, name)) return { name, source: 'secret' };
+      }
+    } catch {
+      // Secret store unavailable — fall through to the drop.yaml check.
+    }
+    try {
+      const dropYaml = await parseDropYaml(appPath);
+      const env = dropYaml.success ? dropYaml.config?.env : undefined;
+      for (const name of names) {
+        const declared = env?.[name];
+        if (typeof declared === 'string' && declared.trim().length > 0) {
+          return { name, source: 'drop.yaml env' };
+        }
+      }
+    } catch {
+      // Unreadable/invalid drop.yaml — nothing declared.
+    }
+    return null;
+  }
+
+  /**
+   * The app's object-storage env vars — only while the owner's intent is
+   * `attached`. Allocation alone is not enough: a detach writes `detached`
+   * BEFORE tearing anything down, and a failed teardown must not keep
+   * handing the app a key to a bucket its owner asked to be rid of.
+   *
+   * Fail-soft, like Redis: an unreadable store or key logs loudly and starts
+   * the app without the variables, rather than blocking the start.
+   */
+  private async objectStorageEnvVars(appName: string): Promise<Record<string, string>> {
+    if (!this.objectStorage || this.appServiceIntent(appName, 'object-storage') !== 'attached') {
+      return {};
+    }
+    try {
+      return (await this.objectStorage.getEnvVars(appName)) ?? {};
+    } catch (err) {
+      this.logger.error(
+        `Object storage is attached to ${appName} but its credentials could not be read — starting without them`,
+        'STORAGE',
+        err
+      );
+      return {};
+    }
+  }
+
+  /**
+   * Boot-time check that every app whose owner attached object storage still
+   * has an allocation record. The usual cause of a gap is a restore from a
+   * backup taken before the allocation store was part of it: the buckets still
+   * exist (and bill) in AWS, but nothing points at them, and the app would
+   * quietly start without its variables. Local file read only; fail-soft.
+   */
+  private async warnOnMissingObjectStorage(): Promise<void> {
+    if (!this.objectStorage || !this.appConfigService) return;
+    try {
+      const allocated = new Set((await this.objectStorage.listAllocations()).map((a) => a.appName));
+      for (const config of this.appConfigService.getAllConfigs()) {
+        if (config.services?.['object-storage'] === 'attached' && !allocated.has(config.name)) {
+          this.logger.warn(
+            `'${config.name}' has object storage attached but no allocation on record - it will start without its bucket variables. ` +
+              `If this followed a restore from an older backup, its bucket still exists in AWS (look for the DROP-generated 'drop-' IAM users); detach and re-attach to get a new one.`,
+            'STORAGE'
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.warn('Could not check object-storage allocations at boot', 'STORAGE', error);
+    }
+  }
+
+  /**
+   * Whether deleting the app would destroy a bucket (#301). An allocation
+   * store that cannot be read is 'unknown', not 'none': the delete route must
+   * never treat "I could not look" as "there is nothing to lose".
+   */
+  private async objectStorageDeleteRisk(appName: string): Promise<'none' | 'bucket' | 'unknown'> {
+    if (!this.objectStorage) return 'none';
+    try {
+      return (await this.objectStorage.getAllocation(appName)) ? 'bucket' : 'none';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  /**
+   * Which app an object-storage record must belong to for this app to act on
+   * it: owner plus creation stamp, from the app's live state. Undefined when
+   * the state is already gone (the delete safety net), in which case the
+   * provisioner cannot verify and does not try.
+   */
+  private incarnationOf(appName: string): { ownerUserId?: string; appCreatedAt?: string } | undefined {
+    const state = this.stateManager?.getApp(appName);
+    return state ? { ownerUserId: state.userId, appCreatedAt: state.createdAt } : undefined;
+  }
+
+  /**
+   * The deleted-app half of object storage (#301). Retires the allocation off
+   * the app's name FIRST (a synchronous store write, no AWS), then revokes the
+   * IAM key; the bucket is drained by the sweep, kicked here and not awaited,
+   * so a large bucket never holds the DELETE response open. `keepData` keeps
+   * the bucket (the owner's data) but never the name or a live key.
+   *
+   * Idempotent, and fail-soft: a corrupt allocation store is logged loudly and
+   * touches nothing — the incarnation marker still stops the next registrant
+   * of the name from inheriting the record.
+   */
+  private async retireObjectStorageOfDeletedApp(name: string, keepData?: boolean): Promise<void> {
+    try {
+      const torn = await this.objectStorage?.teardownForDeletedApp(name, { keepData }, this.incarnationOf(name));
+      if (torn?.outcome !== 'retired') return;
+      if (torn.reason === 'kept') {
+        this.logger.warn(
+          `Kept the bucket of deleted app '${name}' (keepData) — its key is revoked and it is no longer tied to the name`,
+          'STORAGE'
+        );
+      } else {
+        this.logger.info(`Draining the object storage of deleted app '${name}' in the background`, 'STORAGE');
+        void this.sweepRetiredObjectStorage();
+      }
+    } catch (error) {
+      this.logger.error(`Object storage of deleted app '${name}' was NOT cleaned up`, 'STORAGE', error);
+    }
+  }
+
+  /**
+   * Retry the teardown of buckets whose app was deleted while AWS refused
+   * (#301). Best-effort and quiet unless it did something.
+   */
+  private sweepRetiredObjectStorage(): Promise<void> {
+    // Single-flight: the timer, a delete and a detach can all ask at once, and
+    // two sweeps would drain the same bucket twice. A request that arrives
+    // mid-sweep earns exactly one more pass, so work added after the running
+    // sweep listed its records is not left for fifteen minutes.
+    if (this.storageSweep) {
+      this.storageSweepAgain = true;
+      return this.storageSweep;
+    }
+    const run = (async () => {
+      do {
+        this.storageSweepAgain = false;
+        await this.runObjectStorageSweep();
+      } while (this.storageSweepAgain && this.objectStorage && !this.stopping);
+    })().finally(() => {
+      this.storageSweep = null;
+    });
+    this.storageSweep = run;
+    return run;
+  }
+
+  private async runObjectStorageSweep(): Promise<void> {
+    if (!this.objectStorage) return;
+    try {
+      const { destroyed, failed } = await this.objectStorage.sweepRetired({
+        // A live bucket is revoked and drained only for an app whose owner's
+        // intent is (still) 'detached' — the sweep is the one actor that
+        // deletes data with nobody watching — and only while no attach,
+        // detach or delete is holding the app: a re-attach reuses the key
+        // before it writes 'attached', and the sweep must not revoke it in
+        // that window.
+        // It answers with the app's incarnation, so a record that belongs to
+        // an EARLIER app of the same name is skipped, never drained for this one.
+        // No state at all answers with an empty incarnation, which matches no record.
+        stopping: () => this.stopping,
+        shouldDrain: (appName) =>
+          !this.stopping &&
+          !this.isBusy(appName) &&
+          this.appServiceIntent(appName, 'object-storage') === 'detached'
+            ? (this.incarnationOf(appName) ?? {})
+            : false,
+      });
+      if (destroyed > 0) {
+        this.logger.info(`Removed ${destroyed} object-storage bucket(s) left behind by deleted or detached apps`, 'STORAGE');
+      }
+      if (failed > 0) {
+        this.logger.warn(`${failed} object-storage bucket(s) AWS refused to remove — will retry`, 'STORAGE');
+      }
+    } catch (error) {
+      this.logger.warn('Object-storage retry sweep failed', 'STORAGE', error);
+    }
+  }
+
+  /**
    * Parse drop.yaml and resolve depends_on to get dependency URLs.
    * Returns environment variables to inject based on dependent apps.
    *
@@ -3761,9 +4479,14 @@ backup:
 
     const depEnvVars = await this.resolveDependencies(appPath, appName);
 
+    // The commit the clone was made at: the app folder holds no .git any more,
+    // so a build that stamps a version needs it from here.
+    const gitCommit = this.servedGitCommit(appName);
+
     return {
       ...this.coerceEnvRecord(config?.env),
       ...this.coerceEnvRecord(config?.build_env),
+      ...(gitCommit ? { DROP_GIT_COMMIT: gitCommit } : {}),
       ...depEnvVars,
     };
   }
@@ -4002,7 +4725,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     actor?: DeployActorInfo,
     /** True only for the watcher's ready scan at boot; see bootCurrentChildren. */
     incidentalFirstSight = false
-  ): Promise<void> {
+  ): Promise<void | { suspended: SuspensionRefusal }> {
+    // A container cannot be suspended, so a suspended `repoName` is a plain app
+    // whose tree now looks like one: expanding it would create, build and start
+    // children the suspension never named. Covers every caller (the watcher,
+    // reExpandContainer, a redeploy's re-classification and boot). It is
+    // REPORTED, not a silent return: a caller that holds an episode must not
+    // record the expansion as a success. Checked again at each point below
+    // where an await has passed, because a suspension can land mid-expansion.
+    const containerStopped = (): { suspended: SuspensionRefusal } | null => {
+      const refusal = suspendedUpdateRefusal(repoName);
+      return refusal ? { suspended: refusal.suspension! } : null;
+    };
+    const stoppedAtEntry = containerStopped();
+    if (stoppedAtEntry) {
+      this.logger.info(`Not expanding '${repoName}': app is suspended`, 'MONOREPO');
+      return stoppedAtEntry;
+    }
     const group = (config.group || config.name || repoName).trim();
     const services = config.services ?? {};
     const serviceNames = new Set(Object.keys(services));
@@ -4187,6 +4926,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
     }
 
+    // Synchronously before the write: the awaits above can outlive a suspension,
+    // and this tags the plain app as a container.
+    const stoppedBeforeTag = containerStopped();
+    if (stoppedBeforeTag) {
+      this.logger.info(`Not expanding '${repoName}': app was suspended during the expansion`, 'MONOREPO');
+      return stoppedBeforeTag;
+    }
     if (this.stateManager?.hasApp(repoName)) {
       await this.stateManager.updateApp(repoName, { group, isGroupContainer: true });
     }
@@ -4368,6 +5114,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           );
           continue;
         }
+        // Same, for a suspended child: nothing is copied over it, so a lifted
+        // suspension does not leave new, unbuilt source behind.
+        const stoppedBeforeCopy = containerStopped();
+        if (stoppedBeforeCopy) {
+          this.logger.info(`Not expanding '${repoName}': app was suspended during the expansion`, 'MONOREPO');
+          return stoppedBeforeCopy;
+        }
+        if (suspendedUpdateRefusal(childName)) {
+          this.logger.info(`Skipping service '${svcName}': '${childName}' is suspended`, 'MONOREPO');
+          continue;
+        }
 
         // Suppress the watcher's own onboarding of the folder we're about to
         // write — we onboard it ourselves below, same as the interception
@@ -4475,11 +5232,40 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // rebuild — `StaticBuildStrategy.preBuild` treats a surviving
         // `dist/index.html` as "already built" and skips the build entirely,
         // which is the trap that got v2 of this change rejected.
+        //
+        // The child is busy (`materializing`) while its files are written, so the
+        // watcher cannot start a build on a half-copied tree (a pause of more than
+        // the debounce, e.g. one large file, is enough). Released before this
+        // expansion's own dispatch below, which would otherwise be refused. A build
+        // container already running on the child (docker isolation) is writing it
+        // too: skip the child rather than write beside it.
         if (!childCurrent) {
-          await syncTree(srcDir, childPath, {
-            exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
-            preserve: DEFAULT_PRESERVE,
-          });
+          // Nothing awaited between this check and the add, so no claim can slip in
+          // between. Before the add: isBusy includes the marker itself.
+          if (this.isBusy(childName)) {
+            this.logger.warn(
+              `Skipping service '${svcName}': '${childName}' is busy (a deploy, rollback or upload holds it)`,
+              'MONOREPO'
+            );
+            continue;
+          }
+          this.materializing.add(childName);
+          try {
+            if (await this.hasLiveBuildContainer(childName)) {
+              this.logger.warn(
+                `Skipping service '${svcName}': '${childName}' still has a build running`,
+                'MONOREPO'
+              );
+              continue;
+            }
+            await syncTree(srcDir, childPath, {
+              exclude: DropPlatform.MONOREPO_COPY_EXCLUDE_RE,
+              preserve: DEFAULT_PRESERVE,
+            });
+          } finally {
+            // Released here, not at the end: isBusy refusals in handleBuildApp and the drain cover the rest.
+            this.materializing.delete(childName);
+          }
         }
 
         // Resolve type: honor an explicit override, else detect from the
@@ -4621,6 +5407,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               `Not building service '${svcName}': '${childName}' was stopped during expansion`,
               'MONOREPO'
             );
+          } else if (containerStopped()) {
+            // The container itself was suspended after this child was copied: no
+            // build for it or any later child (the caller is told, below).
+            this.logger.info(
+              `Not building service '${svcName}': '${repoName}' was suspended during expansion`,
+              'MONOREPO'
+            );
+            return containerStopped()!;
+          } else if (suspendedUpdateRefusal(childName)) {
+            this.logger.info(
+              `Not building service '${svcName}': '${childName}' was suspended during expansion`,
+              'MONOREPO'
+            );
           } else if (childState) {
             const rebuilt = await this.handleAppUpdate(
               childName,
@@ -4701,18 +5500,38 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // isCloning guard above: don't let the watcher onboard mid-upload.
     if (this.uploadDeployService?.isUploading(payload.name)) return;
 
+    // Decided BEFORE the drop.yaml is read, so a container-shaped tree under a
+    // suspended name is not intercepted and expanded into children either.
+    const suspendedHere = suspendedUpdateRefusal(payload.name) !== null;
+
     // Monorepo interception (M2): a root drop.yaml with a `services:` map
     // describes a group container, never a single app. Materialize each
     // declared service as its own top-level sibling app and skip the
     // normal single-app onboarding below for the container folder itself.
     const rootYaml = await parseDropYaml(payload.path);
-    if (rootYaml.success && rootYaml.config?.services && Object.keys(rootYaml.config.services).length > 0) {
+    if (!suspendedHere && isMonorepoContainer(rootYaml)) {
       this.watcher?.markAppKnown(payload.name);
       // Hold the container name in appsInProgress for the duration of the
       // expansion: the DELETE route's in-progress guard keys off it (a
       // teardown must not interleave with the fs.rm/fs.cp of child folders)
       // and a concurrent app:update for the container drops re-entrantly.
       // finally-guaranteed release — a stuck entry would wedge the app.
+      if (this.isBusy(payload.name)) {
+        this.logger.info(
+          `Not expanding container '${payload.name}': a deploy is already in progress for it`,
+          'MONOREPO'
+        );
+        return;
+      }
+      // Expansion fs.rm/fs.cp's every child's folder: not under one that is
+      // being rebuilt or redeployed.
+      if (this.isGroupBusy(payload.name)) {
+        this.logger.info(
+          `Not expanding container '${payload.name}': a service of its group is busy`,
+          'MONOREPO'
+        );
+        return;
+      }
       this.appsInProgress.add(payload.name);
       try {
         // Incidental first sight only: see bootCurrentChildren.
@@ -4788,7 +5607,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Build the app if auto-build is enabled (skip if user stopped it)
     const currentApp = this.stateManager?.getApp(payload.name);
-    if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
+    // A suspended app is neither built nor marked errored (that would overwrite its 'stopped').
+    if (suspendedHere) {
+      this.logger.info(`Not building ${payload.name} - app is suspended`, 'BUILD');
+    } else if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
       await this.handleBuildApp(payload.path, payload.name, payload.type as string, payload);
     } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
       // Detection couldn't resolve a type: the build guard above never fires
@@ -4820,6 +5642,30 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     actor?: DeployActorInfo
   ): Promise<void> {
     if (!this.builder || !this.detector) return;
+
+    // THE build choke point for a suspended app: a build runs tenant code, so
+    // it is refused before 'building' is written, before the deferral queue and
+    // before any guardrail key is taken.
+    if (suspendedUpdateRefusal(appName)) {
+      this.logger.info(`Not building ${appName} - app is suspended`, 'BUILD');
+      return;
+    }
+
+    // A git deploy is writing this folder. Building now would read a half-
+    // written tree (and let a build container write beside the land), so the
+    // build is deferred and retried, never dropped. An upload writing the folder
+    // is the same: it clears its mark before publishing, and the drain retries.
+    if (
+      this.gitReserved.has(appName) ||
+      this.materializing.has(appName) ||
+      this.gitDeployService?.isCloning(appName) ||
+      this.uploadDeployService?.isUploading(appName)
+    ) {
+      this.logger.debug(`Deferring ${appName} - a git deploy is landing its files`, 'BUILD');
+      this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
+      this.scheduleBuildDrain();
+      return;
+    }
 
     // Skip if already processing this app
     if (this.appsInProgress.has(appName)) {
@@ -4969,6 +5815,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // used to skip finishBuild entirely — leaking the log's write stream and
       // never running retention for the app.
       let result;
+      // The build slot, reserved just before the build and freed in the finally
+      // (the same pattern as buildAndSwap): the wait for a slot is an await a
+      // suspension can land in, so the check below must come after it.
+      let releaseSlot: () => void = () => undefined;
       try {
         // Fresh deploy — nothing is currently serving this app, so a low-disk
         // abort is a hard failure: throw into the catch below, which marks the
@@ -4985,6 +5835,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
         const buildPath = await this.prepareDeployTarget(appName, appPath, deployId);
 
+        releaseSlot = await this.reserveBuildSlot(appName);
+        // Re-checked synchronously, nothing awaited before the build starts: a
+        // build runs tenant code, and the awaits above (the slot wait included)
+        // can outlive a suspension.
+        this.assertStartable(appName);
         builderEntered = true;
         result = await this.builder.build({
           appName,
@@ -5001,11 +5856,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           execCommand,
           toolchainId,
           nodeModulesAsideDir,
+          slotReserved: true,
           onBuildLog: logId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(logId, line)
             : undefined,
         });
       } finally {
+        // The slot is for building only; idempotent, so a throw before the build is safe too.
+        releaseSlot();
         await this.closeBuildLog(logId, appName);
       }
 
@@ -5059,6 +5917,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch (error) {
       const err = error instanceof Error ? error : new Error('Build failed');
       await this.discardDeployTarget(appName);
+      // Checked first, as in buildAndSwap: a suspension is closed by the one
+      // closer (uncharged, left stopped), not written 'errored' and charged.
+      if (error instanceof AppSuspendedError) {
+        const hadEpisode = this.deployEpisodeOpen(appName);
+        await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason }, { closeEpisode: true });
+        // A first deploy has no episode before the builder opens one, so a caller
+        // polling for an outcome would wait out its budget: report one under this
+        // deploy's id. After settle, which released the keys, so nothing is charged.
+        if (!builderEntered && !hadEpisode) {
+          this.failDeployEpisode(
+            appName,
+            new Error(error.tenantMessage),
+            deployId,
+            suspensionEpisodeCode(error.reason)
+          );
+        }
+        this.appsInProgress.delete(appName);
+        return;
+      }
       this.logger.appEvent('error', appName, err.message);
       if (this.stateManager) {
         await this.stateManager.setAppStatus(appName, 'errored', { error: err.message });
@@ -5109,14 +5986,25 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
      * environment, or drop.yaml") sends the caller to look at something that is
      * not wrong.
      */
-    code?: 'GUARDRAIL_TRIPPED' | 'QUOTA_EXCEEDED'
+    code?: 'GUARDRAIL_TRIPPED' | 'QUOTA_EXCEEDED' | 'DEPLOY_REFUSED' | 'DEPLOY_STOPPED',
+    /** What started the deploy, so a pre-build failure's episode carries it like a built one does. */
+    trigger?: DeployTriggerTag,
+    /**
+     * `newEpisode`: ALWAYS open this deploy's own episode (build:started under
+     * `deployId`) before failing it, even when the app already has one open.
+     * The tracker then supersedes the stale one - a held or parked app's
+     * episode is left open by design - instead of the failure closing THAT one
+     * and the deploy being reported as nothing. For a refusal or a failure the
+     * caller must be able to follow under its own id.
+     */
+    options?: { newEpisode?: boolean }
   ): void {
     this.recordDeployOutcome(appName, false);
     try {
       const tracker = getDeployTracker();
       const buildId = `deploy-${appName}-${Date.now()}`;
-      if (!tracker.hasOpenEpisode(appName)) {
-        eventBus.publish('build:started', { appId: appName, buildId, deployId });
+      if (options?.newEpisode || !tracker.hasOpenEpisode(appName)) {
+        eventBus.publish('build:started', { appId: appName, buildId, deployId, trigger });
       }
       // 'pre-build' is the truthful stage for every caller of this: detection
       // failures, the disk check, resolveBuildEnv, a malformed drop.yaml — all
@@ -5307,6 +6195,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           this.appsInProgress.size >= this.config.maxConcurrentBuilds) {
         break;
       }
+      // A git deploy or an upload is still landing its files: keep it queued.
+      if (
+        this.gitReserved.has(appName) ||
+        this.materializing.has(appName) ||
+        // A service whose group is still being expanded: the expansion dispatches
+        // it itself once its drop.yaml is written.
+        (!this.stateManager?.getApp(appName)?.isGroupContainer && this.isGroupBusy(appName)) ||
+        this.gitDeployService?.isCloning(appName) ||
+        this.uploadDeployService?.isUploading(appName)
+      ) {
+        continue;
+      }
       // Started some other way (or already running) since it was queued — drop it.
       if (this.appsInProgress.has(appName) ||
           this.stateManager?.getApp(appName)?.status === 'running') {
@@ -5319,7 +6219,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (this.pendingBuilds.size > 0) this.scheduleBuildDrain();
   }
 
-  private async handleStartApp(appName: string, buildOutputDir?: string): Promise<void> {
+  /**
+   * `intent` is the caller's, because it decides what a refused start (a
+   * suspension) must leave behind: `closeEpisode` says whether the deploy episode
+   * is this call's to close (the build:completed listener's is; a promotion's is
+   * not, its episode is the held build's and stays open), and `callerOwnsTarget`
+   * that the deploy target is a HELD release the caller gives back: it is
+   * forgotten, never discarded, when the start is refused. Required, so a new
+   * caller has to say what it is.
+   */
+  private async handleStartApp(
+    appName: string,
+    buildOutputDir: string | undefined,
+    intent: { closeEpisode: boolean; callerOwnsTarget: boolean }
+  ): Promise<void> {
+    let callerOwnsTarget = false;
     if (!this.runtime || !this.detector) {
       // Only reachable during teardown; release the guard so a queued deploy
       // isn't left wedged in appsInProgress forever.
@@ -5344,6 +6258,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         : cfgAtStart?.path || path.join(this.config.appsDirectory, appName));
 
     try {
+      // First: before the port, the data directory and any database or Redis
+      // provisioning, none of which a suspended app may cause.
+      this.assertStartable(appName);
       // Update state to starting. Kept inside the try: if this write throws it
       // must not escape to the EventBus handler wrapper (which only logs) and
       // leave the app wedged in appsInProgress with no cleanup.
@@ -5421,7 +6338,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         buildOutputDir
       );
       await this.noteRuntimeLogStart(appName);
-      const status = await this.runtime.start(spec);
+      const status = await this.startInstance(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port}`);
 
@@ -5529,6 +6446,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // affect deploy_files.
       this.armPostDeployWatches(appName, port, spec.healthCheckPath);
     } catch (error) {
+      // A suspension is not a failure of the app or of this deploy's caller:
+      // closed by the one closer, uncharged, and the app left stopped. Re-thrown
+      // so a caller that asked for this start (a promotion) hears it was refused;
+      // the build:completed listener, which did not ask, swallows it.
+      if (error instanceof AppSuspendedError) {
+        callerOwnsTarget = intent.callerOwnsTarget;
+        await this.settleRefusedStart(
+          appName,
+          { kind: 'suspended', reason: error.reason },
+          { closeEpisode: intent.closeEpisode }
+        );
+        throw error;
+      }
       // Secret preflight park (PRD-051): not a failure — the app declared
       // required secrets that aren't set. Record them and stop, so the operator
       // gets an actionable `needs-config` instead of a crash-loop. The
@@ -5569,8 +6499,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Terminal handler: always release the in-progress guard on every settled
       // path (success, error, or a throw from the initial 'starting' write), so
       // a transient failure can never wedge the app out of future rebuilds.
-      // A release this start did not commit is discarded (no-op after success).
-      await this.discardDeployTarget(appName);
+      // A release this start did not commit is discarded (no-op after success),
+      // unless it is a held build a refused promotion must give back intact.
+      if (callerOwnsTarget) this.deployTargets.delete(appName);
+      else await this.discardDeployTarget(appName);
       this.appsInProgress.delete(appName);
     }
   }
@@ -5669,6 +6601,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // hostname (never filtered), so it stays reachable even if every custom
       // domain is refused.
       let acceptedCustomDomains: string[] = [];
+      const refusedHostnames: string[] = [];
       if (hasCustomDomains && this.appConfigService) {
         const owners = this.appConfigService.getDomainOwners(domainSuffix);
         acceptedCustomDomains = domains.filter((d) => {
@@ -5677,11 +6610,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // claiming it gets a Caddy block for DROP's hostname pointing at
           // their app, which serves DROP's OAuth and MCP endpoints: a victim's
           // control-plane token delivered straight to a tenant.
-          if (isReservedHost(d, getPublicUrl(), domainSuffix)) {
-            this.logger.warn(
-              `Refusing domain '${d}' for ${appName}: reserved by the platform`,
-              'ROUTER'
-            );
+          //
+          // The same rule also covers a name UNDER the public host: it is
+          // same-site with the platform, so a code or token minted for the
+          // platform's host can be delivered to it.
+          //
+          // Known gap, left for the maintainer: a tenant may still declare a
+          // name under the DOMAIN SUFFIX (another app's future default
+          // hostname). That is a product decision, not refused here.
+          const problem = platformHostProblem(d, { publicUrl: getPublicUrl(), domainSuffix });
+          if (problem) {
+            this.logger.warn(`Refusing domain '${d}' for ${appName}: ${problem}`, 'ROUTER');
+            refusedHostnames.push(d);
             return false;
           }
           const owner = owners.get(d.toLowerCase());
@@ -5695,6 +6635,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           return true;
         });
         domains = acceptedCustomDomains.length > 0 ? acceptedCustomDomains : [defaultHostname];
+        // A refused name that was routed before this rule must stop being served.
+        for (const hostname of refusedHostnames) await this.pruneRoute(appName, hostname);
 
         // Persist only the accepted domains as the source of truth — never the
         // raw, possibly-hijacking request.
@@ -5728,7 +6670,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // Same ownership rule as drop.yaml domains. Verification already
           // refused a claimed domain; this catches a claim made since.
           const owner = this.appConfigService?.getDomainOwners(domainSuffix).get(verified);
-          if (owner && owner !== appName) {
+          const problem = platformHostProblem(verifiedCustom.domain, {
+            publicUrl: getPublicUrl(),
+            domainSuffix,
+          });
+          if (problem) {
+            // Verified before this rule existed. Withdraw its route and
+            // verification (AppState.customDomain itself is left as set).
+            this.logger.warn(
+              `Refusing custom domain '${verifiedCustom.domain}' for ${appName}: ${problem}`,
+              'ROUTER'
+            );
+            await this.dropCustomDomainRoute(appName, verifiedCustom.domain);
+          } else if (owner && owner !== appName) {
             this.logger.warn(
               `Refusing custom domain '${verifiedCustom.domain}' for ${appName}: already claimed by '${owner}'`,
               'ROUTER'
@@ -5809,16 +6763,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // used as-is. Both paths land here: an app named e.g. `dashboard`
       // would otherwise get a Caddy block for the platform's own host
       // unconditionally, with no drop.yaml `domains:` required to trigger it.
+      const finalRefused: string[] = [];
       const routableDomains = domains.filter((hostname) => {
-        if (isReservedHost(hostname, getPublicUrl(), domainSuffix)) {
+        const problem = platformHostProblem(hostname, { publicUrl: getPublicUrl(), domainSuffix });
+        if (problem) {
           this.logger.warn(
-            `Refusing route for ${appName}: hostname '${hostname}' is reserved by the platform`,
+            `Refusing route for ${appName}: hostname '${hostname}' is ${problem}`,
             'ROUTER'
           );
+          finalRefused.push(hostname);
           return false;
         }
         return true;
       });
+      for (const hostname of finalRefused) await this.pruneRoute(appName, hostname);
       if (routableDomains.length === 0) {
         this.logger.warn(
           `App '${appName}' has no routable hostname (every candidate is reserved by the ` +
@@ -5935,8 +6893,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const tlsDisabled = gateStillAsserted ? false : dropYaml.config?.tls?.disabled;
         const enableSsl = this.config.enableHttps && !isLocalhost && !tlsDisabled;
 
-        await this.router.addRoute({
-          appName: `${appName}-${hostname.replace(/\./g, '-')}`, // Unique route name per domain
+        // Route key: '/' can appear in neither a folder name nor a hostname, so
+        // distinct (app, host) pairs can never share a key. Lowercased, so case
+        // variants of one host are one route rather than two Caddy site blocks.
+        const conflict = await this.router.addRoute({
+          appName: `${appName}/${hostname.toLowerCase()}`,
           owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
           hostname,
           pathPrefix: routePathPrefix,
@@ -5959,7 +6920,21 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           // leave it in the Caddyfile for the life of the process.
           mcpAuth: mcpGuard,
           accessAuth: accessGuard,
-        });
+        }).then(
+          () => undefined,
+          (err: unknown) => {
+            if (err instanceof RouteConflictError) return err;
+            throw err;
+          }
+        );
+
+        if (conflict) {
+          this.logger.error(
+            `Route for '${hostname}' NOT configured for ${appName}: already routed for app '${conflict.existingOwner ?? 'unknown'}' (${conflict.existingHostname})`,
+            'ROUTER'
+          );
+          continue;
+        }
 
         const protocol = enableSsl ? 'https' : 'http';
         const caddyAvailable = this.caddyServer?.getStatus() === 'running';
@@ -6181,7 +7156,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   private gateRoutableHostnames(hostnames: string[], suffix: string): string[] {
     return hostnames.filter(
       (hostname) =>
-        !isReservedHost(hostname, getPublicUrl(), suffix) &&
+        !platformHostProblem(hostname, { publicUrl: getPublicUrl(), domainSuffix: suffix }) &&
         this.config.enableHttps &&
         !isLocalhostDomain(hostname)
     );
@@ -6193,7 +7168,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * `PlatformOps.reconfigureRoute` for why this exists.
    */
   private async reconfigureRoute(appName: string): Promise<void> {
-    if (this.appsInProgress.has(appName)) {
+    // Not isBusy: an upload writes the folder, never a route, and refusing here
+    // would leave a route that was meant to be withdrawn live.
+    if (this.appsInProgress.has(appName) || this.gitReserved.has(appName)) {
       // A deploy in flight will write the route itself when it starts the app;
       // racing it here could emit a block for a port that is about to change.
       throw new AppInProgressError(appName);
@@ -6776,6 +7753,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   ): Promise<boolean> {
     if (!this.runtime || !this.stateManager || !this.detector || !this.builder) return false;
 
+    // A suspended app is refused FIRST: before the stale-tree and container
+    // exemptions below (a stopped app's stale marker is tenant-forgeable), and
+    // before anything is claimed, charged or built.
+    if (suspendedUpdateRefusal(appName)) {
+      this.logger.info(`Dropped update for ${appName} - app is suspended`, 'UPDATE');
+      return false;
+    }
+
     // A backup is taking a snapshot (P2-5b). Deferring rather than dropping:
     // the watcher re-arms once the lock clears, and an API/webhook caller has
     // already been told the deploy was accepted — so this is logged at info,
@@ -6798,14 +7783,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // An explicit redeploy that's dropped here is logged at info - the API/
     // webhook caller has already reported success, so a silent debug-level
     // drop would hide the fact that nothing actually happened.
-    if (this.appsInProgress.has(appName)) {
-      if (bypassCooldown) {
-        this.logger.info(`Dropped redeploy for ${appName} - already in progress`, 'UPDATE');
-      } else {
-        this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
-      }
-      return false;
-    }
+    if (this.inProgressSkip(appName, bypassCooldown)) return false;
 
     // A monorepo container (root drop.yaml has `services:`) is a group descriptor, never a buildable
     // app — the app:detected interception (see the detectedSub handler above) expands it into child
@@ -6817,45 +7795,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // interception already expanded the children this deploy, and re-expanding would fs.rm/fs.cp their
     // folders out from under an in-flight build.
     const containerYaml = await parseDropYaml(appPath);
-    if (
-      containerYaml.success &&
-      containerYaml.config?.services &&
-      Object.keys(containerYaml.config.services).length > 0
-    ) {
+    if (isMonorepoContainer(containerYaml)) {
       if (bypassCooldown) {
-        // GUARDRAIL. This branch RETURNS below, above the gate on the ordinary
-        // rebuild path, and expandMonorepo is one of the most expensive things
-        // on the box: a git pull plus an fs.rm/fs.cp of every child tree plus a
-        // build per service. Whether an app takes this branch is decided by the
-        // caller's own drop.yaml (`services:`), so leaving it ungated let any
-        // caller opt into an unmetered build loop.
-        const containerKeys = this.guardrailKeys(appName, false, actor ?? {});
-        const containerVerdict = this.checkGuardrails(containerKeys);
-        if (!containerVerdict.allowed) {
-          const refusal =
-            `Too many failed deploys (${containerVerdict.failures}). ` +
-            `Retry in ${containerVerdict.retryAfterSeconds}s.`;
-          this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
-          this.releaseGuardrailKeys(appName);
-          this.failDeployEpisode(appName, new Error(refusal), crypto.randomUUID(), 'GUARDRAIL_TRIPPED');
-          return false;
-        }
-        this.breakerKeys.set(appName, containerKeys);
-
-        this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
-        // Same in-progress bracket as the app:detected interception: blocks a
-        // concurrent DELETE (409) and re-entrant updates while child folders
-        // are re-materialized out from under running apps.
-        this.appsInProgress.add(appName);
-        try {
-          await this.expandMonorepo(appPath, appName, containerYaml.config, actor);
-          this.recordDeployOutcome(appName, true);
-        } catch (err) {
-          this.recordDeployOutcome(appName, false);
-          throw err;
-        } finally {
-          this.appsInProgress.delete(appName);
-        }
+        await this.reExpandContainer(appName, appPath, containerYaml.config, actor);
       } else {
         this.logger.debug(
           `Skipping update for monorepo container '${appName}' - not a buildable app`,
@@ -6887,6 +7829,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         `Skipping incidental update for grouped child '${appName}' — its monorepo container owns rebuilds`,
         'MONOREPO'
       );
+      return false;
+    }
+
+    // An explicit update (upload, git, API) to a service whose group's container
+    // is busy - being re-expanded, or torn down - would build a tree that is
+    // being rewritten. The expansion's own calls for its children say so in
+    // their reason, and pass.
+    if (bypassCooldown && reason !== 'monorepo re-expansion' && this.isGroupBusy(appName)) {
+      this.logger.info(`Dropped redeploy for ${appName} - its monorepo group is busy`, 'MONOREPO');
       return false;
     }
 
@@ -6922,10 +7873,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Except an explicit redeploy of a tree built for another Node runtime:
     // the start guard refuses to start it and tells the user to redeploy, and
     // this is the only path that rebuilds it.
-    const rebuildsStaleTree =
-      appState.status === 'stopped' &&
-      bypassCooldown === true &&
-      (await this.dependenciesAreStale(appName, this.servingPathOf(appName, undefined, appState)));
+    const rebuildsStaleTree = await this.rebuildsStaleTree(appName, appState, bypassCooldown === true);
     if (rebuildsStaleTree) {
       this.logger.info(`Redeploying stopped ${appName} to rebuild dependencies for the current Node runtime`, 'UPDATE');
     }
@@ -6954,6 +7902,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // `reason`/`wasRunning` reads: each of those returns without deploying, and
     // an update that never deploys must neither be refused nor leave a key in
     // breakerKeys for some later episode's outcome to be recorded against.
+    //
+    // The in-progress skip at the top of this method is stale by now: the
+    // drop.yaml read and the stale-tree check awaited, leaving a gap in which
+    // another deploy can take the slot (the chained redeploy: A's update arrives
+    // after A released, B reserves, then A would claim a slot B holds, build
+    // beside B's land, and release B's reservation when it finished). So it is
+    // re-checked HERE, before the guardrail: a busy app's update is dropped, not
+    // refused, and never touches a key. inProgressSkip covers BOTH sets
+    // (in-progress and git-reserved). Nothing below awaits before the claim.
+    if (this.inProgressSkip(appName, bypassCooldown)) return false;
     const guardKeys = this.guardrailKeys(appName, false, actor ?? {});
     const verdict = this.checkGuardrails(guardKeys);
     if (!verdict.allowed) {
@@ -6979,82 +7937,832 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return false;
     }
     this.breakerKeys.set(appName, guardKeys);
-
     this.logger.info(`Hot-reload triggered for ${appName}: ${reason}`, 'UPDATE');
     this.appsInProgress.add(appName);
 
+    const admitted: AdmittedUpdate = { appPath, statusAtEntry, appState, wasRunning, originalPort };
+    const update = await this.runClaimedUpdate(appName, admitted, () => this.appsInProgress.delete(appName));
+    return 'started' in update ? update.done : false;
+  }
+
+  /**
+   * Whether an EXPLICIT rebuild of a stopped app is allowed: only to refresh a
+   * tree built for another Node runtime (the start guard refuses to start it
+   * and tells the user to redeploy, and this is the only path that rebuilds
+   * it). The one expression behind handleAppUpdate's stopped rule and the
+   * explicit-redeploy admission.
+   */
+  private async rebuildsStaleTree(
+    appName: string,
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    explicit: boolean
+  ): Promise<boolean> {
+    return (
+      appState.status === 'stopped' &&
+      explicit &&
+      (await this.dependenciesAreStale(appName, this.servingPathOf(appName, undefined, appState)))
+    );
+  }
+
+  /**
+   * Redeploy an app explicitly (POST /apps/:name/redeploy): ONE operation, and
+   * the reservation never leaves it:
+   *
+   *  1. take the app's slot (a hold), synchronously;
+   *  2. under it, check the app may be rebuilt (see checkRedeployable) and
+   *     classify it: git-backed (its own gitSource), a monorepo container, or a
+   *     plain app. Every refusal so far is returned directly, uncharged;
+   *  3. ONE admitDeploy, charged to the caller's quota whatever becomes of the
+   *     request (the quota counts volume, not outcome). For a plain app it is
+   *     the last step, with nothing awaited between it and the hold being
+   *     consumed - so a hold that was lost is found out BEFORE the charge. A
+   *     git-backed app is charged BEFORE its clone, as git's own redeploy is:
+   *     charged after, a caller over quota would get a free clone every time;
+   *  4. a plain app: consume the hold, set the breaker keys (their lifetime is
+   *     the hold's) and start, waiting up to DROP_REDEPLOY_START_WAIT_MS for a
+   *     builder slot. In time: `started`; otherwise `accepted`, and the start
+   *     carries on in the background - a refusal after the wait then closes a
+   *     failed episode (DEPLOY_REFUSED), because nobody is left to be told;
+   *  5. a git-backed app or a container does NOT run inside the request: the
+   *     answer is `accepted` (`group` for a container) as soon as admission
+   *     passes, and continueRedeploy carries on under the same hold - land,
+   *     re-classify (the landed drop.yaml may now declare `services:`), then
+   *     either re-expand the group or build. Whatever goes wrong there is
+   *     recorded as a failed deploy the caller can follow.
+   *
+   * The hold is released in the finally until step 4 consumes it or step 5
+   * takes it over, so every earlier exit gives the slot back exactly once and
+   * leaves no key behind. Authorization is the caller's.
+   */
+  private async redeployApp(
+    appName: string,
+    actor: DeployActorInfo,
+    options: { caller?: TokenCaller | null } = {}
+  ): Promise<RedeployStart> {
+    if (!this.runtime || !this.stateManager || !this.detector || !this.builder) {
+      return redeployRefusal('SERVICE_UNAVAILABLE', 'The platform is not ready to deploy');
+    }
+    const hold = this.reserve(appName);
+    if (!hold) {
+      return this.isQuiesced()
+        ? redeployRefusal('SERVICE_UNAVAILABLE', 'Deploys are paused for a backup; retry shortly')
+        : redeployRefusal('APP_BUSY', `Application '${appName}' is building or deploying - retry once it settles`);
+    }
+    let handedOn = false;
+    try {
+      const checked = await this.checkRedeployable(appName, actor);
+      if ('refused' in checked) return checked;
+      const { appState, kind, isContainer } = checked;
+
+      const lost = (): { refused: RedeployRefusal } =>
+        redeployRefusal('APP_BUSY', `The reservation for '${appName}' is no longer held - retry the redeploy`);
+      // The quota's store is loaded BEFORE the hold is checked, so admitDeploy's
+      // own await has nothing left to wait for: the checked hold and the consume
+      // are then separated by no real I/O.
+      await getPrincipalQuota().initialize();
+      if (!hold.held()) return lost();
+      // ONE admission, with the one actor: the breaker and the quota, charged
+      // here, followed at once by the consume (a plain app) or the hand-over.
+      try {
+        await admitDeploy(appName, false, actor);
+      } catch (error) {
+        if (error instanceof DeployRefusedError || error instanceof QuotaExceededError) {
+          return redeployRefusal('RATE_LIMITED', error.message, error.retryAfterSeconds);
+        }
+        throw error;
+      }
+
+      if (kind !== 'files') {
+        handedOn = true;
+        void this.continueRedeploy(appName, appState, kind, actor, options.caller ?? null, hold).catch((error) =>
+          this.logger.error(`Redeploy of ${appName} failed`, 'UPDATE', error)
+        );
+        this.logger.info(`Explicit redeploy of ${appName} accepted (${kind}), carrying on in the background`, 'UPDATE');
+        return isContainer ? { group: { container: appName } } : { accepted: true };
+      }
+
+      const releaseClaim = hold.consume();
+      if (!releaseClaim) return lost();
+      return await this.startClaimedRedeploy(appName, actor, appState, releaseClaim, false);
+    } finally {
+      if (!handedOn) hold.release();
+    }
+  }
+
+  /**
+   * The start of an explicit redeploy, once its claim has been consumed: the
+   * claim is the build's from here, and nothing below may throw without giving
+   * it back. `background`: the caller has already been answered, so the start
+   * is not raced against the wait and every refusal is recorded as a failed
+   * deploy.
+   */
+  private async startClaimedRedeploy(
+    appName: string,
+    actor: DeployActorInfo,
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    releaseClaim: () => void,
+    background: boolean
+  ): Promise<RedeployStart> {
+    try {
+      this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
+      const admitted: AdmittedUpdate = {
+        appPath: this.sourcePathOf(appName),
+        statusAtEntry: appState.status,
+        appState,
+        wasRunning: appState.status === 'running',
+        originalPort: appState.port,
+        trigger: 'deploy',
+        groupGuard: true,
+        explicit: true,
+      };
+      const detached = { value: background };
+      const pending = this.runClaimedUpdate(appName, admitted, releaseClaim, (refused) => {
+        // The caller was answered `accepted` and is following the app: give
+        // it the refusal as a failed deploy (the guardrail refusal already
+        // closed its own). Keys first, so the failure is not charged.
+        if (!detached.value || refused.refused === 'guardrail') return;
+        this.releaseGuardrailKeys(appName);
+        this.failDeployEpisode(
+          appName,
+          new Error(redeployRefusalOf(appName, refused).refused.message),
+          crypto.randomUUID(),
+          refused.refused === 'suspended' ? suspensionEpisodeCode(refused.suspension) : 'DEPLOY_REFUSED',
+          admitted.trigger,
+          { newEpisode: true }
+        );
+      });
+      const first = background ? await pending : await this.within(pending, redeployStartWaitMs());
+      if (first === TIMED_OUT) {
+        detached.value = true;
+        pending.then(
+          (late) => {
+            if ('started' in late) this.logRedeployFailure(appName, late.done);
+          },
+          (error) => this.logger.error(`Redeploy of ${appName} failed before its build`, 'UPDATE', error)
+        );
+        this.logger.info(`Explicit redeploy of ${appName} accepted, waiting for a builder slot`, 'UPDATE');
+        return { accepted: true };
+      }
+      if ('refused' in first) return redeployRefusalOf(appName, first);
+      this.logger.info(`Explicit redeploy of ${appName} started (${first.started})`, 'UPDATE');
+      this.logRedeployFailure(appName, first.done);
+      return { started: first.started };
+    } catch (error) {
+      releaseClaim();
+      this.releaseGuardrailKeys(appName);
+      throw error;
+    }
+  }
+
+  /**
+   * The rest of a git-backed app's or a container's redeploy, run in the
+   * background under the hold redeployApp handed over (this releases it, unless
+   * a consume gave it to the build or the re-expansion). A git-backed app lands
+   * first, then both are classified again; a failure anywhere is a failed
+   * deploy under the app's name, and a throw is the terminal catch's to log.
+   *
+   * A hold that was lost (the platform stopped, say): after a land, the landed
+   * commit still has to build, so the update git's own redeploy always
+   * publishes is published; before one, the request is simply recorded as
+   * refused.
+   */
+  private async continueRedeploy(
+    appName: string,
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    kind: 'git' | 'container',
+    actor: DeployActorInfo,
+    caller: TokenCaller | null,
+    hold: PlatformHold
+  ): Promise<void> {
+    const refuse = (message: string): void =>
+      this.failDeployEpisode(appName, new Error(message), crypto.randomUUID(), 'DEPLOY_REFUSED', 'deploy', {
+        newEpisode: true,
+      });
+    try {
+      if (kind === 'git') await this.landForRedeploy(appName, appState, actor, caller, hold);
+      const appPath = this.sourcePathOf(appName);
+      const group = await this.groupClassOf(this.stateManager!.getApp(appName) ?? appState, appPath);
+      const parsed = group === 'container' ? await parseDropYaml(appPath) : undefined;
+
+      const releaseClaim = hold.consume();
+      if (!releaseClaim) {
+        if (kind === 'git') {
+          this.logger.warn(
+            `The reservation for '${appName}' was lost during its redeploy; publishing the update so the landed commit builds`,
+            'UPDATE'
+          );
+          publishRedeployUpdate(appName, appPath, deployActorOfInfo(actor));
+        } else {
+          refuse(`The reservation for '${appName}' was lost - retry the redeploy`);
+        }
+        return;
+      }
+      if (parsed) {
+        if (!isMonorepoContainer(parsed)) {
+          releaseClaim();
+          refuse(`'${appName}' is a monorepo container but its drop.yaml declares no services`);
+          return;
+        }
+        await this.reExpandContainer(appName, appPath, parsed.config, actor, releaseClaim);
+        return;
+      }
+      await this.startClaimedRedeploy(appName, actor, appState, releaseClaim, true);
+    } finally {
+      hold.release();
+    }
+  }
+
+  /**
+   * Re-expand a monorepo container's group (an EXPLICIT update to a container:
+   * a git pull refreshed it, the children are copies that must be
+   * re-materialized). Shared by handleAppUpdate's container branch, which takes
+   * its own claim, and by the explicit redeploy, which passes the claim it
+   * already holds as `held` (the callback that gives it back). Under `held`
+   * every refusal and failure is recorded as a failed deploy under the
+   * container's name, because the caller was answered and is following; the
+   * claim is given back exactly once, whichever way this ends.
+   */
+  private async reExpandContainer(
+    appName: string,
+    appPath: string,
+    config: DropYamlConfig,
+    actor: DeployActorInfo | undefined,
+    held?: () => void
+  ): Promise<void> {
+    let released = false;
+    const giveBack = (): void => {
+      if (held && !released) {
+        released = true;
+        held();
+      }
+    };
+    const refusedWhileHeld = (message: string, code: 'DEPLOY_REFUSED' | 'GUARDRAIL_TRIPPED' = 'DEPLOY_REFUSED'): void => {
+      if (!held) return;
+      this.releaseGuardrailKeys(appName);
+      this.failDeployEpisode(appName, new Error(message), crypto.randomUUID(), code, undefined, { newEpisode: true });
+    };
+    try {
+      // GUARDRAIL. This branch RETURNS below, above the gate on the ordinary
+      // rebuild path, and expandMonorepo is one of the most expensive things
+      // on the box: a git pull plus an fs.rm/fs.cp of every child tree plus a
+      // build per service. Whether an app takes this branch is decided by the
+      // caller's own drop.yaml (`services:`), so leaving it ungated let any
+      // caller opt into an unmetered build loop.
+      //
+      // Re-checked HERE, synchronously, because the caller's parseDropYaml
+      // awaited: two explicit updates can both pass the early in-progress skip
+      // and then both reach this add. Nothing may await between this check and
+      // the add. The other two early skips are stale for the same reason: a
+      // backup quiesce, a git pull or an upload can begin during that await, and
+      // nothing has been reserved yet. (Under `held` the claim is ours.)
+      if (!held && this.inProgressSkip(appName, true)) return;
+      if (this.isQuiesced()) {
+        this.logger.info(
+          `Deferring update for ${appName}  deploys are quiesced for a backup`,
+          'BACKUP'
+        );
+        refusedWhileHeld(`deploys are paused for a backup; retry the redeploy of '${appName}' shortly`);
+        return;
+      }
+      if (this.gitDeployService?.isCloning(appName) || this.uploadDeployService?.isUploading(appName)) {
+        this.logger.info(
+          `Dropped redeploy for ${appName} - a git pull/upload began while reading its drop.yaml`,
+          'UPDATE'
+        );
+        refusedWhileHeld(`a git pull or upload of '${appName}' began; retry once it settles`);
+        return;
+      }
+      // Re-expansion fs.rm/fs.cp's every child's folder. A child that is
+      // being rebuilt or redeployed (or a group being torn down) must not have
+      // its tree rewritten under it; the update is dropped, and the next
+      // explicit redeploy of the group re-expands.
+      if (this.isGroupBusy(appName)) {
+        this.logger.info(
+          `Dropped redeploy for ${appName} - a service of its monorepo group is busy`,
+          'MONOREPO'
+        );
+        // An explicit re-expansion that is dropped is a deploy the caller is
+        // following: it gets a failed one, not silence.
+        this.failDeployEpisode(
+          appName,
+          new Error(`a service of the monorepo group '${appName}' is busy; retry once it settles`),
+          crypto.randomUUID(),
+          'DEPLOY_REFUSED',
+          undefined,
+          { newEpisode: true }
+        );
+        return;
+      }
+      const containerKeys = this.guardrailKeys(appName, false, actor ?? {});
+      const containerVerdict = this.checkGuardrails(containerKeys);
+      if (!containerVerdict.allowed) {
+        const refusal =
+          `Too many failed deploys (${containerVerdict.failures}). ` +
+          `Retry in ${containerVerdict.retryAfterSeconds}s.`;
+        this.logger.warn(`Re-expansion of '${appName}' refused by guardrail: ${refusal}`, 'MONOREPO');
+        this.releaseGuardrailKeys(appName);
+        this.failDeployEpisode(
+          appName,
+          new Error(refusal),
+          crypto.randomUUID(),
+          'GUARDRAIL_TRIPPED',
+          undefined,
+          held ? { newEpisode: true } : undefined
+        );
+        return;
+      }
+      this.breakerKeys.set(appName, containerKeys);
+
+      this.logger.info(`Re-expanding monorepo container '${appName}' (explicit redeploy)`, 'MONOREPO');
+      // Same in-progress bracket as the app:detected interception: blocks a
+      // concurrent DELETE (409) and re-entrant updates while child folders
+      // are re-materialized out from under running apps.
+      if (!held) {
+        if (this.isBusy(appName)) {
+          this.releaseGuardrailKeys(appName);
+          return;
+        }
+        this.appsInProgress.add(appName);
+      }
+      try {
+        const expanded = await this.expandMonorepo(appPath, appName, config, actor);
+        if (expanded && 'suspended' in expanded) {
+          // Not a success and not a failure of the caller: the keys are given
+          // back first so nothing is charged, then a held episode is closed.
+          this.releaseGuardrailKeys(appName);
+          if (held) {
+            this.failDeployEpisode(
+              appName,
+              new Error(new AppSuspendedError(appName, expanded.suspended).tenantMessage),
+              crypto.randomUUID(),
+              suspensionEpisodeCode(expanded.suspended),
+              undefined,
+              { newEpisode: true }
+            );
+          }
+          return;
+        }
+        this.recordDeployOutcome(appName, true);
+      } catch (err) {
+        if (held) {
+          // Records the failure with the breaker as well (it owns the keys).
+          this.failDeployEpisode(
+            appName,
+            err instanceof Error ? err : new Error(String(err)),
+            crypto.randomUUID(),
+            undefined,
+            undefined,
+            { newEpisode: true }
+          );
+        } else {
+          this.recordDeployOutcome(appName, false);
+        }
+        throw err;
+      } finally {
+        if (!held) this.appsInProgress.delete(appName);
+      }
+    } finally {
+      giveBack();
+    }
+  }
+
+  /** Nobody awaits a redeploy's `done`: its rejection (the failure handler itself throwing) is logged, never unhandled. */
+  private logRedeployFailure(appName: string, done: Promise<boolean>): void {
+    done.catch((error) =>
+      this.logger.error(`Redeploy of ${appName} failed while reporting its outcome`, 'UPDATE', error)
+    );
+  }
+
+  /** `promise`, or TIMED_OUT if it has not settled within `ms` (it keeps running either way). */
+  private async within<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<typeof TIMED_OUT>((resolve) => {
+          timer = setTimeout(() => resolve(TIMED_OUT), ms);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Land a git-backed app's repository for an explicit redeploy, under the
+   * caller's hold: the land is marked (so a watcher build is deferred, not
+   * dropped) and unmarked again before the hold goes on to build. A failure is
+   * a deploy the caller is following - a failed episode, counted by the breaker
+   * like any other failed deploy - and is rethrown; the hold is the caller's to
+   * release. The actor carries no token choice: the app's stored token is used.
+   */
+  private async landForRedeploy(
+    appName: string,
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    actor: DeployActorInfo,
+    caller: TokenCaller | null,
+    hold: PlatformHold
+  ): Promise<void> {
+    // This run supersedes a queued (webhook) redeploy of the app, as git's own does.
+    this.gitDeployService!.supersedeQueued(appName);
+    hold.beginLand();
+    try {
+      await this.gitDeployService!.landUnderHold(appState, deployActorOfInfo(actor), caller);
+    } catch (error) {
+      if (error instanceof AppSuspendedError) {
+        // The suspension landed after the entry check: nothing was pulled, so
+        // nothing is charged (the keys are released, not set) and the caller
+        // is told with the tenant text, as a stopped deploy.
+        this.releaseGuardrailKeys(appName);
+        this.failDeployEpisode(
+          appName,
+          new Error(error.tenantMessage),
+          crypto.randomUUID(),
+          suspensionEpisodeCode(error.reason),
+          'deploy',
+          { newEpisode: true }
+        );
+        throw error;
+      }
+      this.breakerKeys.set(appName, this.guardrailKeys(appName, false, actor));
+      this.failDeployEpisode(
+        appName,
+        error instanceof Error ? error : new Error(String(error)),
+        crypto.randomUUID(),
+        undefined,
+        'deploy',
+        { newEpisode: true }
+      );
+      throw error;
+    } finally {
+      hold.endLand();
+    }
+  }
+
+  /** Whether a folder is a monorepo container (by state, or by the drop.yaml it holds now) or plain files. */
+  private async groupClassOf(
+    appState: NonNullable<ReturnType<AppStateManager['getApp']>>,
+    appPath: string
+  ): Promise<'container' | 'files'> {
+    if (appState.isGroupContainer || isMonorepoContainer(await parseDropYaml(appPath))) return 'container';
+    return 'files';
+  }
+
+  /**
+   * redeployApp's checks, run under the hold: the app exists and is not a
+   * service of a git-deployed group (its container is what holds the
+   * repository), a git-backed app has a git service and a valid recorded
+   * repository URL (checked HERE, before any charge), nothing around it is busy,
+   * the stopped rule (not for a monorepo container, which is never started), a
+   * files app still has its folder (a git app lands it again), and disk. Answers
+   * the class too. The deploy admission (breaker and quota) is NOT here: it is
+   * the caller's next step, so a request refused for any of these is not
+   * counted. An ADMITTED request counts against the quota whatever becomes of
+   * it - the quota counts volume, not outcome (principal-quota).
+   */
+  private async checkRedeployable(
+    appName: string,
+    actor: DeployActorInfo
+  ): Promise<
+    | { refused: RedeployRefusal }
+    | {
+        appState: NonNullable<ReturnType<AppStateManager['getApp']>>;
+        kind: 'git' | 'container' | 'files';
+        isContainer: boolean;
+      }
+  > {
+    // FIRST: before the stale-tree and container exemptions, and before any charge.
+    const suspended = suspendedUpdateRefusal(appName);
+    if (suspended) return redeployRefusalOf(appName, suspended);
+    const appState = this.stateManager!.getApp(appName);
+    if (!appState) return redeployRefusal('NOT_FOUND', `Application '${appName}' not found`);
+    const appPath = this.sourcePathOf(appName);
+
+    // A child of a git-deployed group holds no repository of its own, and its
+    // copy is rewritten by the container's next expansion: the route resolves a
+    // child to its container (and re-checks access on it). A direct caller is
+    // told, without naming the container (the group tag is tenant-influenced).
+    const owner = resolveGitBackedName(appState, this.stateManager!);
+    if (owner && owner !== appName) {
+      return redeployRefusal(
+        'REDEPLOY_VIA_CONTAINER',
+        `Application '${appName}' is a service of a git-deployed group; redeploy the group's container`
+      );
+    }
+
+    const isContainer = (await this.groupClassOf(appState, appPath)) === 'container';
+    const kind = appState.gitSource ? 'git' : isContainer ? 'container' : 'files';
+    if (kind === 'git') {
+      if (!this.gitDeployService?.isAvailable()) {
+        return redeployRefusal('SERVICE_UNAVAILABLE', 'git is not available on this system');
+      }
+      try {
+        this.gitDeployService.recordedCloneUrl(appState);
+      } catch (error) {
+        return redeployRefusal('INVALID_GIT_SOURCE', error instanceof Error ? error.message : String(error));
+      }
+    }
+    // A group being rewritten (a container's expansion) or a child being rebuilt
+    // under a container that is. Checked again after the slot wait.
+    if (this.isGroupBusy(appName)) {
+      return redeployRefusal('APP_BUSY', `Application '${appName}' belongs to a group that is busy - retry once it settles`);
+    }
+    // A build container left running (docker isolation) means a build is in
+    // flight that the platform is not tracking.
+    if (await this.hasLiveBuildContainer(appName)) {
+      return redeployRefusal('APP_BUSY', `Application '${appName}' still has a build running - retry once it settles`);
+    }
+
+    // The stopped rule, decided once: a stopped app is rebuilt only to refresh a
+    // tree built for another Node runtime, and an agent never rebuilds one.
+    const rebuildsStale = !actor.agent && (await this.rebuildsStaleTree(appName, appState, true));
+    if (appState.status === 'stopped' && !rebuildsStale && !isContainer) {
+      return redeployRefusal('APP_STOPPED', `Application '${appName}' is stopped; start it before redeploying`);
+    }
+
+    // A files app whose folder is gone (deleted from under it, a wiped volume)
+    // has nothing to rebuild; without this the disk probe of a missing path reads
+    // as "no space" (507). A git app does not need its folder: the land creates
+    // it again, and the disk is probed where it will be.
+    const hasSource = await fs.stat(appPath).then(
+      (stat) => stat.isDirectory(),
+      () => false
+    );
+    if (!hasSource && kind !== 'git') {
+      return redeployRefusal(
+        'APP_SOURCE_MISSING',
+        `Application '${appName}' has no source folder on disk to rebuild; upload it again`
+      );
+    }
+
+    const disk = await hasEnoughDisk(hasSource ? appPath : path.dirname(appPath));
+    if (!disk.ok) {
+      return redeployRefusal(
+        'INSUFFICIENT_DISK',
+        `Insufficient disk space (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`
+      );
+    }
+
+    return { appState, kind, isContainer };
+  }
+
+  /**
+   * The claim's one owner, from the moment it is taken. Two-phase: it resolves
+   * `{refused}` (claim and keys already given back) or `{started}` right after
+   * the mint, with `done` the build and swap running behind it. Whichever way
+   * it ends the claim and the breaker keys are given back exactly once, in one
+   * place (giveBack); neither stage touches `appsInProgress`. `releaseClaim` is
+   * how the caller's claim is given back.
+   *
+   * `done` resolves true only when the new build is serving (see
+   * handleAppUpdate). It rejects when the failure handler itself threw, after
+   * the outcome has been closed. It is logged by no one here: the awaiting
+   * caller gets the rejection, and a caller that does not await it must attach
+   * its own terminal catch, or the rejection goes unhandled.
+   */
+  private async runClaimedUpdate(
+    appName: string,
+    admitted: AdmittedUpdate,
+    releaseClaim: () => void,
+    /** Called with a refusal while the claim is still held (before it is given back). */
+    onRefused?: (refused: UpdateRefused) => void
+  ): Promise<ClaimedUpdate> {
+    const giveBack = (): void => {
+      this.releaseGuardrailKeys(appName);
+      releaseClaim();
+    };
+    let acquired: AcquiredSlot | UpdateRefused;
+    try {
+      acquired = await this.acquireSlotAndRecheck(appName, admitted);
+    } catch (error) {
+      this.reportPreBuildThrow(appName, error, crypto.randomUUID(), admitted.trigger, admitted.explicit);
+      giveBack();
+      throw error;
+    }
+    // A refusal: nothing was built, and neither a refusal nor the box being
+    // full is evidence the caller is looping, so the keys are released, not
+    // recorded.
+    if ('refused' in acquired) {
+      // Reported while the claim is still ours, so a close lands on THIS
+      // deploy's episode and not on a successor's.
+      onRefused?.(acquired);
+      giveBack();
+      return acquired;
+    }
+
+    const deployId = crypto.randomUUID();
+    const done = this.swapAndClose(appName, admitted, deployId, acquired, giveBack);
+    return { started: deployId, done };
+  }
+
+  /**
+   * The slot wait threw: a refusal nobody reported. Reported the way the
+   * guardrail refusal is, and the keys released BEFORE failDeployEpisode so the
+   * failure is not charged (the build never ran).
+   */
+  private reportPreBuildThrow(
+    appName: string,
+    error: unknown,
+    deployId: string,
+    trigger?: DeployTriggerTag,
+    newEpisode?: boolean
+  ): void {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    this.logger.warn(`Redeploy of ${appName} failed before its build: ${failure.message}`, 'UPDATE');
+    this.releaseGuardrailKeys(appName);
+    this.failDeployEpisode(appName, failure, deployId, undefined, trigger, { newEpisode });
+  }
+
+  /** runClaimedUpdate's second phase: buildAndSwap, then whatever it left open closed, then the claim given back. */
+  private async swapAndClose(
+    appName: string,
+    admitted: AdmittedUpdate,
+    deployId: string,
+    acquired: AcquiredSlot,
+    giveBack: () => void
+  ): Promise<boolean> {
+    const progress: UpdateProgress = { builderEntered: false, episodeClosed: false };
+    try {
+      return await this.buildAndSwap(appName, admitted, deployId, acquired, progress);
+    } catch (error) {
+      // buildAndSwap reports every failure itself and never rethrows, so this
+      // is its failure handler throwing (a state write rejecting). Close what
+      // it left open: the minted episode if nothing closed it, and a build
+      // that was paid for is charged either way. failDeployEpisode is NOT
+      // idempotent (on a closed episode it opens and fails a second one), so
+      // closure is tracked, and read from the tracker once the builder has
+      // been entered, since the builder opens its own episode.
+      if (!progress.episodeClosed && (!progress.builderEntered || this.deployEpisodeOpen(appName))) {
+        this.failDeployEpisode(
+          appName,
+          error instanceof Error ? error : new Error('Hot-reload failed'),
+          deployId,
+          undefined,
+          admitted.trigger
+        );
+      } else if (progress.builderEntered) {
+        this.recordDeployOutcome(appName, false);
+      }
+      throw error;
+    } finally {
+      giveBack();
+    }
+  }
+
+  /** Whether the deploy tracker has an episode open for the app (false when it is not initialised). */
+  private deployEpisodeOpen(appName: string): boolean {
+    try {
+      return getDeployTracker().hasOpenEpisode(appName);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * handleAppUpdate's second stage: wait for a builder slot, then re-check what
+   * the wait could have changed. A refusal names its reason and has released
+   * the slot it took, and nothing else. On success the caller owns the returned
+   * slot release. Never touches `appsInProgress`.
+   */
+  private async acquireSlotAndRecheck(
+    appName: string,
+    admitted: AdmittedUpdate
+  ): Promise<AcquiredSlot | UpdateRefused> {
     // Wait for a builder slot BEFORE any side effect, so a redeploy queued
     // behind a full cap (a boot-reconcile burst) leaves status, build log and
     // deploy target alone and the old version untouched. The checks below
     // re-run what can change while waiting, and the disk check then sees the
     // disk as it is now.
     const releaseSlot = await this.reserveBuildSlot(appName);
+    // The platform began stopping while this waited: the slot is released and
+    // nothing starts that stop() would then have to tear down.
+    if (this.stopping) {
+      releaseSlot();
+      return { refused: 'stopping' };
+    }
+    // Suspended while it waited: the entry check is stale after a long wait.
+    // Before the stopped exemption below (an app stopped at entry proceeds).
+    const suspended = suspendedUpdateRefusal(appName);
+    if (suspended) {
+      this.logger.info(`Dropped redeploy for ${appName} - app was suspended while waiting for a build slot`, 'UPDATE');
+      releaseSlot();
+      return suspended;
+    }
     if (this.isQuiesced()) {
       this.logger.info(
         `Deferring update for ${appName} — deploys are quiesced for a backup`,
         'BACKUP'
       );
       releaseSlot();
-      this.releaseGuardrailKeys(appName);
-      this.appsInProgress.delete(appName);
-      return false;
+      return { refused: 'quiesced' };
     }
     // A git pull or upload that began while waiting publishes its own
     // app:update when it lands, and with appsInProgress cleared that runs.
-    if (this.gitDeployService?.isCloning(appName) || this.uploadDeployService?.isUploading(appName)) {
+    if (
+      this.gitDeployService?.isCloning(appName) ||
+      this.gitReserved.has(appName) ||
+      this.uploadDeployService?.isUploading(appName)
+    ) {
       this.logger.info(
         `Dropped redeploy for ${appName} - a git pull/upload began while waiting for a build slot`,
         'UPDATE'
       );
       releaseSlot();
-      this.releaseGuardrailKeys(appName);
-      this.appsInProgress.delete(appName);
-      return false;
+      return { refused: 'busy' };
+    }
+    if (admitted.groupGuard && this.isGroupBusy(appName)) {
+      this.logger.info(
+        `Dropped redeploy for ${appName} - its monorepo group became busy while waiting for a build slot`,
+        'UPDATE'
+      );
+      releaseSlot();
+      return { refused: 'group-busy' };
     }
     // Removed, or stopped by the user since entry, while waiting. An explicit
     // redeploy of an app that was ALREADY stopped at entry (rebuildsStaleTree)
     // deliberately proceeds.
-    const current = this.stateManager.getApp(appName);
-    if (!current || (current.status === 'stopped' && statusAtEntry !== 'stopped')) {
+    const current = this.stateManager!.getApp(appName);
+    if (!current || (current.status === 'stopped' && admitted.statusAtEntry !== 'stopped')) {
       this.logger.info(
         `Dropped redeploy for ${appName} - app was ${current ? 'stopped by user' : 'removed'} while waiting for a build slot`,
         'UPDATE'
       );
       releaseSlot();
-      this.releaseGuardrailKeys(appName);
-      this.appsInProgress.delete(appName);
-      return false;
+      return { refused: current ? 'stopped' : 'gone' };
     }
 
-    // Hot-reload — the app is currently RUNNING and serving traffic. Abort
-    // with a `return`, never a `throw`: the catch below unconditionally marks
-    // the app 'errored' and tears down its health prober, which is wrong for
-    // a healthy running app that simply can't be rebuilt right now. Must run
-    // after appsInProgress.add (before it would open a TOCTOU double-build
+    // Hot-reload - the app is currently RUNNING and serving traffic. Abort
+    // with a `return`, never a `throw`: buildAndSwap's catch unconditionally
+    // marks the app 'errored' and tears down its health prober, which is wrong
+    // for a healthy running app that simply can't be rebuilt right now. Must run
+    // after the claim is taken (before it would open a TOCTOU double-build
     // window) and before setAppStatus('building') (so status stays 'running').
-    const disk = await hasEnoughDisk(appPath);
+    const disk = await hasEnoughDisk(admitted.appPath);
     if (!disk.ok) {
       this.logger.warn(
         `Skipping hot-reload of ${appName}: insufficient disk (${Math.round(disk.freeMb)} MB free, need ${getMinFreeDiskMb()} MB)`,
         'UPDATE'
       );
-      // Released, not counted: the build never ran, and the box being full is
-      // not evidence the caller is looping. Leaving the key set would hand this
-      // episode's slot to whatever outcome is recorded next.
-      this.releaseGuardrailKeys(appName);
-      this.appsInProgress.delete(appName);
       releaseSlot();
-      return false;
+      return { refused: 'disk' };
     }
 
+    // The entry gate's verdict is stale after a long wait: the breaker may have
+    // tripped meanwhile (a looping caller queued behind a full cap). Re-checked
+    // against the keys this deploy was admitted under; spends no quota.
+    const keys = this.breakerKeys.get(appName);
+    const verdict = keys ? this.checkGuardrails(keys) : undefined;
+    if (verdict && !verdict.allowed) {
+      const refusal =
+        `Too many failed deploys (${verdict.failures}). Retry in ${verdict.retryAfterSeconds}s.`;
+      this.logger.warn(`Redeploy of ${appName} refused by guardrail: ${refusal}`, 'UPDATE');
+      releaseSlot();
+      // Released BEFORE reporting, as at the entry gate: failDeployEpisode
+      // records a failure, which must not land in the window that refused it.
+      this.releaseGuardrailKeys(appName);
+      this.appDeployTimes.set(appName, Date.now());
+      this.failDeployEpisode(
+        appName,
+        new Error(refusal),
+        crypto.randomUUID(),
+        'GUARDRAIL_TRIPPED',
+        admitted.trigger,
+        { newEpisode: admitted.explicit }
+      );
+      return { refused: 'guardrail', retryAfterSeconds: verdict.retryAfterSeconds };
+    }
+    return { releaseSlot };
+  }
+
+  /**
+   * handleAppUpdate's third stage: build, then swap the new release in. Reports
+   * every failure itself (the catch below) and does not touch the claim -
+   * runClaimedUpdate releases it.
+   *
+   * @returns true only when the new build is serving (see handleAppUpdate).
+   */
+  private async buildAndSwap(
+    appName: string,
+    admitted: AdmittedUpdate,
+    deployId: string,
+    acquired: AcquiredSlot,
+    progress: UpdateProgress
+  ): Promise<boolean> {
+    // The id is minted by the caller, ahead of the try, so the catch can close
+    // an episode under it. This path must NOT skip the mint: upload-deploy
+    // routes every EXISTING app here, so threading only the fresh-deploy path
+    // would leave exactly those builds unaddressable.
+    const { appPath, appState, wasRunning, originalPort } = admitted;
+    const { releaseSlot } = acquired;
     try {
       // M5.1 deploy transaction: keep old version serving while the new build
       // runs. Only stop the old process after a successful build — on failure,
       // restore the `running` status so the old version stays live.
-      await this.stateManager.setAppStatus(appName, 'building');
+      await this.stateManager!.setAppStatus(appName, 'building');
 
       // Re-detect and rebuild the app
-      const detection = await this.detector.detect(appPath, { silent: true });
+      const detection = await this.detector!.detect(appPath, { silent: true });
 
       // Persist the (possibly changed) type on hot-reload too — detect() is
       // silent, so this is the only place a static→node type change is recorded.
@@ -7068,25 +8776,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       if (this.appConfigService) {
         await this.appConfigService.updateConfig(appName, { type: detectedType });
       }
-      if (this.stateManager) {
-        await this.stateManager.updateApp(appName, { type: detectedType });
-      }
+      await this.stateManager!.updateApp(appName, { type: detectedType });
 
       const workDir = await this.getBuildWorkDir(appName);
-      // Same mint-and-thread as handleBuildApp. This path must NOT be skipped:
-      // upload-deploy routes every EXISTING app here, so it is the dominant
-      // path for an agent redeploying, and threading only the fresh-deploy path
-      // would leave exactly those builds unaddressable.
-      const updateDeployId = crypto.randomUUID();
       const updateLogId = this.buildLogService
-        ? await this.buildLogService.startBuild(appName, new Date(), updateDeployId)
+        ? await this.buildLogService.startBuild(appName, new Date(), deployId)
         : null;
       // Mark this app self-managed only around build(): the build:completed it
       // emits is dispatched synchronously inside build(), so buildSub sees the
       // marker and abstains from starting the app (handleAppUpdate starts it
       // below). finally guarantees the marker is cleared even on build failure —
       // a stuck marker would silently suppress the app's NEXT legit deploy.
-      const buildPath = await this.prepareDeployTarget(appName, appPath, updateDeployId);
+      const buildPath = await this.prepareDeployTarget(appName, appPath, deployId);
       this.selfManagedUpdates.add(appName);
       let buildResult;
       try {
@@ -7101,10 +8802,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           detection.type,
           appName
         );
-        buildResult = await this.builder.build({
+        // Re-checked synchronously, nothing awaited before the build starts.
+        this.assertStartable(appName);
+        progress.builderEntered = true;
+        buildResult = await this.builder!.build({
           appName,
           appPath: buildPath,
-          deployId: updateDeployId,
+          deployId,
           appType: detection.type,
           framework: detection.framework || null,
           config: {
@@ -7117,6 +8821,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           toolchainId,
           nodeModulesAsideDir,
           slotReserved: true,
+          trigger: admitted.trigger,
           onBuildLog: updateLogId && this.buildLogService
             ? (line) => this.buildLogService!.writeLine(updateLogId, line)
             : undefined,
@@ -7139,16 +8844,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Old process is still running — restore status and surface the error
         // so the dashboard shows it without taking down the live service.
         if (wasRunning) {
-          await this.stateManager.setAppStatus(appName, 'running', {
+          await this.stateManager!.setAppStatus(appName, 'running', {
             port: originalPort,
             error: `Build failed: ${buildError}`,
           });
         } else {
-          await this.stateManager.setAppStatus(appName, 'errored', { error: buildError });
+          await this.stateManager!.setAppStatus(appName, 'errored', { error: buildError });
         }
         await this.discardDeployTarget(appName);
         this.recordDeployOutcome(appName, false);
-        this.appsInProgress.delete(appName);
         return false;
       }
 
@@ -7157,12 +8861,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // already exists, so gating it did nothing and unapproved code went live
       // the instant the new process started. Holding before the stop leaves the
       // approved version running and serving, untouched.
-      if (await this.holdForPromotion(appName, buildResult.outputPath ?? undefined, updateDeployId)) {
+      if (await this.holdForPromotion(appName, buildResult.outputPath ?? undefined, deployId)) {
         // A held build is not a failed one — the guardrail window must not be
-        // charged for a deploy the operator asked to be held.
+        // charged for a deploy the operator asked to be held. Released here, not
+        // left to the finally: the status write below can throw, and a throw is
+        // charged to whatever keys are still set.
         this.releaseGuardrailKeys(appName);
-        await this.stateManager.setAppStatus(appName, appState.status);
-        this.appsInProgress.delete(appName);
+        await this.stateManager!.setAppStatus(appName, appState.status);
         return false;
       }
 
@@ -7185,16 +8890,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // buildFreshStartSpec's allocatePort() call below re-claims the same
       // config-sourced port; releasing it in between would open a window for
       // a concurrent deploy to steal it.
-      // Also stop when the app is 'errored': the hot-reload catch block below
-      // can mark an app errored while its PM2 process is still alive (the
-      // failure happened after start), and skipping stop() here would hit
-      // ProcessManager.start's online-early-return - a silent no-op that
-      // leaves the old (broken) code running.
-      if (wasRunning || appState.status === 'errored') {
-        this.logger.info(`Stopping ${appName} to swap in new build...`, 'UPDATE');
-        this.stopHealthProber(appName);
-        await this.runtime.stop(appName);
-      }
+      // Unconditional, as in doRestart: the STORED status says nothing
+      // reliable about the process (an 'errored' or crash-looping app can
+      // still hold a live one). See replaceLiveProcess.
+      this.logger.info(`Replacing ${appName}'s process (if any) with the new build...`, 'UPDATE');
+      await this.replaceLiveProcess(appName);
 
       this.appBuildDurations.set(appName, buildResult.duration);
       this.logger.appEvent('built', appName, `rebuilt in ${buildResult.duration}ms`);
@@ -7207,7 +8907,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       }
 
-      await this.stateManager.setAppStatus(appName, 'starting');
+      await this.stateManager!.setAppStatus(appName, 'starting');
 
       const { spec, port } = await this.buildFreshStartSpec(
         appName,
@@ -7216,7 +8916,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         buildResult.outputPath ?? undefined
       );
       await this.noteRuntimeLogStart(appName);
-      const status = await this.runtime.start(spec);
+      const status = await this.startInstance(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (hot-reloaded)`);
 
@@ -7228,7 +8928,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // delay the 'running' status write or appsInProgress's release.
       void this.recordDeploySignature(appName, this.sourcePathOf(appName));
 
-      await this.stateManager.setAppStatus(appName, 'running', {
+      await this.stateManager!.setAppStatus(appName, 'running', {
         port,
         pid: status.pid ?? undefined,
       });
@@ -7244,11 +8944,16 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       await this.commitServedPath(appName, buildPath);
       this.recordDeployOutcome(appName, true);
-      this.appsInProgress.delete(appName);
       return true;
     } catch (error) {
       releaseSlot();
       await this.discardDeployTarget(appName);
+      // Checked first: a suspension must not fall through to the 'errored'
+      // write and the breaker charge below, which would undo the stop.
+      if (error instanceof AppSuspendedError) {
+        await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason }, { progress, closeEpisode: true });
+        return false;
+      }
       // Secret preflight park (PRD-051) on a hot-reload — e.g. the edited
       // drop.yaml added a required `secrets:` entry. Park in `needs-config`
       // (not `errored`) so the operator gets the actionable missing list. The
@@ -7258,7 +8963,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           `${appName} parked in needs-config on hot-reload — ${needsConfigAction(error)}, then restart`,
           'SECURITY'
         );
-        await this.stateManager.setAppStatus(appName, 'needs-config', {
+        await this.stateManager!.setAppStatus(appName, 'needs-config', {
           missingSecrets: error.missingSecrets,
           ...(error instanceof AppManifestInvalidError ? { error: error.message } : {}),
         });
@@ -7271,17 +8976,45 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // free, unbounded loop. (An earlier revision likened this to MAX_BUILDS;
         // that was wrong — MAX_BUILDS aborts BEFORE the build.)
         this.recordDeployOutcome(appName, false);
-        this.appsInProgress.delete(appName);
         return false;
       }
       this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
-      await this.stateManager.setAppStatus(appName, 'errored', {
+      await this.stateManager!.setAppStatus(appName, 'errored', {
         error: error instanceof Error ? error.message : 'Hot-reload failed',
       });
+      // A throw BEFORE builder.build() (detect, prepareDeployTarget,
+      // resolveBuildEnv, buildToolchainFor, a malformed drop.yaml) never opened
+      // a deploy episode, so the setAppStatus above had nothing to close.
+      // Mirrors handleBuildApp. Also records the breaker failure.
+      if (!progress.builderEntered) {
+        this.failDeployEpisode(
+          appName,
+          error instanceof Error ? error : new Error('Hot-reload failed'),
+          deployId,
+          undefined,
+          admitted.trigger
+        );
+        progress.episodeClosed = true;
+      }
       this.recordDeployOutcome(appName, false);
-      this.appsInProgress.delete(appName);
       return false;
     }
+  }
+
+  /**
+   * The ONE in-progress admission predicate for handleAppUpdate: true when the
+   * app already has an update or deploy in flight, having logged the skip.
+   * Synchronous on purpose — callers rely on nothing being awaited between this
+   * check and their own appsInProgress.add.
+   */
+  private inProgressSkip(appName: string, bypassCooldown?: boolean): boolean {
+    if (!this.isBusy(appName)) return false;
+    if (bypassCooldown) {
+      this.logger.info(`Dropped redeploy for ${appName} - already in progress`, 'UPDATE');
+    } else {
+      this.logger.debug(`Skipping update for ${appName} - already in progress`, 'UPDATE');
+    }
+    return true;
   }
 
   /**
@@ -7374,10 +9107,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * api/platform-ops.ts): on a stopped app it degenerates to a fresh start.
    */
   async restartApp(appName: string): Promise<AppProcessInfo> {
-    // Synchronous check-and-insert — no await between the check and the add,
-    // mirroring handleAppUpdate — so two concurrent restarts of the same app
-    // can't both pass the guard.
-    if (this.appsInProgress.has(appName)) {
+    // Before the busy check, so a suspension is never reported as a busy app.
+    this.assertStartable(appName);
+    // Synchronous check-and-insert, no await between the check and the add,
+    // so two concurrent restarts of the same app can't both pass the guard.
+    // (handleAppUpdate awaits before its claim, so it re-checks again on the
+    // line before ITS add; see isBusy.)
+    if (this.isBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
@@ -7393,8 +9129,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * new release. Returns FALSE, having touched nothing, when the deploy is not
    * eligible (see `cutoverEligibility`) — the caller then stops and starts as
    * before. Otherwise it handled the deploy — 'ok' when traffic moved to the
-   * new release, 'failed' when it did not; it then owns the app's status, the
-   * guardrail outcome and releasing `appsInProgress`.
+   * new release, 'failed' when it did not; it then owns the app's status and the
+   * guardrail outcome. The claim on `appsInProgress` stays with the caller,
+   * which releases it once (giveBack, in swapAndClose's finally).
    */
   private async tryCutover(
     appName: string,
@@ -7414,7 +9151,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return 'failed';
     }
     this.recordDeployOutcome(appName, true);
-    this.appsInProgress.delete(appName);
     return 'ok';
   }
 
@@ -7514,7 +9250,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         await runtime.delete(newRef).catch(() => undefined);
       }
       await this.noteRuntimeLogStart(appName);
-      await runtime.start(spec);
+      await this.startInstance(spec);
       started = true;
 
       const ready = await this.awaitStrictReadiness(newRef, newPort, spec.healthCheckPath);
@@ -7544,6 +9280,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
       if (started) await runtime.delete(newRef).catch(() => undefined);
       if (this.usedPorts.get(newPort) === appName) this.usedPorts.delete(newPort);
+      // A suspension is not a failed cutover: the caller settles it, rather than
+      // failCutover writing 'errored' and putting 'running' and the prober back.
+      if (error instanceof AppSuspendedError) throw error;
       return { ok: false, error, healthCheckPath: spec?.healthCheckPath };
     }
 
@@ -7551,6 +9290,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // finish, then remove it.
     this.cutovers.delete(appName);
     await new Promise((resolve) => setTimeout(resolve, this.cutoverDrainMs()));
+    // Not replaceLiveProcess: that is app-addressed and fails on survival; this
+    // is slot-addressed and best-effort, traffic having already switched.
     this.stopHealthProber(appName);
     await runtime.delete(oldRef).catch((err) =>
       this.logger.warn(`Could not remove ${oldInstance} after cutover`, 'CUTOVER', err)
@@ -7585,6 +9326,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     error: unknown,
     healthCheckPath: string | undefined
   ): Promise<void> {
+    // Backstop: cutoverTo re-throws a suspension, so it should never arrive here.
+    if (error instanceof AppSuspendedError) throw error;
     const reason = error instanceof Error ? error.message : String(error);
     const exited = error instanceof CutoverError && error.exited;
     this.logger.warn(`Zero-downtime deploy of ${appName} failed; previous version still serving: ${reason}`, 'CUTOVER');
@@ -7606,7 +9349,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     await this.stateManager?.setAppStatus(appName, 'errored', { port: oldPort, error: message });
     await this.stateManager?.setAppStatus(appName, 'running', { port: oldPort, error: message });
     this.armPostDeployWatches(appName, oldPort, healthCheckPath);
-    this.appsInProgress.delete(appName);
   }
 
   /**
@@ -7678,18 +9420,37 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     return false;
   }
 
+  /** One boot-time warning when the public host cannot be protected from tenant names. */
+  private warnPlatformHostConfig(): void {
+    const warning = platformHostWarning(getPublicUrl(), this.config.domainSuffix);
+    if (warning) this.logger.warn(warning, 'SECURITY');
+  }
+
+  /**
+   * Remove the live route for a hostname the app is no longer allowed to serve.
+   *
+   * The route key is `${app}/${host lowercased}`; '/' appears in neither a
+   * folder name nor a hostname, so keys of different apps cannot collide. The
+   * owner and hostname are still checked as defence in depth: only a route this
+   * app owns, on exactly this hostname, is removed.
+   */
+  private async pruneRoute(appName: string, hostname: string): Promise<void> {
+    const routeKey = `${appName}/${hostname.toLowerCase()}`;
+    const route = this.router?.getRoute(routeKey);
+    if (!route || route.owner !== appName) return;
+    if (route.hostname?.toLowerCase() !== hostname.toLowerCase()) return;
+    await this.router?.removeRoute(routeKey).catch((err) =>
+      this.logger.warn(`Could not remove the route for '${hostname}'`, 'ROUTER', err)
+    );
+  }
+
   /**
    * Forget a verified custom domain (#302) and remove the route it had, if
    * any. Used when the app's domain no longer matches what was verified.
    * Best-effort: a route that is already gone is not an error.
    */
   private async dropCustomDomainRoute(appName: string, domain: string): Promise<void> {
-    const routeKey = `${appName}-${domain.replace(/\./g, '-')}`;
-    if (this.router?.hasRoute(routeKey)) {
-      await this.router.removeRoute(routeKey).catch((err) =>
-        this.logger.warn(`Could not remove the route for '${domain}'`, 'ROUTER', err)
-      );
-    }
+    await this.pruneRoute(appName, domain);
     await this.appConfigService
       ?.updateSystemConfig(appName, { customDomainVerified: undefined })
       .catch(() => undefined);
@@ -7803,6 +9564,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * The git commit the app's current files came from: its own `gitSource`, or
+   * for a monorepo child (which carries none) its group container's, the
+   * container stamped on it as `groupContainer`.
+   */
+  private servedGitCommit(appName: string): string | undefined {
+    const container = this.appConfigService?.getConfig?.(appName)?.groupContainer;
+    return (
+      this.stateManager?.getApp(appName)?.gitSource?.lastCommitSha ??
+      (container ? this.stateManager?.getApp(container)?.gitSource?.lastCommitSha : undefined)
+    );
+  }
+
+  /**
+   * Put the commit an app displays back to the one its restored files came
+   * from. Only an app with its own `gitSource`: a monorepo child's commit is its
+   * container's, which a child rollback does not touch.
+   */
+  private async restoreGitCommit(appName: string, commit: string | undefined): Promise<void> {
+    if (commit === undefined || !this.stateManager) return;
+    const gitSource = this.stateManager.getApp(appName)?.gitSource;
+    if (!gitSource) return;
+    await this.stateManager.updateApp(appName, {
+      gitSource: { ...gitSource, lastCommitSha: commit },
+    } as Record<string, unknown>);
+  }
+
+  /**
    * The app is now RUNNING from `servedPath`: record it. A release becomes
    * `currentRelease` (the one it replaces becomes `previousRelease`) and any
    * older release is pruned — so a rollback to `previousRelease` swaps the
@@ -7829,6 +9617,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             : { id: path.basename(servedPath), path: servedPath, createdAt: new Date().toISOString() }),
           // What a later rollback to this release must serve from.
           ...(reused ? {} : cfg?.outputDirectory !== undefined ? { outputDirectory: cfg.outputDirectory } : {}),
+          // The commit it was built from, for a rollback to put back.
+          ...(reused || this.servedGitCommit(appName) === undefined
+            ? {}
+            : { gitCommit: this.servedGitCommit(appName) }),
           ...(slot ? { instance: slot } : {}),
         };
         const previous = cfg?.currentRelease ?? cfg?.previousRelease;
@@ -7874,7 +9666,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * touched — see NOT_RESTORED.
    */
   async rollbackApp(appName: string): Promise<{ meta: RollbackSnapshotMeta; info: AppProcessInfo }> {
-    if (this.appsInProgress.has(appName)) {
+    // First: a rollback restores a tree or cuts over before it starts anything.
+    this.assertStartable(appName);
+    if (this.isBusy(appName) || this.isGroupBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
@@ -7899,7 +9693,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       }
 
       const appPath = this.servingPathOf(appName, config, state);
+      // Re-checked right before the irreversible step: the awaits above could
+      // have outlived a suspension, and restoreInto empties the app directory.
+      this.assertStartable(appName);
       const meta = await store.restoreInto(appName, appPath);
+      // The folder is the older tree again, so the commit the app claims is too.
+      await this.restoreGitCommit(appName, meta.gitCommit);
       this.appDeployTimes.set(appName, Date.now());
       if (meta.outputDirectory !== undefined) {
         await this.appConfigService.upsertConfig(appName, { outputDirectory: meta.outputDirectory });
@@ -7945,6 +9744,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       takenAt: release.createdAt,
       bytes: measured.bytes,
       ...(release.outputDirectory !== undefined ? { outputDirectory: release.outputDirectory } : {}),
+      ...(release.gitCommit !== undefined ? { gitCommit: release.gitCommit } : {}),
       kind: 'release',
     };
   }
@@ -7964,7 +9764,17 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const oldPort = await this.cutoverEligibility(appName, release.path);
     if (oldPort !== null) {
       const detection = await this.detector.detect(release.path, { silent: true });
-      const result = await this.cutoverTo(appName, release.path, detection, release.outputDirectory, oldPort);
+      let result;
+      try {
+        result = await this.cutoverTo(appName, release.path, detection, release.outputDirectory, oldPort);
+      } catch (error) {
+        // cutoverTo re-threw a suspension: revoke the key the start re-minted and
+        // leave the status true. The release is the previous one, not a deploy target.
+        if (error instanceof AppSuspendedError) {
+          await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason }, { closeEpisode: false });
+        }
+        throw error;
+      }
       if (!result.ok) {
         const reason = result.error instanceof Error ? result.error.message : String(result.error);
         throw new Error(
@@ -7972,6 +9782,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         );
       }
       this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');
+      await this.restoreGitCommit(appName, release.gitCommit);
       const info = await this.runtime.getStatus(appName);
       if (!info) throw new Error(`Rolled back ${appName}, but the runtime does not report it`);
       return { meta, info };
@@ -7979,14 +9790,304 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Not running, or not something traffic can be cut over for: serve the
     // previous release from the next start, as a snapshot rollback would.
+    // Re-checked before the first write; a second check after it would leave
+    // the outputDirectory written and the release not committed (a torn rollback).
+    this.assertStartable(appName);
     if (release.outputDirectory !== undefined) {
       await this.appConfigService.upsertConfig(appName, { outputDirectory: release.outputDirectory });
     }
     await this.commitServedPath(appName, release.path);
     this.appDeployTimes.set(appName, Date.now());
     this.logger.info(`Rolled back ${appName} to the release deployed ${release.createdAt}`, 'ROLLBACK');
+    await this.restoreGitCommit(appName, release.gitCommit);
     const info = await this.doRestart(appName);
     return { meta, info };
+  }
+
+  /**
+   * Removes whatever process the runtime holds for `appName` so the start that
+   * follows registers fresh. ProcessManager.delete swallows its errors, and a
+   * start over a surviving process hits the online early-return - a silent
+   * no-op that records success - so the removal is verified through the seam
+   * rather than trusted. Deleting an absent process is a no-op.
+   * Best-effort under PM2: ProcessManager.getStatus swallows RPC errors, so a
+   * PM2 that cannot be reached reads as absent.
+   */
+  private async replaceLiveProcess(appName: string): Promise<void> {
+    this.stopHealthProber(appName);
+    await this.runtime!.delete(appName);
+    if (await this.runtime!.getStatus(appName)) {
+      throw new Error(`The previous instance of ${appName} is still present after delete`);
+    }
+  }
+
+  /**
+   * Throws AppSuspendedError when an administrator has suspended the app.
+   * Synchronous (the store answers from memory), so it can sit directly in
+   * front of a runtime call with nothing awaited between the two.
+   */
+  private assertStartable(appName: string): void {
+    // A start with no usable name cannot be checked against a name-keyed record:
+    // refuse it rather than let it through as "not suspended".
+    if (typeof appName !== 'string' || appName === '') {
+      throw new Error('Cannot start an app without a name');
+    }
+    // The refusal says WHY (a record, an unreadable store, a store not yet
+    // loaded), rather than attributing it to an administrator who never acted.
+    const refusal = getSuspensionStore().refusalFor(appName);
+    if (refusal) throw new AppSuspendedError(appName, refusal);
+  }
+
+  /**
+   * THE choke point for starting an app on the runtime: every start goes
+   * through here, so none can skip the suspension check. A test pins
+   * `runtime.start(` / `runtime.restart(` to this method and `restartInstance`.
+   * The instance a cutover starts in the idle slot is checked by its APP name.
+   */
+  private async startInstance(spec: AppStartSpec): Promise<AppProcessInfo> {
+    this.assertStartable(spec.name);
+    return this.runtime!.start(spec);
+  }
+
+  /**
+   * The restart twin of `startInstance`: `pm2.restart` and `container.restart`
+   * both start a STOPPED process, so a restart is a start.
+   */
+  private async restartInstance(appName: string): Promise<AppProcessInfo> {
+    this.assertStartable(appName);
+    return this.runtime!.restart(appName);
+  }
+
+  /**
+   * Close a start that was cut short, by its CAUSE (`suspended`, or `stopped`
+   * for a user stop). ONE closer for every catch that can see a refusal, because
+   * each of those catches otherwise writes 'errored' and charges the breaker,
+   * which would undo the stop and punish the caller for someone else's act:
+   *
+   *   1. the guardrail keys are released, UNCHARGED;
+   *   2. when `closeEpisode` (the deploy paths: buildAndSwap and a first
+   *      deploy), the episode is closed once, as DEPLOY_STOPPED, and only when
+   *      one is open. failDeployEpisode is not idempotent, so
+   *      `progress.episodeClosed` is set first and closure is read from the
+   *      tracker. A restart or a promotion passes false: a restart has no
+   *      episode, and a held build's is left open by design;
+   *   3. the runtime-log window is closed. The deploy TARGET is not touched:
+   *      each caller disposes of its own (buildAndSwap's catch discards it,
+   *      handleStartApp's finally forgets or discards it, promoteApp forgets a
+   *      held one), and rollback and restart have none;
+   *   4. the app's minted provisioning key is revoked, best-effort: every start
+   *      path re-mints it in buildStartSpec BEFORE the guard throws;
+   *   5. the status is left TRUE, by cause and by what the runtime shows (and
+   *      not at all while the platform is stopping):
+   *        - nothing live: 'stopped' (the cause's text), or 'errored' when the
+   *          refusal was the store and not an administrator's act;
+   *        - live, an administrator's suspension or a stop: left alone (the
+   *          caller is taking it down and writes 'stopped' when it is done);
+   *        - live, the store refusing: 'running' with the error, because
+   *          something IS serving and the app is not suspended;
+   *        - liveness unknown (the runtime could not be listed): 'errored' when
+   *          the store refused, 'stopped' for a suspension or a stop;
+   *   6. except that a caller which does not close the episode never closes it
+   *      by accident: while one is open, the deploy tracker closes it on
+   *      'running' and 'errored', so neither is written then. Nothing live
+   *      falls back to 'stopped' (which the tracker ignores); the other two
+   *      write nothing and log.
+   *
+   * What a tenant can read (AppState.error, the episode detail) never names the
+   * suspension store's state; the specific reason goes to the log. It never arms
+   * the prober or the crash-loop watch.
+   */
+  private async settleRefusedStart(
+    appName: string,
+    cause: StartRefusalCause,
+    opts: { progress?: UpdateProgress; closeEpisode: boolean }
+  ): Promise<void> {
+    // Whether the caller is taking the app down itself, or the store is what refused.
+    const unreadable = cause.kind === 'suspended' && cause.reason !== 'record';
+    const { shown, logged } = startRefusalText(appName, cause);
+    this.logger.warn(`Deploy of ${appName} stopped: ${logged}`, 'SUSPENSION');
+    // Never throws: every step is attempted and logged, so a caller that must re-throw
+    // the refusal (a restart, a promotion) always gets to.
+    const attempt = async (what: string, step: () => unknown): Promise<void> => {
+      try {
+        await step();
+      } catch (err) {
+        this.logger.error(`Could not ${what} for ${appName} after a refused start`, 'SUSPENSION', err);
+      }
+    };
+    await attempt('release the guardrail keys', () => this.releaseGuardrailKeys(appName));
+    if (opts.closeEpisode && !opts.progress?.episodeClosed && this.deployEpisodeOpen(appName)) {
+      if (opts.progress) opts.progress.episodeClosed = true;
+      await attempt('close the deploy episode', () =>
+        this.failDeployEpisode(appName, new Error(shown), undefined, 'DEPLOY_STOPPED')
+      );
+    }
+    await attempt('close the runtime-log window', () => this.noteRuntimeLogEnd(appName));
+    await attempt('revoke the provisioning key', () => deleteApiKeysByName(appProvisionKeyName(appName)));
+    // A platform that is stopping owns its own shutdown of the state: no write.
+    if (this.stopping) return;
+    let live: boolean | null = null;
+    try {
+      live = (await this.runtimeInstancesOf(appName)).some(isLiveRuntimeState);
+    } catch (err) {
+      this.logger.warn(`Could not read the runtime for ${appName}`, 'SUSPENSION', err);
+    }
+    // An episode this call does not own stays open: the tracker would close it on 'running' or 'errored'.
+    const foreignEpisodeOpen = !opts.closeEpisode && this.deployEpisodeOpen(appName);
+    const withheld = (status: string): void =>
+      this.logger.warn(
+        `Not writing '${status}' for ${appName} after a refused start: it would close the open deploy episode`,
+        'SUSPENSION'
+      );
+    const write = (status: AppStatus, error: string): Promise<void> =>
+      attempt(`write '${status}'`, () => this.stateManager?.setAppStatus(appName, status, { error }));
+    if (live === null) {
+      // Liveness unknown: only the store refusing is an error; an administrator's
+      // suspension or a stop was taken on purpose, and nothing can be told to be up.
+      if (!unreadable) await write('stopped', shown);
+      else if (foreignEpisodeOpen) withheld('errored');
+      else await write('errored', 'runtime unreadable after a refused start');
+    } else if (!live) {
+      await write(unreadable && !foreignEpisodeOpen ? 'errored' : 'stopped', shown);
+    } else if (unreadable) {
+      if (foreignEpisodeOpen) withheld('running');
+      else await write('running', shown);
+    } else {
+      this.logger.warn(
+        `${appName} is still live after a refused start; its status is left for the caller to write`,
+        'SUSPENSION'
+      );
+    }
+  }
+
+  /**
+   * Every runtime instance of the app (both slots), from the runtime's own list.
+   * Not `getStatus`: PM2's swallows RPC errors, which would read as "absent". A
+   * runtime that cannot be listed throws, and the caller decides what that means.
+   */
+  private async runtimeInstancesOf(appName: string): Promise<AppProcessInfo[]> {
+    const all = await this.runtime!.getAllStatus();
+    return all.filter((p) => appNameOfInstance(p.instance ?? p.name) === appName);
+  }
+
+  /**
+   * Take an app's running instances away: disarm the prober and crash-loop
+   * watch (or one could restart what is removed next), delete BOTH slots by
+   * explicit reference (the bare name only ever means the live slot), verify
+   * through the runtime's own list, remove its routes and, when asked, its
+   * minted DROP_API_KEY. Returns what did not work; never throws on a failed
+   * step, because the caller reports all of them rather than stopping at one.
+   * Shared by suspension and by a stop that must hold (follow-up F).
+   */
+  private async takeAppDown(appName: string, opts: { revokeKey: boolean }): Promise<string[]> {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error('Platform is not fully initialized');
+
+    this.stopHealthProber(appName);
+    this.stopCrashLoopWatch(appName);
+
+    const errors: string[] = [];
+    for (const slot of ['a', 'b'] as const) {
+      const ref = instanceRef(appName, slot);
+      try {
+        await runtime.delete(ref);
+      } catch (err) {
+        errors.push(`${ref}: ${err instanceof Error ? err.message : 'delete failed'}`);
+      }
+    }
+    try {
+      for (const left of await this.runtimeInstancesOf(appName)) {
+        errors.push(`${left.instance ?? left.name}: still present after delete`);
+      }
+    } catch (err) {
+      errors.push(`runtime: could not verify the removal (${err instanceof Error ? err.message : 'unreadable'})`);
+    }
+
+    try {
+      await this.router?.removeRoutesForApp(appName);
+    } catch (err) {
+      errors.push(`routes: ${err instanceof Error ? err.message : 'removal failed'}`);
+    }
+    if (opts.revokeKey) {
+      try {
+        await deleteApiKeysByName(appProvisionKeyName(appName));
+      } catch (err) {
+        errors.push(`api key: ${err instanceof Error ? err.message : 'revoke failed'}`);
+      }
+    }
+    return errors;
+  }
+
+  /**
+   * Suspend an app (admin). Order matters:
+   *
+   *   1. the record is written FIRST, so every start path refuses from here on;
+   *      a failed write throws and nothing else has been touched;
+   *   2. the prober and crash-loop watch stop, or one could restart what the
+   *      next step removes;
+   *   3. BOTH runtime slots are deleted by explicit reference (the bare name
+   *      only ever means the live slot), then verified through the seam;
+   *   4. routes and the app's minted DROP_API_KEY are removed;
+   *   5. 'stopped' is written.
+   *
+   * Anything still live afterwards comes back as `stopErrors`: the suspension
+   * holds regardless, but the caller is never told a bare success.
+   */
+  async suspendApp(appName: string, by: string, reason?: string): Promise<SuspendAppResult> {
+    const runtime = this.runtime;
+    const state = this.stateManager;
+    if (!runtime || !state) throw new Error('Platform is not fully initialized');
+
+    // Its services are the runtime apps; the container itself runs nothing.
+    const current = state.getApp(appName);
+    if (current?.isGroupContainer) {
+      return {
+        refused: 'group-container',
+        services: state
+          .getAllApps()
+          .filter((a) => a.group === current.group && !a.isGroupContainer)
+          .map((a) => a.name),
+      };
+    }
+
+    // Names are matched ignoring case by the store; another existing app that
+    // differs only in case would be suspended with this one.
+    const collisions = this.caseCollisionsOf(appName);
+    if (collisions.length > 0) return { refused: 'case-collision', names: collisions };
+
+    const record = await getSuspensionStore().suspend(appName, by, reason);
+
+    const stopErrors = await this.takeAppDown(appName, { revokeKey: true });
+
+    await state.setAppStatus(appName, 'stopped', { error: 'Suspended by admin' });
+
+    return { suspended: true, at: record.at, ...(stopErrors.length > 0 ? { stopErrors } : {}) };
+  }
+
+  /**
+   * Lift a suspension. The app is left 'stopped' explicitly (never a leftover
+   * 'errored' or 'crash-looping'), so its owner starts it deliberately. A name
+   * with a record but no app state (the app was deleted) just loses the record.
+   */
+  async unsuspendApp(appName: string): Promise<UnsuspendAppResult> {
+    // The store matches ignoring case: lifting this name would lift another app's.
+    const collisions = this.caseCollisionsOf(appName);
+    if (collisions.length > 0) return { refused: 'case-collision', names: collisions };
+
+    const lifted = await getSuspensionStore().unsuspend(appName);
+    if (lifted && this.stateManager?.getApp(appName)) {
+      await this.stateManager.setAppStatus(appName, 'stopped', { error: undefined });
+    }
+    return { unsuspended: lifted };
+  }
+
+  /** Other existing apps whose name equals `appName` ignoring case (never `appName` itself). */
+  private caseCollisionsOf(appName: string): string[] {
+    if (!this.stateManager) return [];
+    return caseVariantsOf(appName, {
+      stateManager: this.stateManager,
+      appConfigService: this.appConfigService ?? undefined,
+    });
   }
 
   /**
@@ -8003,6 +10104,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (!this.runtime || !this.detector || !this.stateManager || !this.appConfigService) {
       throw new Error('Platform is not fully initialized');
     }
+    // Before anything is deleted or read. (attachService and rollbackApp refuse
+    // at their own entry, before they change anything, and reach here after.)
+    this.assertStartable(appName);
 
     // Resolve the app. Out-of-tree (admin-deployed) apps have state but no
     // appconf, so fall back through both before the webapps-dir default.
@@ -8034,12 +10138,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     await this.assertDependenciesCurrent(appName, appPath);
 
     try {
-      this.stopHealthProber(appName);
       // Delete, not stop: PM2's env update on a bare restart/start is a
       // merge, so a removed secret would keep being injected; delete forces
       // a fresh registration (and, on docker, a fresh container) so the
       // spec built below is what actually ends up running.
-      await this.runtime.delete(appName);
+      await this.replaceLiveProcess(appName);
 
       const detection = await this.detector.detect(appPath, { silent: true });
       const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
@@ -8047,7 +10150,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // the store will discard it — so that a start site is never the one
       // that was forgotten if restarts later become addressable.
       await this.noteRuntimeLogStart(appName);
-      const status = await this.runtime.start(spec);
+      const status = await this.startInstance(spec);
 
       this.logger.appEvent('started', appName, `PID ${status.pid}, port ${port} (restarted)`);
 
@@ -8078,6 +10181,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
       return status;
     } catch (error) {
+      // A suspension that landed after the entry check: settled, then re-thrown
+      // so the caller/route reports it. Not an 'errored' app.
+      if (error instanceof AppSuspendedError) {
+        await this.settleRefusedStart(appName, { kind: 'suspended', reason: error.reason }, { closeEpisode: false });
+        throw error;
+      }
       // Secret preflight park (PRD-051): re-park in `needs-config` rather than
       // `errored` (e.g. a "retry" that still has some required secrets unset),
       // then re-throw so the caller/route reports which are missing.
@@ -8183,7 +10292,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     serviceId: AttachableServiceId
   ): Promise<AttachServiceResult> {
-    if (this.appsInProgress.has(appName)) {
+    // First: an attach provisions (and bills) before the restart that would refuse.
+    this.assertStartable(appName);
+    if (this.isBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
@@ -8256,6 +10367,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         });
       }
 
+      // Object storage only. detachService refuses every group app (guard
+      // 3), so a bucket attached to one could only ever be removed by
+      // deleting the app — and unlike a database, it bills the operator for
+      // every day it sits there. Postgres/Redis keep their existing
+      // asymmetry; this is not the place to change it.
+      if (serviceId === 'object-storage' && (state?.isGroupContainer || state?.group)) {
+        return this.refuse('attach', appName, serviceId, {
+          attached: false,
+          reason: 'group-app',
+          detail: `'${appName}' is part of a monorepo group, and a group app's services cannot be detached — attach object storage to a standalone app instead.`,
+        });
+      }
+
       // Both services need this guard, not just Postgres. dbEnvVars AND
       // redisEnvVars are each spread after secretEnvVars in the start env, so
       // either one provisioned over an owner-supplied URL silently repoints
@@ -8272,7 +10396,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             detail: `This app already supplies its own DATABASE_URL (via ${ownSource}) — attaching would silently repoint it at a freshly-created, empty database.`,
           });
         }
-      } else {
+      } else if (serviceId === 'redis') {
         const ownSource = await this.appRedisUrlSource(appName, appPath);
         if (ownSource) {
           return this.refuse('attach', appName, serviceId, {
@@ -8281,17 +10405,41 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             detail: `This app already supplies its own REDIS_URL (via ${ownSource}) — attaching would silently repoint it at a freshly-created, empty Redis instance.`,
           });
         }
+      } else if (serviceId === 'object-storage') {
+        const own = await this.appAwsCredentialSource(appName, appPath);
+        if (own) {
+          return this.refuse('attach', appName, serviceId, {
+            attached: false,
+            reason: 'has-own-aws-credentials',
+            detail: `This app already sets ${own.name} (via ${own.source}) — attaching would silently repoint its AWS SDK at a freshly-created, empty bucket.`,
+          });
+        }
+      } else {
+        return assertNever(serviceId, 'attachable service');
       }
 
       const ownerUserId = state?.userId;
-      const quota = serviceId === 'postgres'
-        ? this.checkDbQuota(ownerUserId)
-        : this.checkRedisQuota(ownerUserId);
+      let quota: { allowed: true } | { allowed: false; used: number; limit: number };
+      if (serviceId === 'postgres') {
+        quota = this.checkDbQuota(ownerUserId);
+      } else if (serviceId === 'redis') {
+        quota = this.checkRedisQuota(ownerUserId);
+      } else if (serviceId === 'object-storage') {
+        quota = await this.checkObjectStorageQuota(ownerUserId);
+      } else {
+        return assertNever(serviceId, 'attachable service');
+      }
       if (!quota.allowed) {
+        const QUOTA_LABEL: Record<AttachableServiceId, string> = {
+          postgres: 'Database',
+          redis: 'Redis',
+          'object-storage': 'Object storage',
+        };
+        const quotaLabel = QUOTA_LABEL[serviceId];
         return this.refuse('attach', appName, serviceId, {
           attached: false,
           reason: 'quota-exceeded',
-          detail: `${serviceId === 'postgres' ? 'Database' : 'Redis'} quota reached (${quota.used}/${quota.limit}).`,
+          detail: `${quotaLabel} quota reached (${quota.used}/${quota.limit}).`,
           quota: { used: quota.used, limit: quota.limit },
         });
       }
@@ -8312,6 +10460,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // retried attach recovers cleanly; nothing currently detects the gap
       // proactively.
       let envVarNames: string[];
+      // Object storage only: whether THIS attach created the bucket, so a
+      // refusal further down knows it owns the undo.
+      let createdStorage = false;
       if (serviceId === 'postgres') {
         if (!this.dbProvisioner) {
           // A refusal, not a throw: an instance with no database layer is a
@@ -8323,6 +10474,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             detail: 'The database service is not available on this instance.',
           });
         }
+        // Re-checked right before the provisioner call, nothing awaited between.
+        this.assertStartable(appName);
         await this.dbProvisioner.provisionAppDatabase(appName);
         const pgSocketDir =
           this.config.isolation === 'docker'
@@ -8331,7 +10484,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const envVars =
           this.dbProvisioner.getEnvVars(appName, pgSocketDir ? { pgSocketDir } : undefined) || {};
         envVarNames = Object.keys(envVars);
-      } else {
+      } else if (serviceId === 'redis') {
         if (!this.redisProvisioner) {
           // See the Postgres branch above — a refusal, not a throw. This is
           // the ordinary state of any box with managed Redis disabled or
@@ -8344,10 +10497,58 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
               'platform configuration, or it may have failed to start.',
           });
         }
+        this.assertStartable(appName);
         await this.redisProvisioner.provisionAppRedis(appName);
         const redisHost = this.config.isolation === 'docker' ? HOST_ALIAS : '127.0.0.1';
         const envVars = this.redisProvisioner.getEnvVars(appName, { host: redisHost }) || {};
         envVarNames = Object.keys(envVars);
+      } else if (serviceId === 'object-storage') {
+        // Unavailable here is the ORDINARY state of a box whose operator has
+        // not set object storage up — a refusal naming what is missing, never
+        // a throw that would read as a crash.
+        const availability = this.objectStorage ? await this.objectStorage.availability() : null;
+        if (!this.objectStorage || !availability?.available) {
+          return this.refuse('attach', appName, serviceId, {
+            attached: false,
+            reason: 'service-unavailable',
+            detail:
+              availability && !availability.available
+                ? availability.detail
+                : 'Object storage is not available on this instance.',
+          });
+        }
+        try {
+          // Idempotent: a retried attach gets the same bucket back — but only
+          // the same APP gets it (owner + creation stamp), never a later
+          // registrant of the name.
+          createdStorage = !(await this.objectStorage.getAllocation(appName));
+          this.assertStartable(appName);
+          await this.objectStorage.provisionAppStorage(appName, {
+            ownerUserId,
+            appCreatedAt: state?.createdAt,
+          });
+        } catch (err) {
+          if (err instanceof ObjectStorageIncarnationError || err instanceof ObjectStorageDetachIncompleteError) {
+            return this.refuse('attach', appName, serviceId, {
+              attached: false,
+              reason: 'service-unavailable',
+              detail: err.message,
+            });
+          }
+          // The settings or credential changed between the check above and
+          // here — still the "not configured" refusal, not a failure.
+          if (err instanceof ObjectStorageUnavailableError) {
+            return this.refuse('attach', appName, serviceId, {
+              attached: false,
+              reason: 'service-unavailable',
+              detail: err.message,
+            });
+          }
+          throw err;
+        }
+        envVarNames = Object.keys((await this.objectStorage.getEnvVars(appName)) ?? {});
+      } else {
+        return assertNever(serviceId, 'attachable service');
       }
 
       // setServiceIntent, not upsertSystemConfig's snapshot-spread — it
@@ -8363,11 +10564,29 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // recorded.
       const persisted = await this.appConfigService.setServiceIntent(appName, serviceId, 'attached');
       if (!persisted) {
+        // A bucket this attach just created, with no intent to ever use it,
+        // would bill the operator forever: take it back (a failed undo is
+        // logged and retired for the sweep inside undoProvision).
+        if (createdStorage) await this.objectStorage?.undoProvision(appName);
         return this.refuse('attach', appName, serviceId, {
           attached: false,
           reason: 'no-app-config',
           detail: noAppConfigDetail,
         });
+      }
+
+      // A brand-new IAM key is eventually consistent: restarting the app the
+      // instant it exists can boot it into InvalidAccessKeyId. Wait (bounded)
+      // until the app's own key reaches its bucket. Not a refusal on timeout —
+      // the key normally lands while the app boots.
+      if (serviceId === 'object-storage' && createdStorage && this.objectStorage) {
+        const ready = await this.objectStorage.awaitKeyPropagation(appName).catch(() => false);
+        if (!ready) {
+          this.logger.warn(
+            `The new object-storage key for '${appName}' was not yet honoured after the wait - restarting the app anyway`,
+            'STORAGE'
+          );
+        }
       }
 
       // Only report success once the restart (and its env re-injection)
@@ -8515,7 +10734,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     appName: string,
     serviceId: AttachableServiceId
   ): Promise<DetachServiceResult> {
-    if (this.appsInProgress.has(appName)) {
+    if (this.isBusy(appName)) {
       throw new AppInProgressError(appName);
     }
     this.appsInProgress.add(appName);
@@ -8550,6 +10769,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           reason: 'group-app',
           detail: `'${appName}' is part of a monorepo group. Group children never consult the container's own config, so a group-level detach could report a service removed that was never actually attached to this app — detach the individual app's own database/Redis outside the group tooling, or contact an operator.`,
         });
+      }
+
+      // Object storage has no manifest key, no dump and no in-memory
+      // registry — its own method, same guard order from here on.
+      if (serviceId === 'object-storage') {
+        return await this.detachObjectStorage(appName, config, noAppConfigDetail);
       }
 
       // 4. service-unavailable — per-service, never a generic null check.
@@ -8715,7 +10940,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       let deprovisionStarted = false;
       try {
         const runtimeStatus = await this.runtime.getStatus(appName);
-        wasLive = runtimeStatus?.status === 'running';
+        wasLive = isLiveRuntimeState(runtimeStatus);
         if (wasLive) {
           this.stopHealthProber(appName);
           this.stopCrashLoopWatch(appName);
@@ -8824,6 +11049,119 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
+   * detachService for object storage (#301), steps 4-11 — same ordering and
+   * the same persist-first invariant, minus what does not apply: there is no
+   * manifest key (so no manifest conflict), no orphan probe, and NO BACKUP.
+   * Detaching destroys every object in the bucket; the dashboard's confirm
+   * dialog says so, and this is the only place that does it.
+   *
+   * Runs inside detachService's busy guard; refusals go through `refuse`.
+   */
+  private async detachObjectStorage(
+    appName: string,
+    config: ReturnType<AppConfigService['getConfig']>,
+    noAppConfigDetail: string
+  ): Promise<DetachServiceResult> {
+    const serviceId = 'object-storage' as const;
+    const storage = this.objectStorage;
+
+    // 4. Teardown needs only the admin credential — an operator who has
+    // since DISABLED object storage can still have DROP remove a bucket.
+    if (!storage || !(await storage.canDeprovision())) {
+      return this.refuse('detach', appName, serviceId, {
+        detached: false,
+        reason: 'service-unavailable',
+        detail: 'Object storage has no AWS credential configured on this instance, so nothing can be removed.',
+      });
+    }
+
+    // 5. Not provisioned: record the intent, nothing to stop or destroy.
+    if (!(await storage.getAllocation(appName))) {
+      const persisted = await this.appConfigService!.setServiceIntent(appName, serviceId, 'detached');
+      if (!persisted) {
+        return this.refuse('detach', appName, serviceId, {
+          detached: false,
+          reason: 'no-app-config',
+          detail: noAppConfigDetail,
+        });
+      }
+      return { detached: true, deprovisioned: false, restart: 'not-needed' };
+    }
+
+    // 6. Cooldown, skipped for a retry of a detach that did not finish.
+    if (this.appServiceIntent(appName, serviceId) !== 'detached') {
+      const cooldown = checkDetachCooldown({ lastDetachAt: config?.lastDetachAt?.[serviceId] });
+      if (!cooldown.allowed) {
+        return this.refuse(
+          'detach',
+          appName,
+          serviceId,
+          {
+            detached: false,
+            reason: 'detach-limit',
+            limit: 'cooldown',
+            retryAfterSeconds: cooldown.retryAfterSeconds,
+            detail: `'${appName}' had its ${serviceId} service detached too recently — retry in ${cooldown.retryAfterSeconds}s.`,
+          },
+          'detach-limit (cooldown)'
+        );
+      }
+    }
+
+    // 8. Persist BEFORE destroying anything. From here on the app no longer
+    // gets the variables on any start (objectStorageEnvVars reads intent).
+    const persisted = await this.appConfigService!.setServiceIntent(appName, serviceId, 'detached', {
+      lastDetachAt: Date.now(),
+    });
+    if (!persisted) {
+      return this.refuse('detach', appName, serviceId, {
+        detached: false,
+        reason: 'no-app-config',
+        detail: noAppConfigDetail,
+      });
+    }
+
+    // 9. Revoke the app's key and delete its IAM user — the half of the
+    // teardown that is fast, and the half that matters: from here the app
+    // cannot touch the bucket whatever it still holds in memory. Progress is
+    // RECORDED on the allocation (accessRevoked), so a retry resumes and an
+    // attach in between is refused rather than handed a bucket the sweep is
+    // about to empty. The bucket itself is NOT drained here: a large one would
+    // hold this request open for minutes, and the app should restart without
+    // waiting for it.
+    const wasRunning = this.stateManager!.getApp(appName)?.status === 'running';
+    let wasLive = false;
+    let outcome: DetachServiceOutcome;
+    try {
+      wasLive = isLiveRuntimeState(await this.runtime!.getStatus(appName));
+      const revoked = await storage.revokeAppAccess(appName, this.incarnationOf(appName));
+      outcome = revoked
+        ? { detached: true, deprovisioned: true, drainPending: true }
+        : // The allocation vanished since step 5 — nothing left to remove.
+          { detached: true, deprovisioned: false };
+    } catch (err) {
+      this.logger.error(`detach: revoking the object storage key threw for '${appName}'`, 'SERVICES', err);
+      outcome = {
+        detached: false,
+        reason: 'deprovision-failed',
+        detail:
+          'The bucket key could not be revoked. The detach intent has been recorded and the app no longer receives its credentials — retry once AWS is reachable.',
+      };
+    }
+
+    // 10. Restart, so the app comes back without the variables.
+    const restartOutcome = await this.restartAfterDetach(appName, wasLive || wasRunning);
+
+    // 11. Drain through the sweep, after the app is off the bucket. Not
+    // awaited, and not started inline: this detach still holds the app until
+    // detachService's finally releases it a few microtasks from now, and the
+    // sweep deliberately keeps its hands off a held app. A revoke that failed
+    // above is finished by that same sweep, not left for a manual retry.
+    if (outcome.detached) setImmediate(() => void this.sweepRetiredObjectStorage());
+    return { ...outcome, ...restartOutcome };
+  }
+
+  /**
    * True when drop.yaml still declares this service (`database:` for
    * postgres, `redis:` for redis) — informational only (guard 7): owner
    * intent always wins, this just lets the UI say so without a second round
@@ -8910,6 +11248,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     } catch {
       // Process might not exist in the runtime
     }
+
+    // Object storage is retired off the name before the state and config that
+    // describe the app are removed, and before anything else can fail.
+    await this.retireObjectStorageOfDeletedApp(name, opts.keepData);
 
     // Explicit + deterministic: `stateManager.removeApp` below also triggers
     // this via `app:deleted` -> `handleAppDeleted`, but that's fire-and-forget
@@ -9081,6 +11423,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.logger.warn(`Failed to revoke guest grants for ${name}`, 'CLEANUP', error);
     }
 
+    // Object storage (#301): normally already retired by the delete path
+    // before anything else ran (see retireObjectStorageOfDeletedApp), so this
+    // is the safety net for a path that reaches here without having done so.
+    // A no-op when the name holds no allocation.
+    await this.retireObjectStorageOfDeletedApp(name, opts.keepData);
+
     const targets = [
       path.join(this.config.dropRoot, 'data', 'logs', 'webapps', name),
       path.join(this.config.dropRoot, 'data', 'logs', 'builds', name),
@@ -9091,6 +11439,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       path.join(this.config.dropRoot, 'data', 'rollback', name),
       // Release directories (#298) are code too, and keyed on the freed name.
       path.join(this.config.dropRoot, 'data', 'releases', name),
+      // The saved list of files a git redeploy last landed: platform state
+      // keyed on the freed name, and it decides what the next one deletes.
+      gitManifestPath(gitManifestDir(path.join(this.config.dropRoot, 'data')), name),
     ];
     for (const dir of targets) {
       try {
@@ -9314,7 +11665,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           if (failures >= 3 && this.runtime) {
             failures = 0;
             this.logger.appEvent('error', appName, 'health check failed — restarting');
-            this.runtime.restart(appName).catch(() => undefined);
+            // A suspended app is left down quietly (restartInstance would throw).
+            if (getSuspensionStore().isSuspended(appName)) {
+              this.stopHealthProber(appName);
+              return;
+            }
+            this.restartInstance(appName).catch(() => undefined);
           }
         }
       } catch {
@@ -9685,6 +12041,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * something nobody approved.
    */
   async promoteApp(appName: string): Promise<void> {
+    // First: a refusal here keeps the held build held (nothing is cleared yet).
+    this.assertStartable(appName);
     const config = this.appConfigService?.getConfig(appName);
     const pending = config?.pendingPromotion;
     if (!pending) {
@@ -9697,22 +12055,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       : this.servingPathOf(appName, config, this.stateManager?.getApp(appName));
     await this.assertDependenciesCurrent(appName, heldPath);
 
-    await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
-    await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
+    // Claimed BEFORE the held state is cleared, so a refusal keeps the build
+    // held and nothing else can be writing this app while it swaps.
+    if (this.isBusy(appName)) {
+      throw new AppInProgressError(appName);
+    }
+    this.appsInProgress.add(appName);
+    // Set once a suspension refused the swap: the held build is then given back.
+    let refused = false;
+    // What the app was before this attempt wrote its transient 'starting'.
+    const entrySnapshot = this.stateManager?.snapshotTransientStatus(appName);
+    try {
+      await this.appConfigService?.updateConfig(appName, { pendingPromotion: undefined });
+      await this.stateManager?.updateApp(appName, { awaitingPromotion: false });
 
-    const app = this.stateManager?.getApp(appName);
-    await tryLogActivity({
-      action: 'promote',
-      appName,
-      userId: app?.userId,
-      detail: `Promoted build from ${pending.builtAt}`,
-    });
+      const app = this.stateManager?.getApp(appName);
+      await tryLogActivity({
+        action: 'promote',
+        appName,
+        userId: app?.userId,
+        detail: `Promoted build from ${pending.builtAt}`,
+      });
+    } catch (err) {
+      this.appsInProgress.delete(appName);
+      throw err;
+    }
 
     // The swap itself is an ordinary start path, so promotion has no second
     // implementation of starting an app to drift from the first: a held
     // release of a running app is cut over to (#298 step 6), anything else
     // goes through the deploy path's start.
-    this.appsInProgress.add(appName);
     try {
       // Re-validated: pendingPromotion is not a system-tier field.
       if (this.releaseStore?.isReleasePathOf(appName, pending.releasePath)) {
@@ -9720,13 +12092,28 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         const oldPort = await this.cutoverEligibility(appName, pending.releasePath);
         if (oldPort !== null && this.detector) {
           const detection = await this.detector.detect(pending.releasePath, { silent: true });
-          const result = await this.cutoverTo(
-            appName,
-            pending.releasePath,
-            detection,
-            pending.outputDirectory,
-            oldPort
-          );
+          let result;
+          try {
+            result = await this.cutoverTo(
+              appName,
+              pending.releasePath,
+              detection,
+              pending.outputDirectory,
+              oldPort
+            );
+          } catch (error) {
+            // Not settled by handleStartApp on this branch: revoke the key and
+            // leave the status true, but keep the held release (see the finally below).
+            if (error instanceof AppSuspendedError) {
+              refused = true;
+              await this.settleRefusedStart(
+                appName,
+                { kind: 'suspended', reason: error.reason },
+                { closeEpisode: false }
+              );
+            }
+            throw error;
+          }
           if (result.ok) return;
           await this.discardDeployTarget(appName);
           const reason = result.error instanceof Error ? result.error.message : String(result.error);
@@ -9735,9 +12122,36 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           );
         }
       }
-      await this.handleStartApp(appName, pending.outputDirectory);
+      await this.handleStartApp(appName, pending.outputDirectory, { closeEpisode: false, callerOwnsTarget: true });
+    } catch (err) {
+      if (err instanceof AppSuspendedError) refused = true;
+      throw err;
     } finally {
-      this.appsInProgress.delete(appName);
+      try {
+        // A refused promotion gives the held build back exactly as it was: forget
+        // (never discard) the target, restore the hold, and leave the held episode
+        // open. Keyed on the refusal, not on how the closer fared.
+        if (refused) {
+          this.deployTargets.delete(appName);
+          // Each write is log-and-continue: none may replace the AppSuspendedError.
+          const restore = async (what: string, step: () => unknown): Promise<void> => {
+            try {
+              await step();
+            } catch (restoreError) {
+              this.logger.error(`Could not restore ${what} of ${appName} after a refused promotion`, 'PROMOTE', restoreError);
+            }
+          };
+          await restore('the held build', () => this.appConfigService?.updateConfig(appName, { pendingPromotion: pending }));
+          await restore('the held flag', () => this.stateManager?.updateApp(appName, { awaitingPromotion: true }));
+          // Only the transient 'starting' is undone (compare-and-set, and silent: announcing
+          // 'running' would close the held build's episode).
+          if (entrySnapshot) {
+            await restore('the status', () => this.stateManager?.revertTransientStarting(appName, entrySnapshot));
+          }
+        }
+      } finally {
+        this.appsInProgress.delete(appName);
+      }
     }
   }
 
@@ -9762,6 +12176,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // false of one that does not — and the long-lived box is the one
       // accumulating the data.
       void this.sweepGuestRetention();
+      void this.sweepRetiredObjectStorage();
     }, 15 * 60 * 1000);
     this.idleSweepTimer.unref?.();
   }
@@ -9785,7 +12200,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         candidates.push({
           name: app.name,
           agentCreated: config?.agentCreated,
-          noReap: config?.noReap,
+          // An app with object storage attached is never reaped (#301): the
+          // teardown deletes the bucket, and unlike a database there is no
+          // dump to fall back on — an idle app is not an app whose files
+          // nobody wants.
+          noReap: config?.noReap || config?.services?.['object-storage'] === 'attached',
           createdAt: app.createdAt,
           cpuTotalNs: info?.cpuTotalNs,
           status: app.status,
@@ -10263,19 +12682,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // branch at all, so the previous key stayed valid indefinitely — and the
     // app is skip-eligible on top of that (grantedApiScopesCount is now 0).
     try {
-      await deleteApiKeysByName(`app:${appName}:provision`);
+      await deleteApiKeysByName(appProvisionKeyName(appName));
     } catch (err) {
       this.logger.warn(`Could not delete previous provisioning key for ${appName}`, 'SECURITY', err);
     }
     let dropApiKey: string | undefined;
     if (grantedScopes.length > 0) {
       try {
-        const { key } = await createApiKey(`app:${appName}:provision`, 'none', undefined, grantedScopes);
+        const { key } = await createApiKey(appProvisionKeyName(appName), 'none', undefined, grantedScopes);
         dropApiKey = key;
       } catch (err) {
         this.logger.warn(`Could not mint provisioning key for ${appName}`, 'SECURITY', err);
       }
     }
+
+    // Object storage (#301): attach-only, so this is read back here rather
+    // than threaded through both start paths like the database/Redis vars.
+    const storageEnvVars = await this.objectStorageEnvVars(appName);
 
     // Everything that is NOT tenant-authored free text: the app's own secrets
     // plus every value DROP derives for it. Assembled as one object so the
@@ -10289,6 +12712,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ...(dropApiKey ? { DROP_API_KEY: dropApiKey } : {}),
       ...dbEnvVars,
       ...redisEnvVars,
+      ...storageEnvVars,
     };
 
     // DROP-150 / B1: resolved `depends_on` URLs used to be spread LAST, so

@@ -50,8 +50,8 @@ describe('POST /apps is admin-only', () => {
     await server.initialize();
     app = server.getApp();
 
-    await createUser('alice', 'password123', 'user');
-    await createUser('root', 'password123', 'admin');
+    await createUser({ username: 'alice', role: 'user', credential: { password: 'password123' } });
+    await createUser({ username: 'root', role: 'admin', credential: { password: 'password123' } });
     userToken = await getTestToken('alice', 'password123');
     adminToken = await getTestToken('root', 'password123');
   });
