@@ -51,6 +51,17 @@ export interface SuspensionRecord {
  */
 export type SuspensionRefusal = 'record' | 'store-unreadable' | 'not-loaded';
 
+/**
+ * The answer to "is this app refused, and why?" (see `refusalForApp` in
+ * core/suspension-policy). `via` names the OTHER app whose record is the
+ * cause (its monorepo container, or a member of its group); absent when the
+ * app's own record, or the store's own state, is.
+ */
+export interface SuspensionVerdict {
+  reason: SuspensionRefusal;
+  via?: string;
+}
+
 /** Refused because the suspension store cannot be trusted; see the module doc. */
 export class SuspensionStoreCorruptError extends Error {
   constructor() {
@@ -145,10 +156,11 @@ export class SuspensionStore {
   }
 
   /**
-   * THE refusal predicate: why a start of this app must be refused, or null.
+   * Why a start of THIS NAME must be refused by its own record, or null.
    * `not-loaded` and `store-unreadable` refuse EVERY app (the store cannot say
-   * either way); `record` is one app's own suspension. Everything that decides
-   * "refuse?" reads this, so no caller can disagree about what the cases are.
+   * either way); `record` is one name's own suspension. It knows nothing about
+   * an app's monorepo group, so it is not the answer to "is this app refused?":
+   * that is `refusalForApp` (core/suspension-policy), which every reader uses.
    */
   refusalFor(appName: string): SuspensionRefusal | null {
     if (!this.loaded) return 'not-loaded';

@@ -34,6 +34,7 @@ import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService } from '../../managers/app/app-config';
 import { getAppRuntime } from '../../managers/runtime';
 import { getPlatformOps, AppInProgressError, AppSuspendedError, StaleDependenciesError } from '../platform-ops';
+import { refusalForApp } from '../../core/suspension-policy';
 import {
   getUploadDeployService,
   ArchiveRejectedError,
@@ -318,7 +319,9 @@ const STALE_FOR_AGENTS =
 /** A suspension is an administrator's act: no agent action lifts it, and retrying cannot help. */
 const SUSPENDED_FOR_AGENTS = (err: AppSuspendedError): string =>
   err.reason === 'record'
-    ? `Application '${err.appName}' is suspended by an administrator and cannot be started. ` +
+    ? (err.via !== undefined && err.via !== err.appName
+        ? `Application '${err.appName}' is suspended because '${err.via}' is suspended by an administrator, and cannot be started. `
+        : `Application '${err.appName}' is suspended by an administrator and cannot be started. `) +
       'Only an administrator can lift the suspension; do not retry.'
     : err.reason === 'not-loaded'
       ? `The suspension store is not loaded yet, so '${err.appName}' cannot be started; retry shortly.`
@@ -793,6 +796,19 @@ function mcpEndpointFor(appName: string): { path: string; auth: 'none' | 'drop' 
   }
 }
 
+/**
+ * How an app's suspension reads in a status tool, or undefined when it has none:
+ * `record` (or `record (via <app>)` for one suspended through its monorepo
+ * group), from the same resolver every other surface asks. The store's own
+ * state (unreadable, not loaded) is for admins; anyone else sees a plain record.
+ */
+function suspensionLabel(appName: string, auth: AuthContext | undefined): string | undefined {
+  const verdict = refusalForApp(appName);
+  if (!verdict) return undefined;
+  const kind = verdict.reason === 'record' || auth?.role !== 'admin' ? 'record' : verdict.reason;
+  return verdict.via !== undefined ? `${kind} (via ${verdict.via})` : kind;
+}
+
 export function handleListApps(auth: AuthContext | undefined): CallToolResult {
   // Monorepo container entries are internal bookkeeping (webhook matching),
   // never runnable apps — hidden here like in GET /apps.
@@ -809,7 +825,8 @@ export function handleListApps(auth: AuthContext | undefined): CallToolResult {
     // Marked, not expanded: the full endpoint and its public-by-default warning
     // belong in app_status, where there is room to say it properly.
     const mcp = mcpEndpointFor(a.name) ? '  mcp=yes' : '';
-    return `${a.name}  status=${a.status}  type=${a.type}${url ? `  url=${url}` : ''}${mcp}`;
+    const suspended = suspensionLabel(a.name, auth);
+    return `${a.name}  status=${a.status}  type=${a.type}${url ? `  url=${url}` : ''}${mcp}${suspended ? `  suspended=${suspended}` : ''}`;
   });
   return toolText(lines.join('\n'));
 }
@@ -865,6 +882,8 @@ export async function handleAppStatus(
     url ? `url: ${url}` : 'url: (no externally-reachable domain configured)',
   ];
   if (app.lastDeployedAt) lines.push(`lastDeployedAt: ${app.lastDeployedAt}`);
+  const suspended = suspensionLabel(app.name, auth);
+  if (suspended) lines.push(`suspended: ${suspended}`);
 
   // Resource figures are the OWNER's, mirroring GET /apps/:name's isOwner
   // gate: a read grant on someone else's app shows its status, not its load.
@@ -933,13 +952,16 @@ export async function handleVerifyDeployment(
     );
   }
 
+  const suspended = suspensionLabel(app.name, auth);
   if (app.status !== 'running' || !app.port) {
-    const structured = { ok: false, app: app.name, app_status: app.status };
+    const structured = { ok: false, app: app.name, app_status: app.status, ...(suspended ? { suspended } : {}) };
     return {
       content: [
         {
           type: 'text',
-          text: `'${app.name}' is not running (status: ${app.status}), so there is nothing to probe. Use app_status or restart_app.`,
+          text:
+            `'${app.name}' is not running (status: ${app.status}), so there is nothing to probe. Use app_status or restart_app.` +
+            (suspended ? ` It is suspended: ${suspended}.` : ''),
         },
       ],
       structuredContent: structured,
@@ -974,6 +996,7 @@ export async function handleVerifyDeployment(
     ok,
     app: app.name,
     probed_url: probedUrl,
+    ...(suspended ? { suspended } : {}),
     ...(r.responded ? { status_code: r.statusCode, latency_ms: latencyMs } : {}),
   };
   const text = r.responded
@@ -1216,7 +1239,10 @@ export async function handleRedeployApp(
       if (result.refused.code === 'APP_SUSPENDED') {
         // Not the APP_STOPPED hint below: restart_app is refused too, and only an administrator lifts it.
         // Rendered as every other suspended refusal is, by reason and by role.
-        text = suspendedFor(new AppSuspendedError(target, result.refused.suspension), auth?.role === 'admin');
+        text = suspendedFor(
+          new AppSuspendedError(target, result.refused.suspension, result.refused.via),
+          auth?.role === 'admin'
+        );
       }
       if (code === 'APP_STOPPED') {
         // An agent never rebuilds a stopped app, so do not send it round restart_app and back:

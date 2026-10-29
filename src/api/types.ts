@@ -36,12 +36,14 @@ export interface ApiMeta {
 
 /**
  * Why an app cannot be started. `record` is a suspension (`at` for everyone,
- * `by` and `reason` for admins only). `store-unreadable` and `not-loaded` mean
+ * `by` and `reason` for admins only; `via` names the other app whose
+ * record this is, for an app suspended through its monorepo group).
+ * `store-unreadable` and `not-loaded` mean
  * the suspension store itself cannot answer, so every app is refused; only an
  * admin is told that, anyone else gets a bare `{ kind: 'record' }`.
  */
 export type AppSuspensionDto =
-  | { kind: 'record'; at?: string; by?: string; reason?: string }
+  | { kind: 'record'; at?: string; by?: string; reason?: string; via?: string }
   | { kind: Exclude<SuspensionRefusal, 'record'> };
 
 export interface AppDto {

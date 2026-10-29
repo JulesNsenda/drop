@@ -30,8 +30,8 @@ import { landTracked, readManifest, writeManifest, gitManifestDir } from './land
 import { writeJsonAtomic } from '../../utils/atomic-write';
 import { logActivityFor } from '../../managers/activity';
 import { getDeployTracker } from '../../managers/deploy-tracker';
-import { getPlatformOps, AppInProgressError, AppSuspendedError } from '../../api/platform-ops';
-import { getSuspensionStore } from '../../managers/suspension';
+import { getPlatformOps, AppInProgressError, AppSuspendedError, suspensionEpisodeCode } from '../../api/platform-ops';
+import { refusalForApp } from '../suspension-policy';
 import { getStateManager } from '../../managers/app/state-manager';
 import type { AppState } from '../../managers/app/state-manager';
 import { isAdminPrincipalId, getUserById } from '../../api/middleware/auth';
@@ -320,8 +320,8 @@ export class GitDeployService {
         buildId,
         error: suspended || !(err instanceof Error) ? new Error(message) : err,
         stage: 'pre-build',
-        // STOPPED only for an administrator's record; a store that cannot answer stopped nothing.
-        ...(suspended ? { code: err.reason === 'record' ? ('DEPLOY_STOPPED' as const) : ('DEPLOY_REFUSED' as const) } : {}),
+        // The one rule for the code (nothing was looked at here, so a store that cannot answer stopped nothing).
+        ...(suspended ? { code: suspensionEpisodeCode({ kind: 'suspended', reason: err.reason, via: err.via }) } : {}),
       });
     } catch {
       // Tracker not initialised (isolated tests): observability only.
@@ -351,7 +351,7 @@ export class GitDeployService {
    */
   queueRedeploy(appName: string, actor: DeployActor = {}): void {
     // A suspended app's push is not remembered: it would only replay into a refusal.
-    if (getSuspensionStore().isSuspended(appName)) {
+    if (refusalForApp(appName)) {
       logger.info(`Not queueing a redeploy of ${appName}: app is suspended`, 'GIT-DEPLOY');
       return;
     }
@@ -384,8 +384,8 @@ export class GitDeployService {
       // deploy (no episode, no breaker): the refusal is the administrator's.
       // Only a real record drops it; a store that cannot answer keeps it queued,
       // because the push was never refused by anyone.
-      const refusal = getSuspensionStore().refusalFor(appName);
-      if (refusal === 'record') {
+      const refusal = refusalForApp(appName);
+      if (refusal?.reason === 'record') {
         logger.info(`Dropped the queued redeploy of ${appName}: app is suspended`, 'GIT-DEPLOY');
         continue;
       }
@@ -930,8 +930,8 @@ export class GitDeployService {
 
   /** Throws AppSuspendedError when the app is suspended (or the store cannot say), synchronously. */
   private assertNotSuspended(appName: string): void {
-    const suspension = getSuspensionStore().refusalFor(appName);
-    if (suspension) throw new AppSuspendedError(appName, suspension);
+    const suspension = refusalForApp(appName);
+    if (suspension) throw new AppSuspendedError(appName, suspension.reason, suspension.via);
   }
 
   /** The recorded clone URL of a git-deployed app: credential-stripped and re-validated (an older install may have stored one with userinfo). It is what is logged, cloned, persisted and returned. Throws on an invalid one. */
@@ -1418,7 +1418,7 @@ export class GitDeployService {
         if (!app.gitSource?.autoRedeploy) return false;
         // A suspended app is not matched: the push neither pulls nor queues,
         // and the (HMAC-only) response does not say the app is suspended.
-        if (getSuspensionStore().isSuspended(app.name)) return false;
+        if (refusalForApp(app.name)) return false;
         return (
           normalizeRepoUrl(app.gitSource.repoUrl) === normalizedUrl &&
           app.gitSource.branch === branch
