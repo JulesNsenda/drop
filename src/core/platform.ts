@@ -9859,7 +9859,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // leave the status true. The release is the previous one, not a deploy target.
         const settled = await this.settleSwapRefusal(appName, error, {
           closeEpisode: false,
-          label: { what: 'Rollback', tag: 'ROLLBACK' },
+          label: { what: 'Rollback', serving: 'the previous release', tag: 'ROLLBACK' },
         });
         if (settled) {
           // Refused AFTER traffic moved: the rollback is applied (the releases are
@@ -9948,7 +9948,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     opts: {
       closeEpisode: boolean | 'if-replaced';
       progress?: UpdateProgress;
-      label?: { what: string; tag: string };
+      label?: { what: string; serving: string; tag: string };
     }
   ): Promise<{ replaced: boolean; toThrow: unknown } | null> {
     const refusal = refusalCauseOf(error);
@@ -9961,7 +9961,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     });
     if (replaced && opts.label) {
       this.logger.warn(
-        `${opts.label.what} of ${appName} completed before the suspension landed; the new release is serving`,
+        `${opts.label.what} of ${appName} completed before the suspension landed; ${opts.label.serving} is serving`,
         opts.label.tag
       );
     }
@@ -12265,7 +12265,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             // leave the status true, but keep the held release (see the finally below).
             const settled = await this.settleSwapRefusal(appName, error, {
               closeEpisode: 'if-replaced',
-              label: { what: 'Promotion', tag: 'PROMOTE' },
+              label: { what: 'Promotion', serving: 'the promoted release', tag: 'PROMOTE' },
             });
             if (settled) {
               promotion.outcome = settled.replaced ? 'swapped' : 'refused';
