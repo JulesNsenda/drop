@@ -6615,13 +6615,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * @param opts.skipCaddyReload Defer the actual `caddy reload` to the
-   * caller — router.addRoute below still writes/regenerates the Caddyfile
-   * itself. Used by reconcileAppsOnBoot (M1 review item G) to batch N
-   * skipped apps' routes into ONE reload instead of N serialized ones on
-   * the boot path; every other caller reloads immediately as before.
-   */
-  /**
    * The add gate: whether a RECORD holds the app, read as the start gate reads it
    * (a case variant counts; an unreadable store does not, so it keeps adding).
    * Synchronous, so it can sit directly in front of the write.
@@ -6632,6 +6625,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     return true;
   }
 
+  /**
+   * @param opts.skipCaddyReload Defer the actual `caddy reload` to the
+   * caller — router.addRoute below still writes/regenerates the Caddyfile
+   * itself. Used by reconcileAppsOnBoot (M1 review item G) to batch N
+   * skipped apps' routes into ONE reload instead of N serialized ones on
+   * the boot path; every other caller reloads immediately as before.
+   */
   private async handleConfigureRoute(
     appName: string,
     port: number,
