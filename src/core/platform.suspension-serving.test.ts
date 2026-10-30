@@ -488,7 +488,9 @@ describe('app suspension (platform, Item 3: serving)', () => {
 
       await platform.start();
 
-      expect(warn.mock.calls.some((c) => String(c[0]).includes("'ghost' is still present"))).toBe(true);
+      expect(
+        warn.mock.calls.some((c) => String(c[0]).includes("'ghost'") && String(c[0]).includes('still present after delete'))
+      ).toBe(true);
     }, 40000);
 
     it('are also removed by the periodic pass', async () => {

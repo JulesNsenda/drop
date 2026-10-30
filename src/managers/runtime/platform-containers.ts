@@ -41,12 +41,6 @@ export function collidesWithPlatformContainer(name: string): boolean {
 }
 
 /**
- * THE reserved-name rule: a name no app may have, for any caller. DROP's own
- * service name (an app by it would be taken for the platform by everything that
- * matches runtime processes by name) or one that maps onto a platform container.
- * Every create path, the folder drop and the suspension policy ask this one.
- */
-/**
  * DROP's own runtime process name (PM2 daemon mode). Suspension enforcement
  * skips only this: `redis` and `build-*` apps from before the reservation
  * are still enforced, and the container allowlist already keeps the platform's
@@ -56,8 +50,14 @@ export function isPlatformServiceName(name: string): boolean {
   return name.toLowerCase() === DROP_SERVICE_NAME;
 }
 
+/**
+ * THE reserved-name rule: a name no app may have, for any caller. DROP's own
+ * service name (an app by it would be taken for the platform by everything that
+ * matches runtime processes by name) or one that maps onto a platform container.
+ * Every create path and the folder drop ask this one.
+ */
 export function isReservedName(name: string): boolean {
-  return name.toLowerCase() === DROP_SERVICE_NAME || collidesWithPlatformContainer(name);
+  return isPlatformServiceName(name) || collidesWithPlatformContainer(name);
 }
 
 /** A platform service container: one of our names AND the service label. */

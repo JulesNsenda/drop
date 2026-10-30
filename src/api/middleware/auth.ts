@@ -21,7 +21,6 @@ import { getMcpResourceUrl, canonicalizeUrl } from '../oauth/metadata';
 import { mayUseConnectors } from '../connector-policy';
 import { clearGroupTrustForUser } from '../../managers/app/state-manager';
 
-
 // Auth configuration
 export interface AuthConfig {
   /** JWT secret key (auto-generated if not provided) */

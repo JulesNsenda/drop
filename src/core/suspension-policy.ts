@@ -122,7 +122,7 @@ export function preSwapEpisodeCode(reason: SuspensionRefusal): 'DEPLOY_STOPPED' 
 }
 
 export interface SuspensionPolicyDeps {
-  store: Pick<SuspensionStore, 'refusalFor' | 'list'>;
+  store: Pick<SuspensionStore, 'refusalFor' | 'list' | 'availability'>;
   state: Pick<AppStateManager, 'getApp' | 'getAllApps'> | null;
   configs: Pick<AppConfigService, 'getConfig' | 'getAllConfigs' | 'getDomainOwners'> | null;
 }
@@ -287,6 +287,8 @@ function membersOf(container: string, use: Use, deps: SuspensionPolicyDeps): str
 export function refusalForApp(name: string, deps: SuspensionPolicyDeps = defaultDeps()): SuspensionVerdict | null {
   const own = deps.store.refusalFor(name);
   if (own) return { reason: own };
+  // A loaded, readable store with no records refuses nothing: skip the group scans.
+  if (deps.store.list().length === 0) return null;
   for (const container of containersOf(name, 'gate', deps)) {
     if (deps.store.refusalFor(container) === 'record') return { reason: 'record', via: container };
   }
@@ -311,65 +313,51 @@ function knowsApp(name: string, deps: SuspensionPolicyDeps): boolean {
   return deps.state?.getApp(name) !== undefined || deps.configs?.getConfig(name) !== undefined;
 }
 
-/** Every record's name: the exact name it was given (a legacy record's key is taken as it stands). */
-function recordSubjects(deps: SuspensionPolicyDeps): string[] {
-  return deps.store.list().map((entry) => entry.name);
+/**
+ * Every (name, record) pair a suspension makes true: each record's own name, and
+ * each of its `childrenOf` (the exact attribution), under the record that holds
+ * it. DROP's own service name is filtered here, once. A legacy record's key is
+ * its exact name. Empty while the store is unreadable (its list is).
+ */
+function* recordedPairs(deps: SuspensionPolicyDeps): Generator<[name: string, record: string]> {
+  for (const { name: record } of deps.store.list()) {
+    if (!isPlatformServiceName(record)) yield [record, record];
+    for (const child of childrenOf(record, deps)) if (!isPlatformServiceName(child)) yield [child, record];
+  }
 }
 
-/**
- * Why the store cannot answer for ANY app (`store-unreadable` or `not-loaded`),
- * or null when it can. While it cannot, `list()` is empty: nothing is enforced
- * for serving, and the caller should say so loudly.
- */
+/** Whether the store can answer for ANY app. While it cannot, `list()` is empty: nothing is enforced for serving. */
 export function suspensionStoreUnavailable(
   deps: SuspensionPolicyDeps = defaultDeps()
 ): Exclude<SuspensionRefusal, 'record'> | null {
-  const answer = deps.store.refusalFor('');
-  return answer === 'record' ? null : answer;
+  return deps.store.availability();
 }
 
 /**
  * What a record makes true, for the enforcement pass: target app to the record
- * that holds it. A record's own name is a target only when an app of EXACTLY
- * that name is known (a record can name something that is not an app, and the
- * runtime holds processes that are not DROP's); plus each of its `childrenOf`
- * (the exact attribution). Never DROP's own service name. Empty while the store
- * is unreadable (its list is).
+ * that holds it (the first). A record's own name is a target only when an app of
+ * EXACTLY that name is known (a record can name something that is not an app, and
+ * the runtime holds processes that are not DROP's); its `childrenOf` always are.
  */
 export function enforcementTargets(deps: SuspensionPolicyDeps = defaultDeps()): Map<string, string> {
   const targets = new Map<string, string>();
-  for (const record of recordSubjects(deps)) {
-    if (knowsApp(record, deps) && !isPlatformServiceName(record) && !targets.has(record)) targets.set(record, record);
-    for (const child of childrenOf(record, deps)) {
-      if (!isPlatformServiceName(child) && !targets.has(child)) targets.set(child, record);
-    }
+  for (const [name, record] of recordedPairs(deps)) {
+    if (name === record && !knowsApp(name, deps)) continue;
+    if (!targets.has(name)) targets.set(name, record);
   }
   return targets;
 }
 
 /**
- * Whether ANY record still holds `target` (the pass re-asks on the line before it
- * acts): its own record, if an app by that name is known, or a container's record.
+ * Whether ANY record holds `target` by the exact attribution (the pass re-asks on
+ * the line before it acts; `reconfigureRoute` asks it before withdrawing a route):
+ * its own record, if an app by that name is known, or a container's record. Where
+ * `refusalForApp` answers "refuse a start or an add?", this answers "take
+ * something away?": a corrupt or not-loaded store answers false, because it must
+ * never withdraw or delete.
  */
 export function isStillEnforced(target: string, deps: SuspensionPolicyDeps = defaultDeps()): boolean {
-  if (isPlatformServiceName(target)) return false;
-  return recordSubjects(deps).some((r) =>
-    r === target ? knowsApp(target, deps) : childrenOf(r, deps).includes(target)
-  );
-}
-
-/**
- * Whether this app's routes must be withdrawn: a RECORD holds it by the exact
- * attribution `enforcementTargets` uses (never the gate's case-insensitive
- * reading, which would withdraw another owner's route), or null. Where
- * `refusalForApp` answers "refuse a start or an add?", this answers "take a route
- * away?": a corrupt or not-loaded store answers null, because it must never
- * withdraw one.
- */
-export function routeWithdrawalFor(name: string, deps: SuspensionPolicyDeps = defaultDeps()): SuspensionVerdict | null {
-  const record = enforcementTargets(deps).get(name);
-  if (record === undefined) return null;
-  return record === name ? { reason: 'record' } : { reason: 'record', via: record };
+  return enforcementTargets(deps).has(target);
 }
 
 /**
@@ -378,12 +366,7 @@ export function routeWithdrawalFor(name: string, deps: SuspensionPolicyDeps = de
  * revocation covers, and the superset the orphan step draws from.
  */
 export function recordedNames(deps: SuspensionPolicyDeps = defaultDeps()): Set<string> {
-  const names = new Set<string>();
-  for (const record of recordSubjects(deps)) {
-    if (!isPlatformServiceName(record)) names.add(record);
-    for (const child of childrenOf(record, deps)) if (!isPlatformServiceName(child)) names.add(child);
-  }
-  return names;
+  return new Set([...recordedPairs(deps)].map(([name]) => name));
 }
 
 /**
@@ -397,6 +380,15 @@ export function suspendedOrphans(runtimeNames: Iterable<string>, deps: Suspensio
   const orphans = new Set<string>();
   for (const name of runtimeNames) if (recorded.has(name) && !knowsApp(name, deps)) orphans.add(name);
   return orphans;
+}
+
+/**
+ * Whether `name` is STILL such an orphan (the orphan step asks on the line before
+ * it deletes): its own record exists and nothing of the platform knows it. An
+ * orphan has no state or config, so it can only be held by its own record.
+ */
+export function isSuspendedOrphan(name: string, deps: SuspensionPolicyDeps = defaultDeps()): boolean {
+  return !isPlatformServiceName(name) && !knowsApp(name, deps) && deps.store.list().some((r) => r.name === name);
 }
 
 /**

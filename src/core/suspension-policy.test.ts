@@ -21,7 +21,7 @@ import {
   enforcementTargets,
   isStillEnforced,
   recordedNames,
-  routeWithdrawalFor,
+  isSuspendedOrphan,
   settleSetFor,
   claimedAgainst,
   hostClaims,
@@ -500,15 +500,15 @@ describe('suspension policy: refusalForApp', () => {
     });
   });
 
-  describe('routeWithdrawalFor: the exact attribution, never the gate reading', () => {
+  describe('isStillEnforced as the route-withdrawal question: the exact attribution, never the gate reading', () => {
     it('answers for the app itself and for what runs under a suspended container', async () => {
       const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'other' }];
       await store.suspend('site', 'admin');
       const deps = depsOf(apps);
 
-      expect(routeWithdrawalFor('site', deps)).toEqual({ reason: 'record' });
-      expect(routeWithdrawalFor('site-web', deps)).toEqual({ reason: 'record', via: 'site' });
-      expect(routeWithdrawalFor('other', deps)).toBeNull();
+      expect(isStillEnforced('site', deps)).toBe(true);
+      expect(isStillEnforced('site-web', deps)).toBe(true);
+      expect(isStillEnforced('other', deps)).toBe(false);
     });
 
     it('does not withdraw a route the start gate would still refuse on a case-insensitive match', async () => {
@@ -519,13 +519,13 @@ describe('suspension policy: refusalForApp', () => {
       const deps = depsOf(apps);
 
       expect(refusalForApp('x', deps)).toEqual({ reason: 'record', via: 'site' });
-      expect(routeWithdrawalFor('x', deps)).toBeNull();
+      expect(isStillEnforced('x', deps)).toBe(false);
     });
 
     it('does not withdraw for a record that only matches the name ignoring case', async () => {
       await store.suspend('Site', 'admin');
       expect(refusalForApp('site', depsOf([{ name: 'site' }]))).toEqual({ reason: 'record' });
-      expect(routeWithdrawalFor('site', depsOf([{ name: 'site' }]))).toBeNull();
+      expect(isStillEnforced('site', depsOf([{ name: 'site' }]))).toBe(false);
     });
 
     it('never withdraws while the store is unreadable or not loaded', async () => {
@@ -536,9 +536,9 @@ describe('suspension policy: refusalForApp', () => {
       const deps = depsOf([{ name: 'site' }]);
 
       expect(refusalForApp('site', deps)).toEqual({ reason: 'store-unreadable' });
-      expect(routeWithdrawalFor('site', deps)).toBeNull();
+      expect(isStillEnforced('site', deps)).toBe(false);
       const unloaded = new SuspensionStore(path.join(dir, 'other.json'));
-      expect(routeWithdrawalFor('site', { ...deps, store: unloaded })).toBeNull();
+      expect(isStillEnforced('site', { ...deps, store: unloaded })).toBe(false);
     });
   });
 
@@ -556,7 +556,7 @@ describe('suspension policy: refusalForApp', () => {
 
       expect([...enforcementTargets(depsOf([{ name: 'myapp' }, { name: 'other' }]))]).toEqual([['myapp', 'myapp']]);
       expect(enforcementTargets(depsOf([{ name: 'MyApp' }])).size).toBe(0);
-      expect(routeWithdrawalFor('MyApp', depsOf([{ name: 'MyApp' }]))).toBeNull();
+      expect(isStillEnforced('MyApp', depsOf([{ name: 'MyApp' }]))).toBe(false);
     });
 
     it('with no app, the key stands as a recorded name (a deleted app, its runtime orphan)', async () => {
@@ -577,7 +577,7 @@ describe('suspension policy: refusalForApp', () => {
       expect(enforcementTargets(deps).size).toBe(0);
       expect(recordedNames(deps).size).toBe(0);
       expect(isStillEnforced('drop-platform', deps)).toBe(false);
-      expect(routeWithdrawalFor('drop-platform', deps)).toBeNull();
+      expect(isStillEnforced('drop-platform', deps)).toBe(false);
     });
   });
 
@@ -603,6 +603,37 @@ describe('suspension policy: refusalForApp', () => {
       await store.load();
 
       expect(suspendedOrphans(['ghost'], depsOf([])).size).toBe(0);
+    });
+  });
+
+  describe('isSuspendedOrphan', () => {
+    it('is an own record with nothing of ours behind it, never DROP itself', async () => {
+      await store.suspend('ghost', 'admin');
+      await store.suspend('known', 'admin');
+      await store.suspend('drop-platform', 'admin');
+      const deps = depsOf([{ name: 'known' }]);
+
+      expect(isSuspendedOrphan('ghost', deps)).toBe(true);
+      expect(isSuspendedOrphan('Ghost', deps)).toBe(false);
+      expect(isSuspendedOrphan('known', deps)).toBe(false);
+      expect(isSuspendedOrphan('drop-platform', deps)).toBe(false);
+      expect(isSuspendedOrphan('bystander', deps)).toBe(false);
+    });
+  });
+
+  describe('a store with no records', () => {
+    it('refuses nothing and never scans groups, but a store that cannot answer still refuses first', async () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }];
+      const deps = depsOf(apps);
+      const members = jest.spyOn(deps.state!, 'getAllApps');
+
+      expect(refusalForApp('site-web', deps)).toBeNull();
+      expect(members).not.toHaveBeenCalled();
+
+      fs.writeFileSync(path.join(dir, 'suspensions.json'), '{ broken');
+      jest.spyOn(console, 'error').mockImplementation();
+      await store.load();
+      expect(refusalForApp('site-web', deps)).toEqual({ reason: 'store-unreadable' });
     });
   });
 
@@ -896,11 +927,15 @@ describe('suspension policy: pins', () => {
     expect(routerWriteSites('addRoute')).toEqual(['core/platform.ts#handleConfigureRoute']);
     const text = fs.readFileSync(path.join(srcRoot, 'core/platform.ts'), 'latin1');
     const call = text.indexOf('.addRoute(');
-    const check = text.lastIndexOf("refusalForApp(appName)?.reason === 'record'", call);
+    const check = text.lastIndexOf('this.isRouteWithheld(appName)', call);
     expect(check).toBeGreaterThan(-1);
     // Between the last check and the write: nothing awaited but the write itself.
     const between = text.slice(check, call).replace(/const conflict = await this\.router$/, '');
     expect(between).not.toMatch(/\bawait\b/);
+    // The check is the record gate, read synchronously.
+    const gate = text.slice(text.indexOf('private isRouteWithheld('), text.indexOf('private async handleConfigureRoute('));
+    expect(gate).toContain("refusalForApp(appName)?.reason !== 'record'");
+    expect(gate).not.toMatch(/\bawait\b/);
   });
 
   it('the other route writers have no caller outside the router module', () => {
@@ -925,7 +960,7 @@ describe('suspension policy: pins', () => {
     const from = text.indexOf("subscribe('app:started'");
     const handler = text.slice(from, text.indexOf('this.subscriptions.push(startedSub)', from));
     expect(handler).toContain('handleConfigureRoute');
-    expect(handler).not.toMatch(/refusalForApp|routeWithdrawalFor|Suspen/);
+    expect(handler).not.toMatch(/refusalForApp|Suspen/);
   });
 
   it('the store no longer calls its own name-keyed check THE predicate', () => {
