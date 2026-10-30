@@ -32,6 +32,7 @@ import {
   CONTAINER_CAP_DROP,
   CONTAINER_SECURITY_OPT,
 } from '../runtime/container-config';
+import { REDIS_CONTAINER_NAME } from '../runtime/platform-containers';
 
 export type RedisServerStatus = 'stopped' | 'starting' | 'running' | 'errored';
 
@@ -50,7 +51,7 @@ export interface RedisServerConfig {
   onLog?: (msg: string) => void;
 }
 
-const CONTAINER_NAME = 'drop-redis';
+const CONTAINER_NAME = REDIS_CONTAINER_NAME;
 const DEFAULT_IMAGE = 'redis:7-alpine';
 const DEFAULT_PORT = 6380;
 /** Non-root user shipped by the redis image; avoids the entrypoint's gosu (needs CAP_SETUID, which we drop). */

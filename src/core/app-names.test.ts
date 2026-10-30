@@ -1,7 +1,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import { caseVariantsOf, isNameTaken } from './app-names';
+import { caseVariantsOf, isNameTaken, isNewNameRefused } from './app-names';
 import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
 import { AppConfigService } from '../managers/app/app-config';
 import { getStateManager, resetStateManager } from '../managers/app/state-manager';
@@ -37,6 +37,23 @@ describe('isNameTaken', () => {
     for (const name of ['existing', 'EXISTING', 'stategroup', 'StateGroup', 'confgroup', 'gone-repo', 'GONE-REPO', 'b-web']) {
       expect(check(name)).toBe(true);
     }
+  });
+
+  it('reserves the bundled Redis container name, ignoring case, for a non-admin create', async () => {
+    for (const name of ['redis', 'Redis', 'REDIS']) {
+      expect(check(name)).toBe(true);
+      expect(
+        await isNewNameRefused(name, {
+          callerIsAdmin: false,
+          appsDirectory: path.join(tempDir, 'apps'),
+          stateManager: getStateManager(),
+          appConfigService: acs,
+        })
+      ).toBe(true);
+    }
+    // Only the exact container name: neighbours stay free.
+    expect(check('redis-cache')).toBe(false);
+    expect(check('my-redis')).toBe(false);
   });
 
   it('is true for a name with a suspension record and no app, ignoring case, so a variant cannot strand it', async () => {
