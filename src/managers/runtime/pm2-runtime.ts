@@ -7,6 +7,7 @@
  * types and PM2's.
  */
 
+import * as path from 'path';
 import { RESERVED_ENV_PREFIXES, withReservedEnvBlanked } from '../../utils/reserved-env';
 import { ProcessManager, getProcessManager } from '../process';
 import {
@@ -42,6 +43,22 @@ export class Pm2Runtime implements AppRuntime {
 
   constructor(processManager?: ProcessManager) {
     this.processManager = processManager ?? getProcessManager();
+  }
+
+  /** Directories a DROP process runs from (the apps directory, the release store's root). */
+  private managedRoots: string[] = [];
+
+  setManagedRoots(roots: string[]): void {
+    this.managedRoots = roots.map((root) => path.resolve(root));
+  }
+
+  /** Strictly under a managed root; a process with no working directory is not ours. */
+  private isManagedCwd(cwd: string | undefined): boolean {
+    if (!cwd) return false;
+    return this.managedRoots.some((root) => {
+      const rel = path.relative(root, path.resolve(cwd));
+      return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+    });
   }
 
   setLiveInstance(appName: string, slot: InstanceSlot): void {
@@ -151,7 +168,7 @@ export class Pm2Runtime implements AppRuntime {
       restarts: status.restarts,
       createdAt: status.createdAt,
       restartedAt: status.restartedAt,
-      cwd: status.cwd,
+      managed: this.isManagedCwd(status.cwd),
     };
   }
 }

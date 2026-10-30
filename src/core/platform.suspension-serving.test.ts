@@ -427,6 +427,8 @@ describe('app suspension (platform, Item 3: serving)', () => {
 
       // The managed Caddyfile Caddy starts on holds no suspended host (it is reset to the template at every start).
       expect(caddyfilesAtStart).toHaveLength(1);
+      // It is the managed template (a missing file must not pass), without the suspended host.
+      expect(caddyfilesAtStart[0]).toContain('import ');
       expect(caddyfilesAtStart[0]).not.toContain('site.localhost');
       // The route control: a suspended app is never routed again, an app that is up still is.
       expect(add.mock.calls.some((c) => (c[0] as { owner?: string }).owner === 'site')).toBe(false);
@@ -438,11 +440,10 @@ describe('app suspension (platform, Item 3: serving)', () => {
 
     it('deletes an ORPHAN instance (no state, no config) of a suspended name, both slots, and never DROP itself', async () => {
       await deployTwoAndStop();
-      const owned = path.join(webappsDir, 'ghost');
-      fakeRuntime.seedRunning('ghost', 47901, owned);
-      fakeRuntime.seedRunning('ghost.b', 47902, owned);
-      fakeRuntime.seedRunning('drop-platform', 47903, owned);
-      fakeRuntime.seedRunning('Ghost', 47904, owned);
+      fakeRuntime.seedRunning('ghost', 47901);
+      fakeRuntime.seedRunning('ghost.b', 47902);
+      fakeRuntime.seedRunning('drop-platform', 47903);
+      fakeRuntime.seedRunning('Ghost', 47904);
       await writeRecords(['ghost', 'drop-platform']);
       const heldAtStart = watchCaddyStart();
       platform = makePlatform({ bootReconcileMode: mode });
@@ -458,11 +459,11 @@ describe('app suspension (platform, Item 3: serving)', () => {
   });
 
   describe('orphans', () => {
-    it('are deleted only when the process runs from an app or release tree; a stranger on the daemon is left alone', async () => {
+    it('are deleted only when the runtime calls the process DROP's own; a stranger on the daemon is left alone', async () => {
       await deployTwoAndStop();
-      fakeRuntime.seedRunning('mine', 47911, path.join(tempDir, 'data', 'releases', 'mine', 'd1'));
-      fakeRuntime.seedRunning('theirs', 47912, path.join(os.tmpdir(), 'somebody-else'));
-      fakeRuntime.seedRunning('unknown', 47913);
+      fakeRuntime.seedRunning('mine', 47911);
+      fakeRuntime.seedRunning('theirs', 47912, false);
+      fakeRuntime.seedRunning('unknown', 47913, false);
       await writeRecords(['mine', 'theirs', 'unknown']);
       watchCaddyStart();
       platform = makePlatform();
@@ -474,7 +475,7 @@ describe('app suspension (platform, Item 3: serving)', () => {
 
     it('are warned about when they are still there after the delete', async () => {
       await deployTwoAndStop();
-      fakeRuntime.seedRunning('ghost', 47921, path.join(webappsDir, 'ghost'));
+      fakeRuntime.seedRunning('ghost', 47921);
       await writeRecords(['ghost']);
       watchCaddyStart();
       const realDelete = fakeRuntime.delete.bind(fakeRuntime);
@@ -494,7 +495,7 @@ describe('app suspension (platform, Item 3: serving)', () => {
       platform = makePlatform();
       await platform.start();
       await deploy('site');
-      fakeRuntime.seedRunning('ghost', 47931, path.join(webappsDir, 'ghost'));
+      fakeRuntime.seedRunning('ghost', 47931);
       await getSuspensionStore().suspend('ghost', 'admin-1');
 
       await (platform as unknown as { enforceSuspensions: (o: { quiet: boolean }) => Promise<void> }).enforceSuspensions({

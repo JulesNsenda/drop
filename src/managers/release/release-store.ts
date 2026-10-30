@@ -44,10 +44,15 @@ const NOT_COPIED = new Set(['.git', 'node_modules', '.venv']);
 export class ReleaseStore {
   constructor(private readonly dropRoot: string) {}
 
+  /** `data/releases`: the root every app's releases live under. */
+  releasesRoot(): string {
+    return path.join(this.dropRoot, 'data', 'releases');
+  }
+
   /** `data/releases/<app>`. Throws on a name that could escape the root. */
   rootFor(appName: string): string {
     if (!isValidAppName(appName)) throw new Error(`Invalid app name: '${appName}'`);
-    return path.join(this.dropRoot, 'data', 'releases', appName);
+    return path.join(this.releasesRoot(), appName);
   }
 
   /**

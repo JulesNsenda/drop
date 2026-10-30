@@ -54,6 +54,32 @@ describe('Pm2Runtime', () => {
     runtime = new Pm2Runtime(pm);
   });
 
+  describe('managed (is this process DROP\'s own?)', () => {
+    const managedOf = async (cwd: string | undefined): Promise<boolean | undefined> => {
+      pm.getAllStatus.mockResolvedValue([pm2Status({ cwd })]);
+      return (await runtime.getAllStatus())[0].managed;
+    };
+
+    it('is true strictly under the apps directory or the release root, and false for anything else', async () => {
+      runtime.setManagedRoots(['/var/drop/data/webapps', '/var/drop/data/releases']);
+
+      expect(await managedOf('/var/drop/data/webapps/site')).toBe(true);
+      expect(await managedOf('/var/drop/data/releases/site/d1')).toBe(true);
+      expect(await managedOf('/var/drop/data/webapps')).toBe(false);
+      expect(await managedOf('/var/drop/data/webapps/../elsewhere')).toBe(false);
+      expect(await managedOf('/home/somebody/app')).toBe(false);
+    });
+
+    it('is false with no working directory, and while no roots were given', async () => {
+      runtime.setManagedRoots(['/var/drop/data/webapps']);
+      expect(await managedOf(undefined)).toBe(false);
+
+      const bare = new Pm2Runtime(pm);
+      pm.getAllStatus.mockResolvedValue([pm2Status({ cwd: '/var/drop/data/webapps/site' })]);
+      expect((await bare.getAllStatus())[0].managed).toBe(false);
+    });
+  });
+
   it('reports its type as pm2', () => {
     expect(runtime.type).toBe('pm2');
   });
@@ -115,6 +141,8 @@ describe('Pm2Runtime', () => {
         restarts: 2,
         createdAt: new Date('2026-01-01'),
         restartedAt: null,
+        // No working directory reported, so not recognisably DROP's own.
+        managed: false,
       });
     });
 

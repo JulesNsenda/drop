@@ -188,7 +188,7 @@ import {
 } from '../utils/domain-validator';
 import { appProvisionKeyName, createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
 import { caseVariantsOf, isNameTaken } from './app-names';
-import { collidesWithPlatformContainer } from '../managers/runtime/platform-containers';
+import { isReservedName } from '../managers/runtime/platform-containers';
 import { resetDeployReservations } from './deploy-reservations';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
 // check: this decides whether a name is safe to write into a Caddy literal.
@@ -232,7 +232,7 @@ import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAccessLog, resetAccessLog } from '../managers/access-log/access-log';
 import { getAppGuestManager, resetAppGuests } from '../managers/app-guest';
 import { getSuspensionStore, resetSuspensionStore, type SuspensionRefusal } from '../managers/suspension';
-import { DROP_SERVICE_NAME } from '../utils/service-name';
+
 import {
   refusalForApp,
   refusalForExpansion,
@@ -2527,6 +2527,9 @@ backup:
 
     // Initialize the app runtime — docker when isolation=docker, PM2 otherwise.
     this.runtime = getAppRuntime(this.config.isolation === 'docker' ? 'docker' : 'pm2');
+    // Where DROP's own processes run from: how a runtime that lists the whole host (PM2)
+    // marks which of them are ours. The release root comes from the store that owns it.
+    this.runtime.setManagedRoots?.([this.config.appsDirectory, this.releaseStore!.releasesRoot()]);
 
     // The live runtime slot of each app (#298 step 4). Adapters default every
     // app to slot `a`; only an app whose current release records slot `b` —
@@ -5591,19 +5594,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // isCloning guard above: don't let the watcher onboard mid-upload.
     if (this.uploadDeployService?.isUploading(payload.name)) return;
     // A folder-dropped app is admitted without any create-path check: a name that
-    // maps onto a platform container (`redis`, `build-*`) is never registered.
-    if (collidesWithPlatformContainer(payload.name)) {
+    // maps onto a platform container (`redis`, `build-*`) or is DROP's own service name
+    // is never registered.
+    if (isReservedName(payload.name)) {
       this.logger.warn(
-        `Not onboarding '${payload.name}': the name is reserved for a platform container`,
+        `Not onboarding '${payload.name}': the name is reserved for the platform`,
         'DEPLOY'
       );
-      return;
-    }
-
-    // DROP's own service name in the runtime: an app by that name would be taken for the
-    // platform by everything that matches runtime processes by name (as `isNameTaken` says).
-    if (payload.name.toLowerCase() === DROP_SERVICE_NAME) {
-      this.logger.warn(`Not onboarding '${payload.name}': the name is reserved for the platform's own service`, 'DEPLOY');
       return;
     }
 
@@ -12670,18 +12667,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
-  /** Whether a runtime instance is DROP's own, as far as the runtime can tell. */
-  private ownsRuntimeInstance(proc: AppProcessInfo): boolean {
-    // Docker: `delete` itself refuses a container without DROP's label.
-    if (proc.runtime !== 'pm2') return true;
-    // PM2 lists every process of the daemon: DROP's only if it runs from an app or release tree.
-    if (!proc.cwd) return false;
-    const roots = [this.config.appsDirectory, path.join(this.config.dropRoot, 'data', 'releases')];
-    return roots.some((root) => {
-      const rel = path.relative(root, proc.cwd as string);
-      return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
-    });
-  }
 
   /**
    * The ORPHANS: runtime instances a record names that the platform has no state
@@ -12712,7 +12697,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const deleted: string[] = [];
     for (const app of suspendedOrphans(byName.keys())) {
       if (this.stopping) return;
-      if (!byName.get(app)!.every((p) => this.ownsRuntimeInstance(p))) continue;
+      // Only what the runtime itself calls DROP's own (PM2's daemon lists every process of the host).
+      if (!byName.get(app)!.every((p) => p.managed === true)) continue;
       if (this.isBusy(app)) {
         this.logger.warn(`Suspended orphan '${app}' is busy and was not removed`, 'SUSPEND');
         continue;

@@ -124,10 +124,13 @@ export interface AppProcessInfo {
   createdAt: Date | null;
   restartedAt: Date | null;
   /**
-   * The directory the process runs from. PM2 ONLY (`pm_cwd`): its daemon lists every
-   * process of the host, so this is how a caller tells DROP's own from someone else's.
+   * Whether this is one of DROP's own app processes, as far as the runtime can tell.
+   * A caller about to DELETE something it found by listing requires `=== true`.
+   * Docker: the list is already filtered by DROP's label. PM2: its daemon lists every
+   * process of the host, so the adapter decides from the process's working directory
+   * (under the apps directory or the release store); no directory means not managed.
    */
-  cwd?: string;
+  managed?: boolean;
   /**
    * Whether the kernel OOM-killed this app, from `State.OOMKilled`.
    *
