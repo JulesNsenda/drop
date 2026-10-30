@@ -39,6 +39,13 @@ export interface AppRuntime {
   setLiveInstance(appName: string, slot: InstanceSlot): void;
   getLiveInstance(appName: string): InstanceSlot;
 
+  /**
+   * Tell the runtime where DROP's own processes run from, so it can mark them
+   * `managed` in its listings. Only a runtime that lists processes it does not own
+   * (PM2) needs it; the others ignore it.
+   */
+  setManagedRoots?(roots: string[]): void;
+
   /** Start an app; resolves when it is running */
   start(spec: AppStartSpec): Promise<AppProcessInfo>;
 

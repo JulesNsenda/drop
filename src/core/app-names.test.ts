@@ -45,6 +45,21 @@ describe('isNameTaken', () => {
     expect(check('drop-platform-two')).toBe(false);
   });
 
+  it("refuses the platform's service name up front, admin or not", async () => {
+    for (const name of ['drop-platform', 'Drop-Platform']) {
+      for (const callerIsAdmin of [true, false]) {
+        expect(
+          await isNewNameRefused(name, {
+            callerIsAdmin,
+            appsDirectory: path.join(tempDir, 'apps'),
+            stateManager: getStateManager(),
+            appConfigService: acs,
+          })
+        ).toBe(true);
+      }
+    }
+  });
+
   it('reserves the bundled Redis container name, ignoring case, for a non-admin create', async () => {
     for (const name of ['redis', 'Redis', 'REDIS']) {
       expect(check(name)).toBe(true);

@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Nothing serves a suspended app, including after a restart.** No route is
+  written for an app (or monorepo group member) a suspension record holds: the
+  one route writer, `handleConfigureRoute`, withholds it (this is what controls
+  routes across a restart, since the managed Caddyfile is reset to its template
+  at every start), and a route reconfigure withdraws the routes instead of
+  rewriting them. Boot enforces the records before Caddy starts: a suspended
+  app's process is deleted (it would otherwise answer on its direct port and keep
+  its env key), as is an orphan instance of a suspended name that DROP has no
+  state for and that runs from an app or release tree, each deletion logged at
+  warn level; the orphan step also runs on the 15-minute pass. Minted keys of
+  every recorded name are revoked after the credentials load and before the API
+  listens. Withdrawal and deletion use the exact name attribution, never act
+  while the suspension file is unreadable (an error is logged every pass), and
+  never reach DROP's own service name, which a folder drop can no longer take.
+  A revoke that could not be made because the credentials are not loaded is now
+  reported (`api key: revoke deferred`) instead of reported as success.
 - **An app can no longer take the bundled Redis container's name.** Under
   `isolation: docker` an app named `redis` ran as `drop-redis` and, on start,
   force-removed the platform's Redis. The name, and the `build-` prefix (the

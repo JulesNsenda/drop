@@ -26,6 +26,7 @@ import {
 import { getTestToken } from '../__testutils__/auth';
 import * as atomicWrite from '../../utils/atomic-write';
 import * as stateManagerModule from '../../managers/app/state-manager';
+import { getLogger } from '../../utils/logger';
 
 describe('Auth Middleware', () => {
   let tempDir: string;
@@ -616,6 +617,21 @@ describe('deleteApiKeysByName and deleteApiKey', () => {
     resetAuth();
     jest.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  it('resolves false, without logging, when the credentials are not loaded', async () => {
+    resetAuth();
+    const warn = jest.spyOn(getLogger(), 'warn').mockImplementation();
+
+    await expect(deleteApiKeysByName('app:site:provision')).resolves.toBe(false);
+
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('resolves true once the credentials are there, whether or not a key had that name', async () => {
+    await createApiKey('kept', 'admin');
+    await expect(deleteApiKeysByName('absent')).resolves.toBe(true);
+    await expect(deleteApiKeysByName('kept')).resolves.toBe(true);
   });
 
   it('writes nothing when no key has that name', async () => {

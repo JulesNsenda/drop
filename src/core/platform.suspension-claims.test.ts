@@ -231,14 +231,18 @@ describe('handleConfigureRoute: hosts claimed by a suspension', () => {
     expect(hostsOf('b')).toEqual(['*.example.com']);
   });
 
-  it("a suspended app's own record claims nothing against itself", async () => {
+  it('a suspended app gets no route at all, however it declares its hosts (Item 3)', async () => {
     await register('site');
-    await getSuspensionStore().suspend('site', 'admin-1');
     await declareDomains('site', ['site.dropkit.sh', 'site.example.com']);
+    await (platform as any).handleConfigureRoute('site', 4100);
+    // Control: unsuspended, the record's own host is not claimed against the app itself.
+    expect(hostsOf('site')).toEqual(['site.dropkit.sh', 'site.example.com']);
 
+    await getSuspensionStore().suspend('site', 'admin-1');
+    await (platform as any).router.removeRoutesForApp('site');
     await (platform as any).handleConfigureRoute('site', 4100);
 
-    expect(hostsOf('site')).toEqual(['site.dropkit.sh', 'site.example.com']);
+    expect(hostsOf('site')).toEqual([]);
   });
 
   it('acts only on a record: a corrupt store keeps every existing route, and a record then withdraws just the claimed one', async () => {

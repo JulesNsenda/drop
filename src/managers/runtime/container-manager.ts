@@ -919,6 +919,8 @@ export class ContainerManager implements AppRuntime {
       // Authoritative when true. Docker clears it on the next run, so it is
       // only observable while the container is down — see AppProcessInfo.
       oomKilled: state.OOMKilled === true,
+      // Only reached for containers DROP lists by its label (or inspects by an owned id).
+      managed: true,
     };
   }
 

@@ -144,6 +144,12 @@ export class SuspensionStore {
     return this.corrupt;
   }
 
+  /** Why the store cannot answer for ANY app (`not-loaded` or `store-unreadable`), or null when it can. */
+  availability(): Exclude<SuspensionRefusal, 'record'> | null {
+    if (!this.loaded) return 'not-loaded';
+    return this.corrupt ? 'store-unreadable' : null;
+  }
+
   /**
    * Why a start of THIS NAME must be refused by its own record, or null.
    * `not-loaded` and `store-unreadable` refuse EVERY app (the store cannot say

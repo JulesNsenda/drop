@@ -258,6 +258,7 @@ export function toProcessStatus(proc: PM2ProcessDescription): ProcessStatus {
     watching: env.watch || false,
     createdAt: env.created_at ? new Date(env.created_at) : null,
     restartedAt: null,
+    ...(env.pm_cwd ? { cwd: env.pm_cwd } : {}),
   };
 }
 

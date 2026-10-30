@@ -6,8 +6,11 @@
  * `ContainerManager` refuses to act on any container carrying
  * `PLATFORM_SERVICE_LABEL` (the second layer, for names that predate the rule).
  *
- * Kept free of imports so both the name rules and the runtime can use it.
+ * Kept free of imports (but the leaf service-name constant) so both the name rules
+ * and the runtime can use it.
  */
+
+import { DROP_SERVICE_NAME } from '../../utils/service-name';
 
 /** Prefix of every DROP container name, tenant or platform. */
 export const CONTAINER_NAME_PREFIX = 'drop-';
@@ -35,6 +38,26 @@ export function collidesWithPlatformContainer(name: string): boolean {
   if (lower.startsWith(BUILD_NAME_PREFIX)) return true;
   const cName = `${CONTAINER_NAME_PREFIX}${lower}`;
   return PLATFORM_CONTAINER_NAMES.some((reserved) => reserved.toLowerCase() === cName);
+}
+
+/**
+ * DROP's own runtime process name (PM2 daemon mode). Suspension enforcement
+ * skips only this: `redis` and `build-*` apps from before the reservation
+ * are still enforced, and the container allowlist already keeps the platform's
+ * own containers out of reach.
+ */
+export function isPlatformServiceName(name: string): boolean {
+  return name.toLowerCase() === DROP_SERVICE_NAME;
+}
+
+/**
+ * THE reserved-name rule: a name no app may have, for any caller. DROP's own
+ * service name (an app by it would be taken for the platform by everything that
+ * matches runtime processes by name) or one that maps onto a platform container.
+ * Every create path and the folder drop ask this one.
+ */
+export function isReservedName(name: string): boolean {
+  return isPlatformServiceName(name) || collidesWithPlatformContainer(name);
 }
 
 /** A platform service container: one of our names AND the service label. */

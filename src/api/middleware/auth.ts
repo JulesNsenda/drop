@@ -2625,14 +2625,20 @@ export function appProvisionKeyName(appName: string): string {
 
 /**
  * Delete all API keys with a given name (used to rotate the CLI local key on restart).
+ *
+ * Resolves whether the credentials were there to act on: `false` when they are not
+ * loaded (yet, or at all: auth off), so a caller that needs a key gone can tell it
+ * from success and decide whether that matters. It does not log: on a box with auth
+ * off every call would. It stays a resolve, not a throw.
  */
-export async function deleteApiKeysByName(name: string): Promise<void> {
-  if (!credentials || !config) return;
+export async function deleteApiKeysByName(name: string): Promise<boolean> {
+  if (!credentials || !config) return false;
   const kept = credentials.apiKeys.filter((k) => k.name !== name);
   // Nothing to revoke: a converged caller (the suspension pass) must not rewrite the file.
-  if (kept.length === credentials.apiKeys.length) return;
+  if (kept.length === credentials.apiKeys.length) return true;
   credentials.apiKeys = kept;
   await saveCredentials(config.credentialsPath, credentials);
+  return true;
 }
 
 /**

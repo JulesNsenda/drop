@@ -14,8 +14,7 @@ import { pathTaken } from '../utils/paths';
 import type { AppStateManager } from '../managers/app/state-manager';
 import type { AppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore } from '../managers/suspension';
-import { DROP_SERVICE_NAME } from '../utils/service-name';
-import { collidesWithPlatformContainer } from '../managers/runtime/platform-containers';
+import { isReservedName } from '../managers/runtime/platform-containers';
 
 /**
  * Existing APP names (state and config) that equal `name` ignoring case but are
@@ -63,14 +62,12 @@ export function isNameTaken(
   deps: { stateManager: AppStateManager; appConfigService?: AppConfigService; ownGroup?: string }
 ): boolean {
   if (!deps.appConfigService) return true;
-  // The platform's own process name in the runtime: an app by that name would be
-  // indistinguishable from it to anything that matches runtime processes by name.
-  if (name.toLowerCase() === DROP_SERVICE_NAME) return true;
   // An unreadable suspension store cannot say which names it holds. (An UNLOADED one is not
   // treated the same: it is an early-boot state, and every test that never loads it would refuse.)
   if (getSuspensionStore().refusalFor(name) === 'store-unreadable') return true;
-  // Under docker isolation an app's container is `drop-<name>`; `redis` would be the bundled Redis.
-  if (collidesWithPlatformContainer(name)) return true;
+  // DROP's own service name, or (under docker isolation, where an app's container is
+  // `drop-<name>`) `redis`, the bundled Redis: reserved for everyone.
+  if (isReservedName(name)) return true;
   const wanted = name.toLowerCase();
   const same = (other: string | undefined): boolean => other?.toLowerCase() === wanted;
   const own = deps.ownGroup?.toLowerCase();
@@ -119,7 +116,7 @@ export async function isNewNameRefused(
   }
 ): Promise<boolean> {
   // Before the admin exemption: such a name can never run under docker, so no caller benefits from it.
-  if (collidesWithPlatformContainer(name)) return true;
+  if (isReservedName(name)) return true;
   if (deps.callerIsAdmin) return false;
   if (await pathTaken(path.join(deps.appsDirectory, name))) return true;
   return isNameTaken(name, { stateManager: deps.stateManager, appConfigService: deps.appConfigService });
