@@ -57,6 +57,20 @@ describe('isNameTaken', () => {
         })
       ).toBe(true);
     }
+    // The admin / auth-off exemption does not apply: a redis app can never run under docker.
+    expect(
+      await isNewNameRefused('redis', {
+        callerIsAdmin: true,
+        appsDirectory: path.join(tempDir, 'apps'),
+        stateManager: getStateManager(),
+        appConfigService: acs,
+      })
+    ).toBe(true);
+    // `drop-build-*` is the build container namespace.
+    for (const name of ['build-x', 'Build-Web']) {
+      expect(check(name)).toBe(true);
+    }
+    expect(check('builder')).toBe(false);
     // Only the exact container name: neighbours stay free.
     expect(check('redis-cache')).toBe(false);
     expect(check('my-redis')).toBe(false);

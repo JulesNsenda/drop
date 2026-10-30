@@ -35,10 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **An app can no longer take the bundled Redis container's name.** Under
   `isolation: docker` an app named `redis` ran as `drop-redis` and, on start,
-  force-removed the platform's Redis. The name is now reserved (ignoring case)
-  for non-admin creates, and `ContainerManager` refuses to start over, stop,
-  restart or delete any container carrying a `drop.service` label, and leaves
-  such containers out of the app list.
+  force-removed the platform's Redis. The name, and the `build-` prefix (the
+  `drop-build-*` build container namespace), are now reserved ignoring case for
+  every caller including admins and folder-dropped apps. `ContainerManager`
+  only acts on containers labelled `drop.managed` that are neither
+  `drop.service` nor `drop.build`: it refuses to start over a container it does
+  not own, ignores stop/delete on one, acts through the inspected container id,
+  and leaves such containers out of the app list and count. The bundled Redis
+  start no longer removes a `drop-redis` container that is not its own.
 
 ## [1.8.0] - 2026-10-29
 

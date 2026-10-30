@@ -118,6 +118,8 @@ export async function isNewNameRefused(
     appConfigService?: AppConfigService;
   }
 ): Promise<boolean> {
+  // Before the admin exemption: such a name can never run under docker, so no caller benefits from it.
+  if (collidesWithPlatformContainer(name)) return true;
   if (deps.callerIsAdmin) return false;
   if (await pathTaken(path.join(deps.appsDirectory, name))) return true;
   return isNameTaken(name, { stateManager: deps.stateManager, appConfigService: deps.appConfigService });

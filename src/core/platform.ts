@@ -188,6 +188,7 @@ import {
 } from '../utils/domain-validator';
 import { appProvisionKeyName, createApiKey, deleteApiKeysByName, isAdminPrincipalId } from '../api/middleware/auth';
 import { caseVariantsOf, isNameTaken } from './app-names';
+import { collidesWithPlatformContainer } from '../managers/runtime/platform-containers';
 import { resetDeployReservations } from './deploy-reservations';
 // The STRICT name pattern (the API's), not the folder-drop parser's looser
 // check: this decides whether a name is safe to write into a Caddy literal.
@@ -5573,6 +5574,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Skip apps currently being uploaded (PRD-039) — same rationale as the
     // isCloning guard above: don't let the watcher onboard mid-upload.
     if (this.uploadDeployService?.isUploading(payload.name)) return;
+    // A folder-dropped app is admitted without any create-path check: a name that
+    // maps onto a platform container (`redis`, `build-*`) is never registered.
+    if (collidesWithPlatformContainer(payload.name)) {
+      this.logger.warn(
+        `Not onboarding '${payload.name}': the name is reserved for a platform container`,
+        'DEPLOY'
+      );
+      return;
+    }
 
     // Decided BEFORE the drop.yaml is read, so a container-shaped tree under a
     // suspended name is not intercepted and expanded into children either.
