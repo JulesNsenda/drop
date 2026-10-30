@@ -459,7 +459,7 @@ describe('app suspension (platform, Item 3: serving)', () => {
   });
 
   describe('orphans', () => {
-    it('are deleted only when the runtime calls the process DROP's own; a stranger on the daemon is left alone', async () => {
+    it("are deleted only when the runtime calls the process DROP's own; a stranger on the daemon is left alone", async () => {
       await deployTwoAndStop();
       fakeRuntime.seedRunning('mine', 47911);
       fakeRuntime.seedRunning('theirs', 47912, false);

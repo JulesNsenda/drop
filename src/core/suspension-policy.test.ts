@@ -455,6 +455,16 @@ describe('suspension policy: refusalForApp', () => {
       ]);
     });
 
+    it('still enforces an app named like a reserved container (redis, build-*) that predates the reservation', async () => {
+      const apps = [{ name: 'redis' }, { name: 'build-tools' }];
+      await store.suspend('redis', 'admin');
+      await store.suspend('build-tools', 'admin');
+      const deps = depsOf(apps);
+
+      expect([...enforcementTargets(deps).keys()].sort()).toEqual(['build-tools', 'redis']);
+      expect(isStillEnforced('redis', deps)).toBe(true);
+    });
+
     it('is empty while the store is unreadable', async () => {
       await store.suspend('site', 'admin');
       fs.writeFileSync(path.join(dir, 'suspensions.json'), '{ broken');

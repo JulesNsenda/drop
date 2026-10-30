@@ -46,6 +46,16 @@ export function collidesWithPlatformContainer(name: string): boolean {
  * matches runtime processes by name) or one that maps onto a platform container.
  * Every create path, the folder drop and the suspension policy ask this one.
  */
+/**
+ * DROP's own runtime process name (PM2 daemon mode). Suspension enforcement
+ * skips only this: `redis` and `build-*` apps from before the reservation
+ * are still enforced, and the container allowlist already keeps the platform's
+ * own containers out of reach.
+ */
+export function isPlatformServiceName(name: string): boolean {
+  return name.toLowerCase() === DROP_SERVICE_NAME;
+}
+
 export function isReservedName(name: string): boolean {
   return name.toLowerCase() === DROP_SERVICE_NAME || collidesWithPlatformContainer(name);
 }

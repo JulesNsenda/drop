@@ -45,7 +45,7 @@ import type { AppStateManager } from '../managers/app/state-manager';
 import { getAppConfigServiceOrNull } from '../managers/app/app-config';
 import type { AppConfigService } from '../managers/app/app-config';
 import { AppSuspendedError } from '../api/platform-ops';
-import { isReservedName } from '../managers/runtime/platform-containers';
+import { isPlatformServiceName } from '../managers/runtime/platform-containers';
 
 /** Why an app is refused: the reason, and the OTHER app whose record it is, if any. */
 export interface SuspensionVerdict {
@@ -339,9 +339,9 @@ export function suspensionStoreUnavailable(
 export function enforcementTargets(deps: SuspensionPolicyDeps = defaultDeps()): Map<string, string> {
   const targets = new Map<string, string>();
   for (const record of recordSubjects(deps)) {
-    if (knowsApp(record, deps) && !isReservedName(record) && !targets.has(record)) targets.set(record, record);
+    if (knowsApp(record, deps) && !isPlatformServiceName(record) && !targets.has(record)) targets.set(record, record);
     for (const child of childrenOf(record, deps)) {
-      if (!isReservedName(child) && !targets.has(child)) targets.set(child, record);
+      if (!isPlatformServiceName(child) && !targets.has(child)) targets.set(child, record);
     }
   }
   return targets;
@@ -352,7 +352,7 @@ export function enforcementTargets(deps: SuspensionPolicyDeps = defaultDeps()): 
  * acts): its own record, if an app by that name is known, or a container's record.
  */
 export function isStillEnforced(target: string, deps: SuspensionPolicyDeps = defaultDeps()): boolean {
-  if (isReservedName(target)) return false;
+  if (isPlatformServiceName(target)) return false;
   return recordSubjects(deps).some((r) =>
     r === target ? knowsApp(target, deps) : childrenOf(r, deps).includes(target)
   );
@@ -380,8 +380,8 @@ export function routeWithdrawalFor(name: string, deps: SuspensionPolicyDeps = de
 export function recordedNames(deps: SuspensionPolicyDeps = defaultDeps()): Set<string> {
   const names = new Set<string>();
   for (const record of recordSubjects(deps)) {
-    if (!isReservedName(record)) names.add(record);
-    for (const child of childrenOf(record, deps)) if (!isReservedName(child)) names.add(child);
+    if (!isPlatformServiceName(record)) names.add(record);
+    for (const child of childrenOf(record, deps)) if (!isPlatformServiceName(child)) names.add(child);
   }
   return names;
 }
