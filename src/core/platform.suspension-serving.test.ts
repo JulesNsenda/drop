@@ -104,6 +104,7 @@ import { getStateManager } from '../managers/app/state-manager';
 import { getAppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore } from '../managers/suspension';
 import * as authModule from '../api/middleware/auth';
+import * as dropYamlParser from './detector/drop-yaml-parser';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 8000, intervalMs = 25): Promise<void> {
   const started = Date.now();
@@ -207,34 +208,21 @@ describe('app suspension (platform, Item 3: serving)', () => {
   }
 
   /**
-   * Stub Caddy at the class and record what the runtime holds at the moment it is
-   * started (ONE entry per start). Ready is forced true so the start is reached.
+   * Stub Caddy at the class and record, at the moment it is started (ONE entry per
+   * start), what the runtime still holds and what the Caddyfile says (`caddyfilesAtStart`).
+   * Ready is forced true so the start is reached.
    */
+  let caddyfilesAtStart: string[] = [];
   function watchCaddyStart(): string[][] {
     const heldAtStart: string[][] = [];
+    caddyfilesAtStart = [];
     jest.spyOn(CaddyServer.prototype, 'ensureReady').mockResolvedValue(true);
     jest.spyOn(CaddyServer.prototype, 'stop').mockResolvedValue(undefined);
     jest.spyOn(CaddyServer.prototype, 'start').mockImplementation(async () => {
       heldAtStart.push(fakeRuntime.runningNames().sort());
+      caddyfilesAtStart.push(await readCaddyfile().catch(() => ''));
     });
     return heldAtStart;
-  }
-
-  /**
-   * Wrap the boot enforcement step of `p` and capture the Caddyfile on either side
-   * of it. (Startup itself writes the managed Caddyfile, and the router rewrites it
-   * on a route change, so "unchanged" is a claim about THIS step, not about boot.)
-   */
-  function watchEnforcement(p: DropPlatform): { before?: string; after?: string } {
-    const seen: { before?: string; after?: string } = {};
-    const target = p as unknown as { enforceSuspensionsAtBoot: () => Promise<void> };
-    const real = target.enforceSuspensionsAtBoot.bind(p);
-    jest.spyOn(target, 'enforceSuspensionsAtBoot').mockImplementation(async () => {
-      seen.before = await readCaddyfile();
-      await real();
-      seen.after = await readCaddyfile();
-    });
-    return seen;
   }
 
   /**
@@ -343,6 +331,59 @@ describe('app suspension (platform, Item 3: serving)', () => {
       expect(add).toHaveBeenCalledTimes(1);
       expect(routed('site')).toBe(true);
     }, 30000);
+    it('reconfigureRoute withdraws even while a deploy holds the app, and the add gate then keeps that deploy from routing', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      const port = getStateManager().getApp('site')!.port!;
+      await getSuspensionStore().suspend('site', 'admin-1');
+      internals().appsInProgress.add('site');
+      try {
+        await internals().reconfigureRoute('site');
+        expect(routed('site')).toBe(false);
+        const add = jest.spyOn(internals().router, 'addRoute');
+        await internals().handleConfigureRoute('site', port);
+        expect(add).not.toHaveBeenCalled();
+      } finally {
+        internals().appsInProgress.delete('site');
+      }
+    }, 30000);
+
+    it('the add gate also withholds a case variant that the exact withdrawal leaves alone', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      await getSuspensionStore().suspend('Site', 'admin-1');
+      const add = jest.spyOn(internals().router, 'addRoute');
+      const remove = jest.spyOn(internals().router, 'removeRoutesForApp');
+
+      await internals().reconfigureRoute('site');
+
+      // Not withdrawn (the record names a differently-cased app), but nothing new is written.
+      expect(remove).not.toHaveBeenCalled();
+      expect(add).not.toHaveBeenCalled();
+      expect(routed('site')).toBe(true);
+    }, 30000);
+
+    it('a record that lands while the route is being configured is caught by the check before the write', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      const port = getStateManager().getApp('site')!.port!;
+      await internals().router.removeRoutesForApp('site');
+      const parse = dropYamlParser.parseDropYaml;
+      jest.spyOn(dropYamlParser, 'parseDropYaml').mockImplementationOnce(async (...args: Parameters<typeof parse>) => {
+        const result = await parse(...args);
+        await getSuspensionStore().suspend('site', 'admin-1');
+        return result;
+      });
+      const add = jest.spyOn(internals().router, 'addRoute');
+
+      await internals().handleConfigureRoute('site', port);
+
+      expect(add).not.toHaveBeenCalled();
+      expect(routed('site')).toBe(false);
+    }, 30000);
   });
 
   describe('RouterService on an unseeded router', () => {
@@ -366,14 +407,12 @@ describe('app suspension (platform, Item 3: serving)', () => {
   });
 
   describe.each([['off' as const], ['on' as const]])('boot enforcement with DROP_BOOT_RECONCILE=%s', (mode) => {
-    it('deletes a live suspended instance (state-backed) before Caddy starts, logs it, and leaves the Caddyfile alone', async () => {
+    it('deletes a live suspended instance (state-backed) before Caddy starts, and logs it', async () => {
       await deployTwoAndStop();
       await writeRecords(['site']);
       const heldAtStart = watchCaddyStart();
       platform = makePlatform({ bootReconcileMode: mode });
-      const seen = watchEnforcement(platform);
       const warn = jest.spyOn(internals().logger, 'warn');
-      const remove = jest.spyOn(RouterService.prototype, 'removeRoutesForApp');
       const add = jest.spyOn(RouterService.prototype, 'addRoute');
 
       await platform.start();
@@ -386,25 +425,24 @@ describe('app suspension (platform, Item 3: serving)', () => {
       expect(site?.error).toBe('Suspended by admin');
       expect(warn.mock.calls.some((c) => String(c[0]).includes("'site'") && String(c[0]).includes('taken down'))).toBe(true);
 
-      // The unseeded router had nothing to remove, so the step rewrote no Caddyfile and routed nothing.
-      expect(remove.mock.results.every((r) => r.type === 'return')).toBe(true);
-      expect(seen.before).toBeDefined();
-      expect(seen.after).toBe(seen.before);
+      // The managed Caddyfile Caddy starts on holds no suspended host (it is reset to the template at every start).
+      expect(caddyfilesAtStart).toHaveLength(1);
+      expect(caddyfilesAtStart[0]).not.toContain('site.localhost');
+      // The route control: a suspended app is never routed again, an app that is up still is.
       expect(add.mock.calls.some((c) => (c[0] as { owner?: string }).owner === 'site')).toBe(false);
       if (mode === 'on') {
-        // Reconciling the app that is still up regenerates the file from what the router holds:
-        // the refused app is the only block that goes.
-        await eventually(async () => !(await readCaddyfile()).includes('site.localhost'));
-        expect(await readCaddyfile()).toContain('blog.localhost');
+        await eventually(async () => (await readCaddyfile()).includes('blog.localhost'));
+        expect(await readCaddyfile()).not.toContain('site.localhost');
       }
     }, 40000);
 
     it('deletes an ORPHAN instance (no state, no config) of a suspended name, both slots, and never DROP itself', async () => {
       await deployTwoAndStop();
-      fakeRuntime.seedRunning('ghost', 47901);
-      fakeRuntime.seedRunning('ghost.b', 47902);
-      fakeRuntime.seedRunning('drop-platform', 47903);
-      fakeRuntime.seedRunning('Ghost', 47904);
+      const owned = path.join(webappsDir, 'ghost');
+      fakeRuntime.seedRunning('ghost', 47901, owned);
+      fakeRuntime.seedRunning('ghost.b', 47902, owned);
+      fakeRuntime.seedRunning('drop-platform', 47903, owned);
+      fakeRuntime.seedRunning('Ghost', 47904, owned);
       await writeRecords(['ghost', 'drop-platform']);
       const heldAtStart = watchCaddyStart();
       platform = makePlatform({ bootReconcileMode: mode });
@@ -419,8 +457,56 @@ describe('app suspension (platform, Item 3: serving)', () => {
     }, 40000);
   });
 
+  describe('orphans', () => {
+    it('are deleted only when the process runs from an app or release tree; a stranger on the daemon is left alone', async () => {
+      await deployTwoAndStop();
+      fakeRuntime.seedRunning('mine', 47911, path.join(tempDir, 'data', 'releases', 'mine', 'd1'));
+      fakeRuntime.seedRunning('theirs', 47912, path.join(os.tmpdir(), 'somebody-else'));
+      fakeRuntime.seedRunning('unknown', 47913);
+      await writeRecords(['mine', 'theirs', 'unknown']);
+      watchCaddyStart();
+      platform = makePlatform();
+
+      await platform.start();
+
+      expect(fakeRuntime.runningNames().sort()).toEqual(['blog', 'site', 'theirs', 'unknown']);
+    }, 40000);
+
+    it('are warned about when they are still there after the delete', async () => {
+      await deployTwoAndStop();
+      fakeRuntime.seedRunning('ghost', 47921, path.join(webappsDir, 'ghost'));
+      await writeRecords(['ghost']);
+      watchCaddyStart();
+      const realDelete = fakeRuntime.delete.bind(fakeRuntime);
+      jest.spyOn(fakeRuntime, 'delete').mockImplementation(async (name: string) => {
+        if (name.startsWith('ghost')) return;
+        return realDelete(name);
+      });
+      platform = makePlatform();
+      const warn = jest.spyOn(internals().logger, 'warn');
+
+      await platform.start();
+
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("'ghost' is still present"))).toBe(true);
+    }, 40000);
+
+    it('are also removed by the periodic pass', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      fakeRuntime.seedRunning('ghost', 47931, path.join(webappsDir, 'ghost'));
+      await getSuspensionStore().suspend('ghost', 'admin-1');
+
+      await (platform as unknown as { enforceSuspensions: (o: { quiet: boolean }) => Promise<void> }).enforceSuspensions({
+        quiet: true,
+      });
+
+      expect(fakeRuntime.runningNames()).toEqual(['site']);
+    }, 40000);
+  });
+
   describe('boot enforcement: what it must not do', () => {
-    it('an unreadable store deletes nothing and withdraws no route', async () => {
+    it('an unreadable store deletes nothing and withdraws no route, and says so loudly', async () => {
       await deployTwoAndStop();
       await fs.mkdir(path.dirname(suspensionsFile), { recursive: true });
       await fs.writeFile(suspensionsFile, '{ broken');
@@ -429,7 +515,7 @@ describe('app suspension (platform, Item 3: serving)', () => {
       const del = jest.spyOn(fakeRuntime, 'delete');
       const remove = jest.spyOn(RouterService.prototype, 'removeRoutesForApp');
       platform = makePlatform();
-      const seen = watchEnforcement(platform);
+      const error = jest.spyOn(internals().logger as unknown as { error: (...a: unknown[]) => void }, 'error');
 
       await platform.start();
 
@@ -438,32 +524,59 @@ describe('app suspension (platform, Item 3: serving)', () => {
       expect(del).not.toHaveBeenCalled();
       expect(remove).not.toHaveBeenCalled();
       expect(getStateManager().getApp('site')?.status).toBe('running');
-      expect(seen.before).toBeDefined();
-      expect(seen.after).toBe(seen.before);
+      expect(error.mock.calls.some((c) => String(c[0]).includes('NOT enforced'))).toBe(true);
     }, 40000);
 
-    it('revokes the minted key once more after the API has loaded the credentials', async () => {
+    it('revokes the minted key of a suspended app after the credentials load and BEFORE the API listens, with real credentials', async () => {
       await deployTwoAndStop();
-      await writeRecords(['site']);
+      await writeRecords(['site', 'ghost']);
       watchCaddyStart();
-      const order: string[] = [];
+      const credentialsPath = path.join(tempDir, 'data', 'drop-svc', 'api-credentials.json');
+      const keyNames = (): string[] => authModule.listApiKeys().map((k) => k.name);
+      let atListen: string[] | undefined;
       (createApiServer as jest.Mock).mockImplementationOnce(() => ({
-        initialize: jest.fn().mockResolvedValue(undefined),
-        start: jest.fn().mockImplementation(async () => {
-          order.push('api-start');
-        }),
-        stop: jest.fn().mockResolvedValue(undefined),
+        initialize: async () => {
+          await authModule.initializeAuth({ credentialsPath, enableJwt: true, enableApiKeys: true });
+          await authModule.createApiKey('app:site:provision', 'none', undefined, ['users:create']);
+          await authModule.createApiKey('app:ghost:provision', 'none', undefined, ['users:create']);
+          await authModule.createApiKey('app:blog:provision', 'none', undefined, ['users:create']);
+        },
+        start: async () => {
+          atListen = keyNames();
+        },
+        stop: async () => undefined,
       }));
-      jest.spyOn(authModule, 'deleteApiKeysByName').mockImplementation(async (name: string) => {
-        if (name.startsWith('app:')) order.push(`revoke ${name}`);
-        return true;
-      });
       platform = makePlatform({ enableApi: true });
 
-      await platform.start();
+      try {
+        await platform.start();
 
-      // Once before the API (a no-op in real life: no credentials yet), once after.
-      expect(order).toEqual(['revoke app:site:provision', 'api-start', 'revoke app:site:provision']);
+        // Both recorded names (one with no app behind it) are revoked; the unsuspended app keeps its key.
+        expect(atListen).toEqual(['app:blog:provision']);
+      } finally {
+        authModule.resetAuth();
+      }
+    }, 40000);
+
+    it('does not report a deferred revoke as a failure when no API (so no key) exists', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+
+      const result = await platform.suspendApp('site', 'admin-1');
+
+      expect((result as { stopErrors?: string[] }).stopErrors ?? []).toEqual([]);
+    }, 40000);
+
+    it('reports a revoke it could not make when keys can exist but the credentials are not loaded', async () => {
+      platform = makePlatform({ enableApi: true });
+      await platform.start();
+      await deploy('site');
+      authModule.resetAuth();
+
+      const result = await platform.suspendApp('site', 'admin-1');
+
+      expect((result as { stopErrors?: string[] }).stopErrors).toEqual(['api key: revoke deferred (credentials not loaded)']);
     }, 40000);
 
     it('a record that no known app matches changes nothing about the apps that are up', async () => {
@@ -477,21 +590,35 @@ describe('app suspension (platform, Item 3: serving)', () => {
       expect(heldAtStart).toEqual([['blog', 'site']]);
     }, 40000);
 
-    it('a legacy keyless record resolves to the one app that matches ignoring case, and is enforced', async () => {
+    it('a legacy keyless record is its exact name: an app of that name goes, a case variant stays', async () => {
       platform = makePlatform();
       await platform.start();
       await deploy('MySite');
       await deploy('blog');
       await platform.stop();
       platform = null;
-      expect(fakeRuntime.runningNames().sort()).toEqual(['MySite', 'blog']);
       await writeRecords(['mysite'], true);
       const heldAtStart = watchCaddyStart();
       platform = makePlatform();
 
       await platform.start();
 
-      expect(heldAtStart).toEqual([['blog']]);
+      // `mysite` is not `MySite`: nothing is taken down on a case-insensitive guess.
+      expect(heldAtStart).toEqual([['MySite', 'blog']]);
     }, 40000);
+  });
+
+  describe('a folder named after the platform', () => {
+    it('is not onboarded', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await createStaticApp('drop-platform');
+
+      eventBus.publish('app:detected', { name: 'drop-platform', path: appPath, type: undefined });
+      await new Promise((r) => setTimeout(r, 400));
+
+      expect(getStateManager().getApp('drop-platform')).toBeUndefined();
+      expect(fakeRuntime.runningNames()).toEqual([]);
+    }, 20000);
   });
 });

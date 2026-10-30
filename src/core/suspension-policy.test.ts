@@ -16,7 +16,8 @@ import { resetAppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
 import {
   childrenOf,
-  ambiguousKeylessRecords,
+  suspendedOrphans,
+  suspensionStoreUnavailable,
   enforcementTargets,
   isStillEnforced,
   recordedNames,
@@ -540,49 +541,83 @@ describe('suspension policy: refusalForApp', () => {
       await store.load();
     }
 
-    it('resolves to the one known app that matches ignoring case', async () => {
+    it('a key is its exact name: an app of that name is enforced, a case variant is not reached', async () => {
       await loadKeyless('myapp');
-      const deps = depsOf([{ name: 'MyApp' }, { name: 'other' }]);
 
-      expect([...enforcementTargets(deps)]).toEqual([['MyApp', 'MyApp']]);
-      expect(isStillEnforced('MyApp', deps)).toBe(true);
-      expect(routeWithdrawalFor('MyApp', deps)).toEqual({ reason: 'record' });
-      expect(ambiguousKeylessRecords(deps)).toEqual([]);
+      expect([...enforcementTargets(depsOf([{ name: 'myapp' }, { name: 'other' }]))]).toEqual([['myapp', 'myapp']]);
+      expect(enforcementTargets(depsOf([{ name: 'MyApp' }])).size).toBe(0);
+      expect(routeWithdrawalFor('MyApp', depsOf([{ name: 'MyApp' }]))).toBeNull();
     });
 
-    it('is enforced against nobody, and reported, when several apps match', async () => {
-      await loadKeyless('shop');
-      const deps = depsOf([{ name: 'Shop' }, { name: 'SHOP' }, { name: 'shop-two' }]);
-
-      expect(enforcementTargets(deps).size).toBe(0);
-      expect(isStillEnforced('Shop', deps)).toBe(false);
-      expect(isStillEnforced('SHOP', deps)).toBe(false);
-      expect(routeWithdrawalFor('Shop', deps)).toBeNull();
-      expect(recordedNames(deps).size).toBe(0);
-      expect(ambiguousKeylessRecords(deps)).toEqual(['shop']);
-    });
-
-    it('counts a config-only name as a match, as the state-only one', async () => {
-      await loadKeyless('myapp');
-      const deps = depsOf([{ name: 'MyApp', configOnly: true }]);
-
-      expect([...enforcementTargets(deps)]).toEqual([['MyApp', 'MyApp']]);
-    });
-
-    it('with no match, the key stands as the name (a deleted app; its runtime orphan)', async () => {
+    it('with no app, the key stands as a recorded name (a deleted app, its runtime orphan)', async () => {
       await loadKeyless('ghost');
       const deps = depsOf([{ name: 'other' }]);
 
       expect(enforcementTargets(deps).size).toBe(0);
       expect([...recordedNames(deps)]).toEqual(['ghost']);
-      expect(ambiguousKeylessRecords(deps)).toEqual([]);
     });
+  });
 
-    it('a record that carries its app name is never re-resolved', async () => {
-      await store.suspend('MyApp', 'admin');
-      const deps = depsOf([{ name: 'myapp' }]);
+  describe("DROP's own service name", () => {
+    it('is never a target, a recorded name or still enforced, even when an app by that name is known', async () => {
+      await store.suspend('drop-platform', 'admin');
+      await store.suspend('Drop-Platform', 'admin');
+      const deps = depsOf([{ name: 'drop-platform' }, { name: 'Drop-Platform' }]);
 
       expect(enforcementTargets(deps).size).toBe(0);
+      expect(recordedNames(deps).size).toBe(0);
+      expect(isStillEnforced('drop-platform', deps)).toBe(false);
+      expect(routeWithdrawalFor('drop-platform', deps)).toBeNull();
+    });
+  });
+
+  describe('suspendedOrphans', () => {
+    it('is the runtime names a record names that nothing of ours knows, exactly', async () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'known' }];
+      await store.suspend('site', 'admin');
+      await store.suspend('ghost', 'admin');
+      await store.suspend('known', 'admin');
+      await store.suspend('drop-platform', 'admin');
+      const deps = depsOf(apps);
+
+      const orphans = suspendedOrphans(['site', 'site-web', 'ghost', 'Ghost', 'known', 'drop-platform', 'bystander'], deps);
+
+      // `site` and `site-web` are known apps (the pass handles them), `known` too.
+      expect([...orphans]).toEqual(['ghost']);
+    });
+
+    it('is empty while the store is unreadable', async () => {
+      await store.suspend('ghost', 'admin');
+      fs.writeFileSync(path.join(dir, 'suspensions.json'), '{ broken');
+      jest.spyOn(console, 'error').mockImplementation();
+      await store.load();
+
+      expect(suspendedOrphans(['ghost'], depsOf([])).size).toBe(0);
+    });
+  });
+
+  describe('suspensionStoreUnavailable', () => {
+    it('names why the store cannot answer, and is null when it can', async () => {
+      expect(suspensionStoreUnavailable(depsOf([]))).toBeNull();
+      await store.suspend('site', 'admin');
+      expect(suspensionStoreUnavailable(depsOf([]))).toBeNull();
+      fs.writeFileSync(path.join(dir, 'suspensions.json'), '{ broken');
+      jest.spyOn(console, 'error').mockImplementation();
+      await store.load();
+      expect(suspensionStoreUnavailable(depsOf([]))).toBe('store-unreadable');
+      expect(suspensionStoreUnavailable({ ...depsOf([]), store: new SuspensionStore(path.join(dir, 'other.json')) })).toBe(
+        'not-loaded'
+      );
+    });
+  });
+
+  describe("a record's own host", () => {
+    it('is not claimed against its own app, and is against every other', async () => {
+      await store.suspend('site', 'admin');
+      const claims = hostClaims('dropkit.sh', depsOf([{ name: 'site' }, { name: 'other' }]));
+
+      expect(claimedAgainst(claims, 'site.dropkit.sh', 'site')).toBe(false);
+      expect(claimedAgainst(claims, 'site.dropkit.sh', 'other')).toBe(true);
     });
   });
 
@@ -825,25 +860,46 @@ describe('suspension policy: pins', () => {
     return found;
   }
 
-  /** Every non-test source file outside the router module that calls `.<method>(`, with the method it sits in. */
+  /** Comment lines and trailing line comments removed, so a doc that NAMES a writer is not mistaken for one. */
+  function code(text: string): string {
+    return text.replace(/^\s*(?:\/\*|\*|\/\/).*$/gm, '').replace(/\s\/\/ .*$/gm, '');
+  }
+
+  /**
+   * Every non-test source file outside the router module that mentions one of the route
+   * writers by NAME (a call, an alias, a destructure), with the method it sits in.
+   */
   function routerWriteSites(method: string): string[] {
-    const call = new RegExp(`\\.${method}\\(`, 'g');
+    const mention = new RegExp(`\\b${method}\\b`, 'g');
     const sites: string[] = [];
     for (const file of sourceFiles(srcRoot)) {
       if (/^core\/router\//.test(rel(file))) continue;
-      const text = fs.readFileSync(file, 'utf-8');
-      for (const m of text.matchAll(call)) {
+      const text = code(fs.readFileSync(file, 'utf-8'));
+      for (const m of text.matchAll(mention)) {
         sites.push(`${rel(file)}#${enclosingMethod(text, m.index ?? 0)}`);
       }
     }
     return sites;
   }
 
-  it('a route is written in ONE place: router.addRoute is called only in handleConfigureRoute', () => {
+  it('a route is written in ONE place: router.addRoute is named only in handleConfigureRoute, straight after a synchronous record check', () => {
     expect(routerWriteSites('addRoute')).toEqual(['core/platform.ts#handleConfigureRoute']);
+    const text = fs.readFileSync(path.join(srcRoot, 'core/platform.ts'), 'latin1');
+    const call = text.indexOf('.addRoute(');
+    const check = text.lastIndexOf("refusalForApp(appName)?.reason === 'record'", call);
+    expect(check).toBeGreaterThan(-1);
+    // Between the last check and the write: nothing awaited but the write itself.
+    const between = text.slice(check, call).replace(/const conflict = await this\.router$/, '');
+    expect(between).not.toMatch(/\bawait\b/);
   });
 
-  it('traffic is switched in ONE place: router.setUpstream is called only in cutoverTo, straight after its gate', () => {
+  it('the other route writers have no caller outside the router module', () => {
+    for (const method of ['updateRoute', 'setRouteStatus', 'clearRoutes']) {
+      expect(routerWriteSites(method)).toEqual([]);
+    }
+  });
+
+  it('traffic is switched in ONE place: router.setUpstream is named only in cutoverTo, straight after its gate', () => {
     expect(routerWriteSites('setUpstream')).toEqual(['core/platform.ts#cutoverTo']);
     const text = fs.readFileSync(path.join(srcRoot, 'core/platform.ts'), 'latin1');
     const call = text.indexOf('.setUpstream(');

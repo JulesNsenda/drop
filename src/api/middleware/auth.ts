@@ -20,7 +20,7 @@ import { getMcpResourceUrl, canonicalizeUrl } from '../oauth/metadata';
 // connector-policy.ts's header.
 import { mayUseConnectors } from '../connector-policy';
 import { clearGroupTrustForUser } from '../../managers/app/state-manager';
-import { getLogger } from '../../utils/logger';
+
 
 // Auth configuration
 export interface AuthConfig {
@@ -2627,16 +2627,13 @@ export function appProvisionKeyName(appName: string): string {
 /**
  * Delete all API keys with a given name (used to rotate the CLI local key on restart).
  *
- * Resolves whether the credentials were there to act on: `false` (and a warning
- * naming the key) when they are not loaded yet, so a caller that needs a key gone
- * (the boot's suspension enforcement runs before the API loads them) is not told
- * it succeeded. It stays a resolve, not a throw: with the API off nothing is minted.
+ * Resolves whether the credentials were there to act on: `false` when they are not
+ * loaded (yet, or at all: auth off), so a caller that needs a key gone can tell it
+ * from success and decide whether that matters. It does not log: on a box with auth
+ * off every call would. It stays a resolve, not a throw.
  */
 export async function deleteApiKeysByName(name: string): Promise<boolean> {
-  if (!credentials || !config) {
-    getLogger().warn(`API credentials are not loaded: key '${name}' was not revoked`, 'AUTH');
-    return false;
-  }
+  if (!credentials || !config) return false;
   const kept = credentials.apiKeys.filter((k) => k.name !== name);
   // Nothing to revoke: a converged caller (the suspension pass) must not rewrite the file.
   if (kept.length === credentials.apiKeys.length) return true;

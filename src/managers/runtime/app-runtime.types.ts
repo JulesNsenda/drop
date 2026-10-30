@@ -124,6 +124,11 @@ export interface AppProcessInfo {
   createdAt: Date | null;
   restartedAt: Date | null;
   /**
+   * The directory the process runs from. PM2 ONLY (`pm_cwd`): its daemon lists every
+   * process of the host, so this is how a caller tells DROP's own from someone else's.
+   */
+  cwd?: string;
+  /**
    * Whether the kernel OOM-killed this app, from `State.OOMKilled`.
    *
    * DOCKER ONLY, and only while the container is actually down. DROP runs

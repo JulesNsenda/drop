@@ -151,6 +151,7 @@ export class Pm2Runtime implements AppRuntime {
       restarts: status.restarts,
       createdAt: status.createdAt,
       restartedAt: status.restartedAt,
+      cwd: status.cwd,
     };
   }
 }

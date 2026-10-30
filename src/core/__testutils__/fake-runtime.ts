@@ -57,8 +57,8 @@ export class FakeRuntime implements AppRuntime {
   }
 
   /** Test helper: seed a "surviving" process (e.g. to model PM2 state before a platform restart). */
-  seedRunning(name: string, port: number): void {
-    this.apps.set(name, this.buildInfo(name, port));
+  seedRunning(name: string, port: number, cwd?: string): void {
+    this.apps.set(name, { ...this.buildInfo(name, port), ...(cwd ? { cwd } : {}) });
   }
 
   setLiveInstance(appName: string, slot: InstanceSlot): void {
@@ -94,7 +94,7 @@ export class FakeRuntime implements AppRuntime {
   async start(spec: AppStartSpec): Promise<AppProcessInfo> {
     this.startCount += 1;
     const instance = spec.instance ?? spec.name;
-    const info = this.buildInfo(instance, spec.port ?? null);
+    const info = { ...this.buildInfo(instance, spec.port ?? null), cwd: spec.cwd };
     this.apps.set(instance, info);
     return { ...info };
   }

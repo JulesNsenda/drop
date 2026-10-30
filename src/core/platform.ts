@@ -242,7 +242,8 @@ import {
   isStillEnforced,
   routeWithdrawalFor,
   recordedNames,
-  ambiguousKeylessRecords,
+  suspendedOrphans,
+  suspensionStoreUnavailable,
   settleSetFor,
   claimedAgainst,
   refusalCauseOf,
@@ -1059,6 +1060,8 @@ export class DropPlatform {
   private suspensionSweep: Promise<void> | null = null;
   /** A call arrived while the pass was running: it earns exactly one more. */
   private suspensionAgain = false;
+  /** Boot only: the credentials are not loaded yet, so the pass leaves key revocation to `revokeSuspendedKeys`. */
+  private keyRevokeDeferred = false;
   /** A sweep was requested while one was running: go round once more, it may have missed the new work. */
   private storageSweepAgain = false;
   /** Set when `stop()` begins: the object-storage sweep starts nothing new and winds down. */
@@ -1496,11 +1499,6 @@ export class DropPlatform {
       // Start API server if enabled
       if (this.config.enableApi) {
         await this.startApiServer();
-        // The credentials load only inside the API server, so the boot pass before
-        // Caddy could not revoke a suspended app's minted key. Once more now that they
-        // are there: idempotent, and quiet about an app that is busy being reconciled
-        // (the periodic pass catches it).
-        await this.enforceSuspensions({ quiet: true });
       }
 
       // Start certificate expiry monitoring if HTTPS is enabled
@@ -2672,6 +2670,9 @@ backup:
     });
 
     await this.apiServer.initialize();
+    // The credentials are loaded and nothing is listening yet: the one window in which a
+    // suspended app's minted key can be revoked before any request can use it.
+    await this.revokeSuspendedKeys();
     await this.apiServer.start();
 
     // Expose restart/start orchestration to the API routes via the
@@ -5599,6 +5600,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       return;
     }
 
+    // DROP's own service name in the runtime: an app by that name would be taken for the
+    // platform by everything that matches runtime processes by name (as `isNameTaken` says).
+    if (payload.name.toLowerCase() === DROP_SERVICE_NAME) {
+      this.logger.warn(`Not onboarding '${payload.name}': the name is reserved for the platform's own service`, 'DEPLOY');
+      return;
+    }
+
     // Decided BEFORE the drop.yaml is read, so a container-shaped tree under a
     // suspended name is not intercepted and expanded into children either.
     const suspendedHere = suspendedUpdateRefusal(payload.name) !== null;
@@ -6624,12 +6632,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   ): Promise<void> {
     if (!this.router || !port) return;
 
-    // THE only caller of `router.addRoute` (a test pins it), so this is the one place
-    // that decides a route is never written for an app a suspension record holds: no
-    // block, no persisted hostname. The EXACT attribution, not the start gate's, and
-    // nothing at all while the store cannot answer: an unreadable file withdraws no
-    // route. Withdrawing an existing route is `reconfigureRoute`'s and the take-down's.
-    if (routeWithdrawalFor(appName)) {
+    // The one writer of routes (a test pins it), so this is where a route is withheld
+    // for an app a suspension record holds: no block, no persisted hostname. The ADD
+    // gate reads the record the way the start gate does (a case variant is refused
+    // too: an extra missing route is the safe error), and only a RECORD counts, so an
+    // unreadable store keeps adding. WITHDRAWING a route is `reconfigureRoute`'s and
+    // the take-down's, which use the exact attribution.
+    if (refusalForApp(appName)?.reason === 'record') {
       this.logger.info(`Not routing ${appName}: it is suspended`, 'ROUTER');
       return;
     }
@@ -7028,6 +7037,12 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         // Route key: '/' can appear in neither a folder name nor a hostname, so
         // distinct (app, host) pairs can never share a key. Lowercased, so case
         // variants of one host are one route rather than two Caddy site blocks.
+        // Synchronous, directly before the write (a test pins that nothing is awaited
+        // between): a record that landed during the awaits above must not get a route.
+        if (refusalForApp(appName)?.reason === 'record') {
+          this.logger.info(`Not routing ${appName}: it was suspended while its route was being configured`, 'ROUTER');
+          return;
+        }
         const conflict = await this.router.addRoute({
           appName: `${appName}/${hostname.toLowerCase()}`,
           owner: appName, // Bare owning app name — lets removeRoutesForApp find every route this app owns
@@ -7300,6 +7315,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * `PlatformOps.reconfigureRoute` for why this exists.
    */
   private async reconfigureRoute(appName: string): Promise<void> {
+    // A suspended app's routes are withdrawn, not rewritten, and BEFORE the busy
+    // check: a deploy in flight must not leave a route that was meant to go (the
+    // add gate keeps that deploy from writing one). The exact attribution.
+    if (routeWithdrawalFor(appName)) {
+      await this.router?.removeRoutesForApp(appName);
+      this.logger.info(`Withdrew the routes of ${appName}: it is suspended`, 'ROUTER');
+      return;
+    }
     // Not isBusy: an upload writes the folder, never a route, and refusing here
     // would leave a route that was meant to be withdrawn live.
     if (this.appsInProgress.has(appName) || this.gitReserved.has(appName)) {
@@ -7313,13 +7336,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Hold the guard for the duration, like every other lifecycle path.
     this.appsInProgress.add(appName);
     try {
-      // A suspended app's routes are withdrawn, not rewritten (and with no port too:
-      // a route can outlive the port it was written for).
-      if (routeWithdrawalFor(appName)) {
-        await this.router?.removeRoutesForApp(appName);
-        this.logger.info(`Withdrew the routes of ${appName}: it is suspended`, 'ROUTER');
-        return;
-      }
       // AppConfig is the source of truth for ports (see the two-phase
       // reconciliation in syncStateWithConfigs); AppState is the fallback for
       // an app whose config has not been written yet.
@@ -10159,7 +10175,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       await attempt('close the deploy episode', () => this.failDeployEpisode(appName, new Error(shown), undefined, code));
     }
     await attempt('close the runtime-log window', () => this.noteRuntimeLogEnd(appName));
-    await attempt('revoke the provisioning key', () => deleteApiKeysByName(appProvisionKeyName(appName)));
+    await attempt('revoke the provisioning key', () => this.revokeProvisionKey(appName));
     // A platform that is stopping owns its own shutdown of the state: no write.
     if (this.stopping) return code;
     // Read again for the STATUS: the closing steps above awaited, and a suspension's own
@@ -10246,7 +10262,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
     if (opts.revokeKey) {
       try {
-        await deleteApiKeysByName(appProvisionKeyName(appName));
+        await this.revokeProvisionKey(appName);
       } catch (err) {
         errors.push(`api key: ${err instanceof Error ? err.message : 'revoke failed'}`);
       }
@@ -12492,6 +12508,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       do {
         this.suspensionAgain = false;
         await this.runSuspensionEnforcement(opts);
+        // The runtime-only half: an instance a record names that nothing of ours knows.
+        await this.removeSuspendedOrphans().catch((err) =>
+          this.logger.warn(
+            `Could not remove suspended orphans: ${err instanceof Error ? err.message : String(err)}`,
+            'SUSPEND'
+          )
+        );
       } while (this.suspensionAgain && !this.stopping);
     })().finally(() => {
       this.suspensionSweep = null;
@@ -12504,15 +12527,20 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const state = this.stateManager;
     const runtime = this.runtime;
     if (!runtime || !state) return;
+    // A store that cannot answer fails OPEN for serving (starts are refused, but no route
+    // is withdrawn and nothing is taken down): say so every pass, not once.
+    const unavailable = suspensionStoreUnavailable();
+    if (unavailable) {
+      this.logger.error(
+        `The suspension store is ${unavailable === 'store-unreadable' ? 'unreadable' : 'not loaded'}: suspensions are NOT enforced for serving ` +
+          '(no route withdrawn, no instance taken down); repair or delete suspensions.json and restart',
+        'SUSPEND'
+      );
+      return;
+    }
     let targets: Map<string, string>;
     try {
       targets = enforcementTargets();
-      for (const name of ambiguousKeylessRecords()) {
-        this.logger.warn(
-          `Suspension record '${name}' has no recorded app name and matches more than one app ignoring case: it is enforced against none`,
-          'SUSPEND'
-        );
-      }
     } catch (err) {
       this.logger.warn(
         `Could not work out which apps a suspension holds: ${err instanceof Error ? err.message : String(err)}`,
@@ -12569,30 +12597,33 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
   /**
    * Boot enforcement: make the suspension records true before Caddy starts, so a
-   * restart never serves a suspended app. Called after `syncStateWithProcesses`
-   * (which writes 'running' for whatever the runtime still has up) and after the
-   * router exists, before the proxy, the watcher and the API.
+   * restart never leaves a suspended app's process running. Called after
+   * `syncStateWithProcesses` (which writes 'running' for whatever the runtime still
+   * has up) and after the router exists, before the proxy, the watcher and the API.
+   * `enforceSuspensions` does both halves: the targets that have state or config,
+   * and the ORPHANS (see `removeSuspendedOrphans`). Nothing is busy at boot, so a
+   * busy target is a warning.
    *
-   *  a. `enforceSuspensions` over every target that has state or config. Nothing is
-   *     busy at boot, so a busy target is a warning.
-   *  b. the ORPHANS: runtime instances a record names that the platform has no
-   *     state or config for (deleted while suspended, or left by a crash), which
-   *     the pass cannot see because it takes targets from records and state, never
-   *     from the runtime. Exact names only, never DROP's own service, both slots,
-   *     each under the same reservation as the pass.
+   * What this protects is the PROCESS (it answers on its direct port and holds its
+   * env key). The route control is the add gate in `handleConfigureRoute`: the
+   * managed Caddyfile is reset to the import-only template at EVERY start
+   * (`ensureCaddyfile`), so no stale block survives a restart except on an adopted
+   * Caddy whose reload fails. Nothing here regenerates the Caddyfile (the router is
+   * not seeded from disk, and a regenerate would truncate every other app's routes).
    *
-   * It does NOT regenerate the Caddyfile: the router is not seeded from disk, so
-   * a regenerate would truncate every other app's routes. A stale block of a
-   * suspended app is an inert 502 until the next legitimate route write, and the
-   * app's config keeps its port reserved so nothing else can take it. Key
-   * revocation needs the credentials the API loads later: `start()` runs the pass
-   * again after the API is up. Never throws: a failure must not stop the boot, and
-   * the periodic pass retries.
+   * Minted keys cannot be revoked yet: the credentials load only in
+   * `ApiServer.initialize`. `revokeSuspendedKeys` does that between the load and
+   * the API listening, so the pass defers its own revoke (`keyRevokeDeferred`).
+   * Never throws: a failure must not stop the boot, and the periodic pass retries.
    */
   private async enforceSuspensionsAtBoot(): Promise<void> {
+    if (!this.keysCanExist()) {
+      this.logger.info('API authentication is off: there are no minted keys to revoke for suspended apps', 'SUSPEND');
+    } else {
+      this.keyRevokeDeferred = true;
+    }
     try {
       await this.enforceSuspensions({ quiet: false });
-      await this.removeSuspendedOrphans();
     } catch (err) {
       this.logger.warn(
         `Could not enforce suspensions at boot: ${err instanceof Error ? err.message : String(err)}`,
@@ -12601,21 +12632,71 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     }
   }
 
-  /** The orphan half of the boot enforcement; see `enforceSuspensionsAtBoot`. */
+  /** Whether an app's minted DROP_API_KEY can exist at all: the API runs and authenticates. */
+  private keysCanExist(): boolean {
+    return this.config.enableApi && this.config.enableApiAuth;
+  }
+
+  /**
+   * Revoke an app's minted key. Throws when it could not be (the credentials are
+   * not loaded) unless no key can exist, or the boot has deferred revocation to
+   * `revokeSuspendedKeys`; the callers report the throw.
+   */
+  private async revokeProvisionKey(appName: string): Promise<void> {
+    if (this.keyRevokeDeferred) return;
+    const done = await deleteApiKeysByName(appProvisionKeyName(appName));
+    if (!done && this.keysCanExist()) throw new Error('revoke deferred (credentials not loaded)');
+  }
+
+  /**
+   * Revoke the minted key of EVERY recorded name (record names, what runs under
+   * them, and names with no app behind them), after the API has loaded the
+   * credentials and before it listens. Needs no reservation and skips nobody for
+   * being busy: a revoke touches only the credential store. Best-effort per name.
+   */
+  private async revokeSuspendedKeys(): Promise<void> {
+    this.keyRevokeDeferred = false;
+    for (const name of recordedNames()) {
+      try {
+        if (!(await deleteApiKeysByName(appProvisionKeyName(name))) && this.keysCanExist()) {
+          this.logger.warn(`Could not revoke the key of suspended app '${name}': credentials are not loaded`, 'SUSPEND');
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Could not revoke the key of suspended app '${name}': ${err instanceof Error ? err.message : String(err)}`,
+          'SUSPEND'
+        );
+      }
+    }
+  }
+
+  /** Whether a runtime instance is DROP's own, as far as the runtime can tell. */
+  private ownsRuntimeInstance(proc: AppProcessInfo): boolean {
+    // Docker: `delete` itself refuses a container without DROP's label.
+    if (proc.runtime !== 'pm2') return true;
+    // PM2 lists every process of the daemon: DROP's only if it runs from an app or release tree.
+    if (!proc.cwd) return false;
+    const roots = [this.config.appsDirectory, path.join(this.config.dropRoot, 'data', 'releases')];
+    return roots.some((root) => {
+      const rel = path.relative(root, proc.cwd as string);
+      return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+    });
+  }
+
+  /**
+   * The ORPHANS: runtime instances a record names that the platform has no state
+   * or config for (an app deleted while suspended, or left by a crash), which the
+   * pass cannot see because it takes its targets from records and state, never
+   * from the runtime. Exact names only (`suspendedOrphans`, never DROP's own
+   * service), DROP's own processes only (`ownsRuntimeInstance`), both slots, each
+   * under the same reservation as the pass, then verified by listing again.
+   */
   private async removeSuspendedOrphans(): Promise<void> {
     const runtime = this.runtime;
-    const state = this.stateManager;
-    if (!runtime || !state) return;
-    // Empty while the store is unreadable: a corrupt file deletes nothing.
-    if (recordedNames().size === 0) return;
-    const orphans = new Set<string>();
+    if (!runtime || !this.stateManager) return;
+    let all: AppProcessInfo[];
     try {
-      for (const p of await runtime.getAllStatus()) {
-        const app = appNameOfInstance(p.instance ?? p.name);
-        if (app.toLowerCase() === DROP_SERVICE_NAME) continue;
-        if (state.getApp(app) || this.appConfigService?.getConfig(app)) continue;
-        if (recordedNames().has(app)) orphans.add(app);
-      }
+      all = await runtime.getAllStatus();
     } catch (err) {
       this.logger.warn(
         `Could not list the runtime for suspended orphans: ${err instanceof Error ? err.message : String(err)}`,
@@ -12623,15 +12704,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       );
       return;
     }
-    for (const app of orphans) {
+    const byName = new Map<string, AppProcessInfo[]>();
+    for (const p of all) {
+      const app = appNameOfInstance(p.instance ?? p.name);
+      byName.set(app, [...(byName.get(app) ?? []), p]);
+    }
+    const deleted: string[] = [];
+    for (const app of suspendedOrphans(byName.keys())) {
+      if (this.stopping) return;
+      if (!byName.get(app)!.every((p) => this.ownsRuntimeInstance(p))) continue;
       if (this.isBusy(app)) {
-        this.logger.warn(`Suspended orphan '${app}' is busy and was not removed at boot`, 'SUSPEND');
+        this.logger.warn(`Suspended orphan '${app}' is busy and was not removed`, 'SUSPEND');
         continue;
       }
       this.appsInProgress.add(app);
       try {
         // Re-asked on the line before it acts, as the pass does.
-        if (!recordedNames().has(app)) continue;
+        if (!suspendedOrphans([app]).has(app)) continue;
         this.logger.warn(
           `Deleting the runtime instances of suspended app '${app}': a record names it and nothing else of ours does`,
           'SUSPEND'
@@ -12647,9 +12736,22 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
             );
           }
         }
+        deleted.push(app);
       } finally {
         this.appsInProgress.delete(app);
       }
+    }
+    if (deleted.length === 0) return;
+    try {
+      const left = new Set((await runtime.getAllStatus()).map((p) => appNameOfInstance(p.instance ?? p.name)));
+      for (const app of deleted) {
+        if (left.has(app)) this.logger.warn(`Suspended orphan '${app}' is still present after delete`, 'SUSPEND');
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Could not verify the removal of suspended orphans: ${err instanceof Error ? err.message : String(err)}`,
+        'SUSPEND'
+      );
     }
   }
 

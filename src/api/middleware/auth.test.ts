@@ -619,13 +619,13 @@ describe('deleteApiKeysByName and deleteApiKey', () => {
     await fs.rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
-  it('reports, rather than claims success, when the credentials are not loaded', async () => {
+  it('resolves false, without logging, when the credentials are not loaded', async () => {
     resetAuth();
     const warn = jest.spyOn(getLogger(), 'warn').mockImplementation();
 
     await expect(deleteApiKeysByName('app:site:provision')).resolves.toBe(false);
 
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("'app:site:provision'"), 'AUTH');
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it('resolves true once the credentials are there, whether or not a key had that name', async () => {
