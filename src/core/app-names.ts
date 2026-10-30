@@ -15,6 +15,7 @@ import type { AppStateManager } from '../managers/app/state-manager';
 import type { AppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore } from '../managers/suspension';
 import { DROP_SERVICE_NAME } from '../utils/service-name';
+import { collidesWithPlatformContainer } from '../managers/runtime/platform-containers';
 
 /**
  * Existing APP names (state and config) that equal `name` ignoring case but are
@@ -68,6 +69,8 @@ export function isNameTaken(
   // An unreadable suspension store cannot say which names it holds. (An UNLOADED one is not
   // treated the same: it is an early-boot state, and every test that never loads it would refuse.)
   if (getSuspensionStore().refusalFor(name) === 'store-unreadable') return true;
+  // Under docker isolation an app's container is `drop-<name>`; `redis` would be the bundled Redis.
+  if (collidesWithPlatformContainer(name)) return true;
   const wanted = name.toLowerCase();
   const same = (other: string | undefined): boolean => other?.toLowerCase() === wanted;
   const own = deps.ownGroup?.toLowerCase();
