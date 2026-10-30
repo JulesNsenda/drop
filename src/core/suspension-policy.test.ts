@@ -16,6 +16,9 @@ import { resetAppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore, resetSuspensionStore } from '../managers/suspension';
 import {
   childrenOf,
+  enforcementTargets,
+  isStillEnforced,
+  settleSetFor,
   claimedAgainst,
   hostClaims,
   refusalCauseOf,
@@ -403,6 +406,83 @@ describe('suspension policy: refusalForApp', () => {
     it('never includes another container of the same group', () => {
       const apps = [container('site'), container('site-two', { group: 'site' }), { name: 'site-web', group: 'site' }];
       expect(childrenOf('site', depsOf(apps))).toEqual(['site-web']);
+    });
+  });
+
+  describe('childrenOf is exact for anything destructive', () => {
+    it('an untrusted container still does not reach a case-variant group, and a stamped child is its stamp\'s alone', () => {
+      const apps = [
+        { ...container('Mono'), groupTrusted: false },
+        { name: 'theirs', group: 'mono' },
+        { name: 'mine', group: 'Mono' },
+        container('Mono2', { group: 'Mono' }),
+        { name: 'stamped', group: 'Mono', groupContainer: 'Mono2', cfgGroup: 'Mono' },
+      ];
+      expect(childrenOf('Mono', depsOf(apps))).toEqual(['mine']);
+      expect(childrenOf('Mono2', depsOf(apps))).toContain('stamped');
+    });
+  });
+
+  describe('stampOnly keeps a state container the stateless stamp would strip', () => {
+    it('a folder-dropped stamp (no state entry) beside a state container with an exact group match', () => {
+      const apps = [
+        container('Mono'),
+        { name: 'kid', group: 'Mono', groupContainer: 'dropped' },
+        { name: 'dropped', configOnly: true },
+      ];
+      // 'dropped' has no state entry; 'Mono' is a state container and kid's group matches it exactly.
+      expect(childrenOf('Mono', depsOf(apps))).toEqual(['kid']);
+      expect(childrenOf('dropped', depsOf(apps))).toEqual(['kid']);
+    });
+  });
+
+  describe('enforcementTargets and isStillEnforced', () => {
+    it('a record names its own app only when one is known by exactly that name, plus its children', async () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'bystander' }];
+      await store.suspend('site', 'admin');
+      await store.suspend('drop-platform', 'admin');
+      await store.suspend('Bystander', 'admin');
+
+      const targets = enforcementTargets(depsOf(apps));
+
+      expect([...targets].sort()).toEqual([
+        ['site', 'site'],
+        ['site-web', 'site'],
+      ]);
+    });
+
+    it('is empty while the store is unreadable', async () => {
+      await store.suspend('site', 'admin');
+      fs.writeFileSync(path.join(dir, 'suspensions.json'), '{ broken');
+      jest.spyOn(console, 'error').mockImplementation();
+      await store.load();
+
+      expect(enforcementTargets(depsOf([container('site')])).size).toBe(0);
+    });
+
+    it('isStillEnforced follows the record and the attribution', async () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'other' }];
+      await store.suspend('site', 'admin');
+      const deps = depsOf(apps);
+
+      expect(isStillEnforced('site', deps)).toBe(true);
+      expect(isStillEnforced('site-web', deps)).toBe(true);
+      expect(isStillEnforced('other', deps)).toBe(false);
+      // Held by a second record too: lifting one leaves it enforced.
+      await store.suspend('site-web', 'admin');
+      await store.unsuspend('site');
+      expect(isStillEnforced('site-web', deps)).toBe(true);
+      await store.unsuspend('site-web');
+      expect(isStillEnforced('site-web', deps)).toBe(false);
+    });
+
+    it('settleSetFor: the app, what runs under it, and its container', () => {
+      const apps = [container('site'), { name: 'site-web', group: 'site' }, { name: 'other' }];
+      const deps = depsOf(apps);
+
+      expect(settleSetFor('site', deps).sort()).toEqual(['site', 'site-web']);
+      expect(settleSetFor('site-web', deps).sort()).toEqual(['site', 'site-web']);
+      expect(settleSetFor('other', deps)).toEqual(['other']);
     });
   });
 

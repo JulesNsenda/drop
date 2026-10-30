@@ -39,6 +39,12 @@ describe('isNameTaken', () => {
     }
   });
 
+  it("reserves the platform's own runtime process name, ignoring case", () => {
+    expect(check('drop-platform')).toBe(true);
+    expect(check('Drop-Platform')).toBe(true);
+    expect(check('drop-platform-two')).toBe(false);
+  });
+
   it('reserves the bundled Redis container name, ignoring case, for a non-admin create', async () => {
     for (const name of ['redis', 'Redis', 'REDIS']) {
       expect(check(name)).toBe(true);

@@ -29,7 +29,7 @@ import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } fro
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
 import { getPlatformOps } from '../platform-ops';
-import { refusalForApp } from '../../core/suspension-policy';
+import { refusalForApp, childrenOf } from '../../core/suspension-policy';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import {
   getObjectStorageProvisioner,
@@ -315,7 +315,8 @@ admin.post('/apps/:name/suspend', async (c) => {
   const stateManager = getStateManager();
   const app = stateManager.getApp(appName);
 
-  if (!app) {
+  // A folder-dropped container has no state entry of its own, only children.
+  if (!app && childrenOf(appName).length === 0) {
     return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' not found`), 404);
   }
 

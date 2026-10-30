@@ -242,7 +242,7 @@ describe('app suspension (platform, Item 1)', () => {
       const result = await platform.suspendApp('site', 'admin-1');
 
       expect(result).toMatchObject({ suspended: true });
-      expect((result as { stopErrors?: string[] }).stopErrors).toEqual(['site: still present after delete']);
+      expect((result as { stopErrors?: string[] }).stopErrors).toEqual(['site.a: still present after delete']);
       // The suspension holds regardless.
       expect(getSuspensionStore().refusalFor('site') !== null).toBe(true);
     }, 20000);
@@ -259,7 +259,7 @@ describe('app suspension (platform, Item 1)', () => {
       expect((result as { stopErrors?: string[] }).stopErrors).toEqual([
         'site.a: pm2 down',
         'site.b: pm2 down',
-        'site: still present after delete',
+        'site.a: still present after delete',
       ]);
     }, 20000);
 
@@ -308,8 +308,8 @@ describe('app suspension (platform, Item 1)', () => {
       const result = await platform.suspendApp('mono', 'admin-1');
 
       expect((result as { stopErrors?: string[] }).stopErrors).toEqual([
-        'mono-api: mono-api: still present after delete',
-        'mono-web: mono-web: still present after delete',
+        'mono-api.a: still present after delete',
+        'mono-web.a: still present after delete',
       ]);
     }, 30000);
 
@@ -340,16 +340,251 @@ describe('app suspension (platform, Item 1)', () => {
       const api = getStateManager().getApp('mono-api')!;
       expect(api.status).toBe('stopped');
       expect(api.error).toBeUndefined();
-      expect(getStateManager().getApp('mono')?.error).toBeUndefined();
+      // The container itself is still frozen by its service's record, so it keeps its text.
+      expect(getStateManager().getApp('mono')?.error).toBe('Suspended by admin');
       // Still refused by its own record: left as suspended.
       expect(getStateManager().getApp('mono-web')?.error).toBe('Suspended by admin');
       expect(fakeRuntime.startCount).toBe(starts);
       expect(fakeRuntime.runningNames()).toEqual(['other']);
     }, 30000);
 
+    it('a service whose take-down throws is reported by name and the others still go down', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deployGroup();
+      const original = (platform as unknown as { takeAppDown: (n: string, o: object) => Promise<string[]> }).takeAppDown.bind(
+        platform
+      );
+      jest
+        .spyOn(platform as unknown as { takeAppDown: (n: string, o: object) => Promise<string[]> }, 'takeAppDown')
+        .mockImplementation(async (n: string, o: object) => {
+          if (n === 'mono-api') throw new Error('boom');
+          return original(n, o);
+        });
+
+      const result = await platform.suspendApp('mono', 'admin-1');
+
+      expect((result as { stopErrors?: string[] }).stopErrors).toEqual(['mono-api: boom']);
+      expect(fakeRuntime.runningNames().sort()).toEqual(['mono-api', 'other']);
+    }, 30000);
+
+    it('a container redeploy through the expansion path is refused naming the suspended service, and rebuilds no child', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deployGroup();
+      await platform.suspendApp('mono-api', 'admin-1');
+      const appPath = path.join(webappsDir, 'mono');
+      await fs.mkdir(path.join(appPath, 'web'), { recursive: true });
+      await fs.writeFile(path.join(appPath, 'web', 'index.html'), '<h1>web</h1>');
+      const build = jest.spyOn((platform as unknown as { builder: { build: () => Promise<unknown> } }).builder, 'build');
+      const starts = fakeRuntime.startCount;
+
+      const out = await (
+        platform as unknown as { expandMonorepo: (p: string, n: string, c: unknown) => Promise<unknown> }
+      ).expandMonorepo(appPath, 'mono', { services: { web: { path: 'web', type: 'static' } } });
+
+      expect(out).toMatchObject({ suspended: 'record', via: 'mono-api' });
+      expect(build).not.toHaveBeenCalled();
+      expect(fakeRuntime.startCount).toBe(starts);
+    }, 30000);
+
+    it("lifting a service's record settles its container too, once nothing else holds it", async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deployGroup();
+      await platform.suspendApp('mono-api', 'admin-1');
+      await getStateManager().setAppStatus('mono', 'stopped', { error: 'Suspended by admin' });
+
+      await platform.unsuspendApp('mono-api');
+
+      expect(getStateManager().getApp('mono')?.error).toBeUndefined();
+      expect(getStateManager().getApp('mono-api')?.error).toBeUndefined();
+    }, 30000);
+
+    it('unsuspending leaves the state of a service that is somehow still live alone', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deployGroup();
+      jest.spyOn(fakeRuntime, 'delete').mockImplementation(async () => undefined);
+      await platform.suspendApp('mono', 'admin-1');
+      // Still live: the real status is kept and only the suspension text goes.
+      await getStateManager().updateApp('mono-api', { status: 'running' });
+
+      await platform.unsuspendApp('mono');
+
+      expect(getStateManager().getApp('mono-api')?.status).toBe('running');
+      expect(getStateManager().getApp('mono-api')?.error).toBeUndefined();
+      expect(getStateManager().getApp('mono')?.error).toBeUndefined();
+    }, 30000);
+
     describe('the periodic reconcile', () => {
       const reconcile = (): Promise<void> =>
-        (platform as unknown as { reconcileSuspensions: () => Promise<void> }).reconcileSuspensions();
+        (platform as unknown as { enforceSuspensions: (o: { quiet: boolean }) => Promise<void> }).enforceSuspensions({
+          quiet: true,
+        });
+
+      it('retries a revoke that failed during the suspension', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        jest.spyOn(authModule, 'deleteApiKeysByName').mockRejectedValueOnce(new Error('store busy'));
+        const result = await platform.suspendApp('site', 'admin-1');
+        expect((result as { stopErrors?: string[] }).stopErrors).toEqual(['api key: store busy']);
+        const revoke = jest.spyOn(authModule, 'deleteApiKeysByName');
+        revoke.mockClear();
+
+        await reconcile();
+
+        expect(revoke).toHaveBeenCalledWith('app:site:provision');
+      }, 20000);
+
+      it('never takes down a runtime-only process under a recorded name (it is not an app of ours)', async () => {
+        platform = makePlatform();
+        await platform.start();
+        fakeRuntime.seedRunning('drop-platform', 4555);
+        await getSuspensionStore().suspend('drop-platform', 'admin-1');
+
+        await reconcile();
+
+        expect(fakeRuntime.runningNames()).toEqual(['drop-platform']);
+      }, 20000);
+
+      it('a converged pass writes nothing', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await platform.suspendApp('site', 'admin-1');
+        await reconcile();
+        const sm = getStateManager();
+        const save = jest.spyOn(sm as unknown as { scheduleSave: () => void }, 'scheduleSave');
+        const setStatus = jest.spyOn(sm, 'setAppStatus');
+
+        await reconcile();
+
+        expect(setStatus).not.toHaveBeenCalled();
+        expect(save).not.toHaveBeenCalled();
+        expect(fakeRuntime.runningNames()).toEqual([]);
+      }, 20000);
+
+      it('stop() waits for a pass in flight', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await getSuspensionStore().suspend('site', 'admin-1');
+        const priv = platform as unknown as { takeAppDown: (n: string, o: object) => Promise<string[]> };
+        const original = priv.takeAppDown.bind(platform);
+        let release: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let entered = false;
+        jest.spyOn(priv, 'takeAppDown').mockImplementation(async (n: string, o: object) => {
+          entered = true;
+          await gate;
+          return original(n, o);
+        });
+        const pass = reconcile();
+        await waitFor(() => entered);
+
+        let stopped = false;
+        const stopping = platform.stop().then(() => {
+          stopped = true;
+        });
+        await new Promise((r) => setTimeout(r, 300));
+        expect(stopped).toBe(false);
+
+        release();
+        await pass;
+        await stopping;
+        expect(stopped).toBe(true);
+      }, 30000);
+
+      it('a call during a running pass earns exactly one more pass', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await getSuspensionStore().suspend('site', 'admin-1');
+        const priv = platform as unknown as {
+          takeAppDown: (n: string, o: object) => Promise<string[]>;
+          enforceSuspensions: (o: { quiet: boolean }) => Promise<void>;
+        };
+        const original = priv.takeAppDown.bind(platform);
+        let release: () => void = () => undefined;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let calls = 0;
+        jest.spyOn(priv, 'takeAppDown').mockImplementation(async (n: string, o: object) => {
+          calls++;
+          if (calls === 1) await gate;
+          return original(n, o);
+        });
+        const first = priv.enforceSuspensions({ quiet: true });
+        await waitFor(() => calls === 1);
+        const second = priv.enforceSuspensions({ quiet: true });
+        expect(second).toBe(first);
+        release();
+        await second;
+
+        expect(calls).toBe(2);
+      }, 30000);
+
+      it('a busy target is skipped, never acted on unreserved', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await getSuspensionStore().suspend('site', 'admin-1');
+        (platform as unknown as { appsInProgress: Set<string> }).appsInProgress.add('site');
+        const priv = platform as unknown as { enforceSuspensions: (o: { quiet: boolean }) => Promise<void> };
+
+        await priv.enforceSuspensions({ quiet: false });
+
+        expect(fakeRuntime.runningNames()).toEqual(['site']);
+        (platform as unknown as { appsInProgress: Set<string> }).appsInProgress.delete('site');
+      }, 20000);
+
+      it('one target throwing does not stop the next', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deployGroup();
+        await getSuspensionStore().suspend('mono', 'admin-1');
+        const priv = platform as unknown as { takeAppDown: (n: string, o: object) => Promise<string[]> };
+        const original = priv.takeAppDown.bind(platform);
+        jest.spyOn(priv, 'takeAppDown').mockImplementation(async (n: string, o: object) => {
+          if (n === 'mono-api') throw new Error('boom');
+          return original(n, o);
+        });
+
+        await reconcile();
+
+        expect(fakeRuntime.runningNames().sort()).toEqual(['mono-api', 'other']);
+      }, 30000);
+
+      it('is single-flight: a second call returns the pass in flight', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deploy('site');
+        await getSuspensionStore().suspend('site', 'admin-1');
+
+        const first = reconcile();
+        const second = reconcile();
+
+        expect(second).toBe(first);
+        await first;
+      }, 20000);
+
+      it('does not reach a case-variant group of another owner even when the container is untrusted', async () => {
+        platform = makePlatform();
+        await platform.start();
+        await deployGroup();
+        await deploy('stranger');
+        await getStateManager().updateApp('stranger', { group: 'MONO' });
+        await getStateManager().updateApp('mono', { groupTrusted: false });
+
+        await platform.suspendApp('mono', 'admin-1');
+
+        expect(fakeRuntime.runningNames().sort()).toEqual(['other', 'stranger']);
+      }, 30000);
 
       it('retries a take-down that failed', async () => {
         platform = makePlatform();
@@ -366,10 +601,10 @@ describe('app suspension (platform, Item 1)', () => {
         expect(fakeRuntime.runningNames()).toEqual(['other']);
         expect(revoke).toHaveBeenCalledWith('app:mono-api:provision');
         expect(getStateManager().getApp('mono-web')?.status).toBe('stopped');
-        // Idempotent: a second pass finds nothing to do.
-        revoke.mockClear();
+        // Idempotent: a second pass changes nothing.
         await reconcile();
-        expect(revoke).not.toHaveBeenCalled();
+        expect(fakeRuntime.runningNames()).toEqual(['other']);
+        expect(getStateManager().getApp('mono-web')?.status).toBe('stopped');
       }, 30000);
 
       it('skips an app that is mid-operation', async () => {

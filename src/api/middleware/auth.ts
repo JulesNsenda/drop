@@ -19,6 +19,7 @@ import { getMcpResourceUrl, canonicalizeUrl } from '../oauth/metadata';
 // so co-locating the helper there would make the pair cyclic. See
 // connector-policy.ts's header.
 import { mayUseConnectors } from '../connector-policy';
+import { clearGroupTrustForUser } from '../../managers/app/state-manager';
 
 // Auth configuration
 export interface AuthConfig {
@@ -976,7 +977,22 @@ export async function deleteUser(userId: string): Promise<boolean> {
     credentials.externalIdentities = identities.filter((i) => i.userId !== userId);
   }
   await saveCredentials(config.credentialsPath, credentials);
+  await forgetGroupTrustOf(userId);
   return true;
+}
+
+/**
+ * A monorepo container's persisted `groupTrusted` was decided for the owner it
+ * had. When that owner's standing ends (a role change, a disable, a deletion) the
+ * decision is forgotten. Best-effort: the account change has already been saved,
+ * and a failure here only leaves the (gating) decision in place.
+ */
+async function forgetGroupTrustOf(userId: string): Promise<void> {
+  try {
+    await clearGroupTrustForUser(userId);
+  } catch (err) {
+    console.error(`[Auth] Could not clear the monorepo trust of user ${userId}: ${err instanceof Error ? err.message : err}`);
+  }
 }
 
 /** Set after the first 'corrupt' read in this process, so the evidence is written once. */
@@ -1346,6 +1362,7 @@ export async function suspendUser(userId: string): Promise<boolean> {
   if (user.role === 'admin') throw new Error('Cannot suspend an admin account');
   setUserEnabled(user, false);
   await saveCredentials(config.credentialsPath, credentials);
+  await forgetGroupTrustOf(userId);
   return true;
 }
 
@@ -1392,6 +1409,9 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
     throw new Error(PASSWORDLESS_ADMIN_REFUSAL);
   }
 
+  // Read before the writes below: only an ACTUAL change of standing forgets a container's trust.
+  const standingEnded =
+    (updates.role !== undefined && updates.role !== user.role) || (updates.enabled === false && user.enabled !== false);
   if (updates.enabled !== undefined) setUserEnabled(user, updates.enabled);
   if (updates.role) {
     // A LOWERING of rank invalidates sessions and connector grants issued
@@ -1406,6 +1426,7 @@ export async function updateUser(userId: string, updates: { enabled?: boolean; r
   if (updates.maxApps !== undefined) user.maxApps = updates.maxApps;
   if (updates.email !== undefined) user.email = updates.email;
   await saveCredentials(config.credentialsPath, credentials);
+  if (standingEnded) await forgetGroupTrustOf(userId);
   return true;
 }
 
@@ -2589,8 +2610,10 @@ export async function deleteApiKey(keyId: string): Promise<boolean> {
     return false;
   }
 
-  credentials.apiKeys.splice(index, 1);
+  const [removed] = credentials.apiKeys.splice(index, 1);
   await saveCredentials(config.credentialsPath, credentials);
+  // An ownerless key is itself a principal (it may have been the admin that vouched for a container).
+  if (!removed.ownerUserId) await forgetGroupTrustOf(removed.id);
 
   return true;
 }
@@ -2605,7 +2628,10 @@ export function appProvisionKeyName(appName: string): string {
  */
 export async function deleteApiKeysByName(name: string): Promise<void> {
   if (!credentials || !config) return;
-  credentials.apiKeys = credentials.apiKeys.filter((k) => k.name !== name);
+  const kept = credentials.apiKeys.filter((k) => k.name !== name);
+  // Nothing to revoke: a converged caller (the suspension pass) must not rewrite the file.
+  if (kept.length === credentials.apiKeys.length) return;
+  credentials.apiKeys = kept;
   await saveCredentials(config.credentialsPath, credentials);
 }
 
