@@ -310,16 +310,56 @@ function knowsApp(name: string, deps: SuspensionPolicyDeps): boolean {
   return deps.state?.getApp(name) !== undefined || deps.configs?.getConfig(name) !== undefined;
 }
 
+/** A legacy record's key that more than one known app matches ignoring case. */
+const AMBIGUOUS = Symbol('ambiguous');
+
+/**
+ * The app (or other name) a record EXACTLY names, for something destructive.
+ * A record keeps the name it was given in `app`, so that is exact. A legacy
+ * record has no `app` and only the store's lower-cased key to go by: it names an
+ * app only when exactly ONE known (state or config) name matches that key
+ * ignoring case. Several is ambiguous (never guessed at: AMBIGUOUS); none means
+ * the key is the name as it stands.
+ */
+function subjectOf(entry: { name: string; app?: string }, deps: SuspensionPolicyDeps): string | typeof AMBIGUOUS {
+  if (entry.app !== undefined) return entry.name;
+  const matches = allNames(deps).filter((n) => sameNameIgnoringCase(n, entry.name));
+  if (matches.length > 1) return AMBIGUOUS;
+  return matches[0] ?? entry.name;
+}
+
+/** Every record's exact subject (see `subjectOf`); ambiguous legacy records are left out. */
+function recordSubjects(deps: SuspensionPolicyDeps): string[] {
+  const subjects: string[] = [];
+  for (const entry of deps.store.list()) {
+    const subject = subjectOf(entry, deps);
+    if (subject !== AMBIGUOUS) subjects.push(subject);
+  }
+  return subjects;
+}
+
+/**
+ * Legacy records (no `app`, only a lower-cased key) that match more than one
+ * known app ignoring case: they are enforced against nobody, and the caller
+ * should say so. Empty while the store is unreadable.
+ */
+export function ambiguousKeylessRecords(deps: SuspensionPolicyDeps = defaultDeps()): string[] {
+  return deps.store
+    .list()
+    .filter((entry) => subjectOf(entry, deps) === AMBIGUOUS)
+    .map((entry) => entry.name);
+}
+
 /**
  * What a record makes true, for the enforcement pass: target app to the record
- * that holds it. A record's own name is a target only when an app of EXACTLY
+ * that holds it. A record's own subject is a target only when an app of EXACTLY
  * that name is known (a record can name something that is not an app, and the
  * runtime holds processes that are not DROP's); plus each of its `childrenOf`
  * (the exact attribution). Empty while the store is unreadable (its list is).
  */
 export function enforcementTargets(deps: SuspensionPolicyDeps = defaultDeps()): Map<string, string> {
   const targets = new Map<string, string>();
-  for (const { name: record } of deps.store.list()) {
+  for (const record of recordSubjects(deps)) {
     if (knowsApp(record, deps) && !targets.has(record)) targets.set(record, record);
     for (const child of childrenOf(record, deps)) if (!targets.has(child)) targets.set(child, record);
   }
@@ -331,9 +371,36 @@ export function enforcementTargets(deps: SuspensionPolicyDeps = defaultDeps()): 
  * acts): its own record, if an app by that name is known, or a container's record.
  */
 export function isStillEnforced(target: string, deps: SuspensionPolicyDeps = defaultDeps()): boolean {
-  return deps.store
-    .list()
-    .some((r) => (r.name === target ? knowsApp(target, deps) : childrenOf(r.name, deps).includes(target)));
+  return recordSubjects(deps).some((r) =>
+    r === target ? knowsApp(target, deps) : childrenOf(r, deps).includes(target)
+  );
+}
+
+/**
+ * Whether this app's routes must be withdrawn: a RECORD holds it by the exact
+ * attribution `enforcementTargets` uses (never the gate's case-insensitive
+ * reading, which would withdraw another owner's route), or null. Where
+ * `refusalForApp` answers "refuse a start?", this answers "take a route away?":
+ * a corrupt or not-loaded store answers null, because it must never withdraw one.
+ */
+export function routeWithdrawalFor(name: string, deps: SuspensionPolicyDeps = defaultDeps()): SuspensionVerdict | null {
+  const record = enforcementTargets(deps).get(name);
+  if (record === undefined) return null;
+  return record === name ? { reason: 'record' } : { reason: 'record', via: record };
+}
+
+/**
+ * The names a record names with or without an app behind them: each record's
+ * exact subject and its `childrenOf`. The boot's orphan step uses it for runtime
+ * instances the platform has no state or config for; the caller checks that.
+ */
+export function recordedNames(deps: SuspensionPolicyDeps = defaultDeps()): Set<string> {
+  const names = new Set<string>();
+  for (const record of recordSubjects(deps)) {
+    names.add(record);
+    for (const child of childrenOf(record, deps)) names.add(child);
+  }
+  return names;
 }
 
 /**
