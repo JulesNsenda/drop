@@ -48,7 +48,7 @@ import {
   selectImageUser,
 } from './container-config';
 import { AppType } from '../../core/detector/detector.types';
-import { CONTAINER_NAME_PREFIX, PLATFORM_SERVICE_LABEL } from './platform-containers';
+import { CONTAINER_NAME_PREFIX, isPlatformContainer } from './platform-containers';
 
 /** Prefix for all DROP-managed container names. */
 const NAME_PREFIX = CONTAINER_NAME_PREFIX;
@@ -430,9 +430,10 @@ export class ContainerManager implements AppRuntime {
 
   async stop(name: string): Promise<void> {
     const instance = this.live.resolve(name);
+    const owned = await this.inspectOwned(containerName(instance));
+    if (owned.state !== 'owned') return this.quietlyNotOurs('stop', owned.cName);
     this.stopLogTailer(instance);
-    await this.refuseIfPlatformContainer(containerName(instance));
-    const container = this.docker.getContainer(containerName(instance));
+    const container = this.docker.getContainer(owned.id);
     try {
       await container.stop({ t: STOP_GRACE_SECONDS });
     } catch (err: unknown) {
@@ -442,9 +443,11 @@ export class ContainerManager implements AppRuntime {
 
   async restart(name: string): Promise<AppProcessInfo> {
     const instance = this.live.resolve(name);
+    // An absent container falls through, so restart surfaces Docker's own 404 as before.
+    const owned = await this.inspectOwned(containerName(instance));
+    if (owned.state === 'foreign') throw this.foreignError(owned.cName, owned.labels);
     this.stopLogTailer(instance);
-    await this.refuseIfPlatformContainer(containerName(instance));
-    const container = this.docker.getContainer(containerName(instance));
+    const container = this.docker.getContainer(owned.id);
     await container.restart({ t: STOP_GRACE_SECONDS });
     return {
       ...this.inspectToInfo(appNameOfInstance(instance), await container.inspect()),
@@ -454,9 +457,10 @@ export class ContainerManager implements AppRuntime {
 
   async delete(name: string): Promise<void> {
     const instance = this.live.resolve(name);
+    const owned = await this.inspectOwned(containerName(instance));
+    if (owned.state !== 'owned') return this.quietlyNotOurs('delete', owned.cName);
     this.stopLogTailer(instance);
-    await this.refuseIfPlatformContainer(containerName(instance));
-    const container = this.docker.getContainer(containerName(instance));
+    const container = this.docker.getContainer(owned.id);
     try {
       await container.stop({ t: STOP_GRACE_SECONDS });
     } catch {
@@ -476,8 +480,8 @@ export class ContainerManager implements AppRuntime {
       const instance = this.live.resolve(name);
       const container = this.docker.getContainer(containerName(instance));
       const info = await container.inspect();
-      // A platform container is not an app: report it as absent, never as this app's.
-      if (this.isPlatformContainer(info)) return null;
+      // A container we do not own is not this app's: report it as absent.
+      if (!this.isOwnedLabels(info?.Config?.Labels)) return null;
       const base = { ...this.inspectToInfo(appNameOfInstance(instance), info), instance };
       if (base.status === 'running') {
         const stats = await this.fetchContainerStats(container);
@@ -500,7 +504,8 @@ export class ContainerManager implements AppRuntime {
       all: true,
       filters: JSON.stringify({ label: [`${MANAGED_LABEL}=true`] }),
     });
-    return containers.length;
+    // Platform service and build containers carry the managed label too; they are not apps.
+    return containers.filter((c) => this.isOwnedLabels(c.Labels)).length;
   }
 
   async getAllStatus(): Promise<AppProcessInfo[]> {
@@ -509,7 +514,7 @@ export class ContainerManager implements AppRuntime {
         all: true,
         filters: JSON.stringify({ label: [`${MANAGED_LABEL}=true`] }),
       })
-    ).filter((c) => !c.Labels?.[PLATFORM_SERVICE_LABEL]);
+    ).filter((c) => this.isOwnedLabels(c.Labels));
 
     // Parity with getStatus(): a RUNNING container must carry live cpu/memory.
     // inspect() alone leaves both at 0 (see inspectToInfo), and 0 is
@@ -566,7 +571,10 @@ export class ContainerManager implements AppRuntime {
   async getLogs(name: string, lines = 100): Promise<string> {
     const instance = this.live.resolve(name);
     try {
-      const container = this.docker.getContainer(containerName(instance));
+      const owned = await this.inspectOwned(containerName(instance));
+      // A container we do not own has no logs of ours: same answer as a missing one.
+      if (owned.state === 'foreign') throw new Error(`No such container: ${owned.cName}`);
+      const container = this.docker.getContainer(owned.id);
       const logStream = await container.logs({
         stdout: true,
         stderr: true,
@@ -624,7 +632,10 @@ export class ContainerManager implements AppRuntime {
     onLine: (line: string, type: 'out' | 'err') => void,
     onError?: (error: Error) => void
   ): Promise<() => void> {
-    const container = this.docker.getContainer(containerName(this.live.resolve(name)));
+    const owned = await this.inspectOwned(containerName(this.live.resolve(name)));
+    // Nothing of ours to stream: hand back a stop that does nothing.
+    if (owned.state === 'foreign') return () => undefined;
+    const container = this.docker.getContainer(owned.id);
     const stream = await container.logs({
       stdout: true,
       stderr: true,
@@ -791,36 +802,60 @@ export class ContainerManager implements AppRuntime {
     return DROP_NET_GATEWAY;
   }
 
-  /** Whether an inspected container is one the platform runs for itself (bundled Redis), not a tenant app. */
-  private isPlatformContainer(info: Docker.ContainerInspectInfo | undefined): boolean {
-    return Boolean(info?.Config?.Labels?.[PLATFORM_SERVICE_LABEL]);
+  /**
+   * Allowlist: a container is an app's only when DROP labelled it `drop.managed`
+   * and it is neither a platform service (`drop.service`) nor a build
+   * (`drop.build`). Anything else under a `drop-<instance>` name is not ours to touch.
+   */
+  private isOwnedLabels(labels: Record<string, string> | undefined): boolean {
+    return (
+      labels?.['drop.managed'] === 'true' && !labels['drop.service'] && !labels['drop.build']
+    );
   }
 
   /**
-   * Throws when `cName` is a platform service container. Every by-name mutation
-   * calls this first: the app-name rules reserve these names, but a container
-   * that already holds one must still never be stopped, replaced or removed on
-   * an app's behalf. Inspects only; a missing container is fine.
+   * Inspect `cName` once and say whose it is. The id is returned so the follow-up
+   * stop/restart/remove acts on the container that was checked, not on whatever
+   * the name points at by then.
    */
-  private async refuseIfPlatformContainer(cName: string): Promise<void> {
+  private async inspectOwned(
+    cName: string
+  ): Promise<
+    | { state: 'owned'; cName: string; id: string }
+    | { state: 'absent'; cName: string; id: string }
+    | { state: 'foreign'; cName: string; id: string; labels?: Record<string, string> }
+  > {
     let info: Docker.ContainerInspectInfo | undefined;
     try {
       info = await this.docker.getContainer(cName).inspect();
     } catch (err: unknown) {
-      if (this.isNotFound(err)) return;
+      if (this.isNotFound(err)) return { state: 'absent', cName, id: cName };
       throw err;
     }
-    if (this.isPlatformContainer(info)) {
-      throw new Error(
-        `Refusing to act on ${cName}: it is a platform service container, not an app`
-      );
-    }
+    const id = info?.Id ?? cName;
+    const labels = info?.Config?.Labels;
+    if (!this.isOwnedLabels(labels)) return { state: 'foreign', cName, id, labels };
+    return { state: 'owned', cName, id };
+  }
+
+  private foreignError(cName: string, labels: Record<string, string> | undefined): Error {
+    const what = isPlatformContainer(cName, labels)
+      ? 'a platform service container'
+      : 'a container DROP does not manage';
+    return new Error(`Refusing to act on ${cName}: it is ${what}, not an app`);
+  }
+
+  /** stop/delete on a container that is missing or not ours: treated like a 404. */
+  private quietlyNotOurs(action: string, cName: string): void {
+    console.debug(`[container] ${action} ${cName}: absent or not an app container, nothing to do`);
   }
 
   private async removeIfExists(cName: string): Promise<void> {
-    await this.refuseIfPlatformContainer(cName);
+    const owned = await this.inspectOwned(cName);
+    if (owned.state === 'foreign') throw this.foreignError(cName, owned.labels);
+    if (owned.state === 'absent') return;
     try {
-      const c = this.docker.getContainer(cName);
+      const c = this.docker.getContainer(owned.id);
       await c.remove({ force: true });
     } catch (err: unknown) {
       if (!this.isNotFound(err)) throw err;

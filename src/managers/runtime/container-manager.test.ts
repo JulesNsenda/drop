@@ -74,7 +74,7 @@ function makeInspectInfo(
     Created: new Date(Date.now() - 60000).toISOString(),
     RestartCount: restartCount,
     State: state,
-    Config: {},
+    Config: { Labels: { 'drop.managed': 'true' } },
     HostConfig: {},
     NetworkSettings: { Networks: {} },
   };
@@ -585,18 +585,83 @@ describe('ContainerManager', () => {
       expect(docker.createContainer).not.toHaveBeenCalled();
     });
 
-    it('stop(), restart() and delete() refuse it without touching it', async () => {
+    it('stop() and delete() on it return quietly without touching it; restart() refuses', async () => {
       const container = makeMockContainer('redis', platformInfo());
       const docker = makeDockerMock({ redis: container }) as any;
       const mgr = new ContainerManager(docker);
 
-      await expect(mgr.stop('redis')).rejects.toThrow(/platform service container/);
+      await expect(mgr.stop('redis')).resolves.toBeUndefined();
+      await expect(mgr.delete('redis')).resolves.toBeUndefined();
       await expect(mgr.restart('redis')).rejects.toThrow(/platform service container/);
-      await expect(mgr.delete('redis')).rejects.toThrow(/platform service container/);
 
       expect(container.stop).not.toHaveBeenCalled();
       expect(container.restart).not.toHaveBeenCalled();
       expect(container.remove).not.toHaveBeenCalled();
+    });
+
+    it('start() refuses a foreign unlabelled drop-x container and it survives', async () => {
+      const foreign = makeMockContainer('x', { ...makeInspectInfo('x', makeState(true)), Config: {} });
+      const docker = makeDockerMock({ x: foreign }) as any;
+      const mgr = new ContainerManager(docker);
+
+      await expect(mgr.start({ ...baseSpec, name: 'x' })).rejects.toThrow(
+        /container DROP does not manage/
+      );
+
+      expect(foreign.remove).not.toHaveBeenCalled();
+      expect(docker.createContainer).not.toHaveBeenCalled();
+    });
+
+    it('treats a drop.build container as not ours', async () => {
+      const build = makeMockContainer('b', {
+        ...makeInspectInfo('b', makeState(true)),
+        Config: { Labels: { 'drop.managed': 'true', 'drop.build': 'true' } },
+      });
+      const mgr = new ContainerManager(makeDockerMock({ b: build }) as any);
+
+      await expect(mgr.start({ ...baseSpec, name: 'b' })).rejects.toThrow(/not an app/);
+      await mgr.stop('b');
+      await mgr.delete('b');
+      expect(build.stop).not.toHaveBeenCalled();
+      expect(build.remove).not.toHaveBeenCalled();
+    });
+
+    it('acts through the inspected Id, not the name', async () => {
+      const container = makeMockContainer('my-app', {
+        ...makeInspectInfo('my-app', makeState(true)),
+        Id: 'abc123',
+      });
+      const docker = makeDockerMock() as any;
+      docker.getContainer.mockImplementation((id: string) =>
+        id === 'abc123' || id === 'drop-my-app' ? container : makeMockContainer(id, {})
+      );
+      const mgr = new ContainerManager(docker);
+
+      await mgr.stop('my-app');
+      await mgr.delete('my-app');
+
+      const ids = docker.getContainer.mock.calls.map((c: unknown[]) => c[0]);
+      expect(ids).toEqual(['drop-my-app', 'abc123', 'drop-my-app', 'abc123']);
+    });
+
+    it('getLogs() treats it as missing and streamLogs() yields nothing', async () => {
+      const container = makeMockContainer('redis', platformInfo());
+      const mgr = new ContainerManager(makeDockerMock({ redis: container }) as any);
+
+      expect(await mgr.getLogs('redis')).toBe('');
+      const stop = await mgr.streamLogs('redis', jest.fn());
+      expect(typeof stop).toBe('function');
+      expect(container.logs).not.toHaveBeenCalled();
+    });
+
+    it('countManaged() excludes platform service and build containers', async () => {
+      const docker = makeDockerMock() as any;
+      docker.listContainers.mockResolvedValue([
+        { Id: '1', Labels: { 'drop.managed': 'true', 'drop.app': 'a' } },
+        { Id: '2', Labels: { 'drop.managed': 'true', 'drop.service': 'redis' } },
+        { Id: '3', Labels: { 'drop.managed': 'true', 'drop.build': 'true' } },
+      ]);
+      expect(await new ContainerManager(docker).countManaged()).toBe(1);
     });
 
     it('getStatus() reports it as absent', async () => {
@@ -856,7 +921,7 @@ describe('ContainerManager', () => {
       // Id must resolve to the fixture: the mock's getContainer() looks the
       // container up by whatever string it is handed.
       docker.listContainers.mockResolvedValue([
-        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.app': 'my-app' } },
+        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.managed': 'true', 'drop.app': 'my-app' } },
       ]);
       const mgr = new ContainerManager(docker);
 
@@ -938,7 +1003,7 @@ describe('ContainerManager', () => {
       container.stats = jest.fn().mockResolvedValue(makeStats());
       const docker = makeDockerMock({ 'my-app': container }) as any;
       docker.listContainers.mockResolvedValue([
-        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.app': 'my-app' } },
+        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.managed': 'true', 'drop.app': 'my-app' } },
       ]);
       const mgr = new ContainerManager(docker);
 
@@ -957,8 +1022,8 @@ describe('ContainerManager', () => {
 
       const docker = makeDockerMock({ alive, gone }) as any;
       docker.listContainers.mockResolvedValue([
-        { Id: 'gone', Names: ['/drop-gone'], Labels: { 'drop.app': 'gone' } },
-        { Id: 'alive', Names: ['/drop-alive'], Labels: { 'drop.app': 'alive' } },
+        { Id: 'gone', Names: ['/drop-gone'], Labels: { 'drop.managed': 'true', 'drop.app': 'gone' } },
+        { Id: 'alive', Names: ['/drop-alive'], Labels: { 'drop.managed': 'true', 'drop.app': 'alive' } },
       ]);
       const mgr = new ContainerManager(docker);
 
@@ -983,6 +1048,7 @@ describe('ContainerManager', () => {
     it('returns empty string when container not found', async () => {
       const docker = makeDockerMock() as any;
       docker.getContainer.mockReturnValue({
+        inspect: jest.fn().mockRejectedValue(new Error('No such container: 404')),
         logs: jest.fn().mockRejectedValue(new Error('No such container: 404')),
       });
       const mgr = new ContainerManager(docker);

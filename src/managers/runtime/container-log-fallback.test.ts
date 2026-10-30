@@ -20,6 +20,9 @@ import { ContainerManager } from './container-manager';
  * (`404` / `No such container`), not on a statusCode property, so a mock
  * carrying only `statusCode: 404` would fall through to the rethrow.
  */
+/** What inspect() answers for a container DROP owns. */
+const OWNED = { Config: { Labels: { 'drop.managed': 'true' } } };
+
 function notFound(): Error {
   return new Error('(HTTP code 404) no such container - No such container: drop-my-app');
 }
@@ -31,7 +34,7 @@ describe('getLogs falls back to the DROP-owned files when the container is gone'
 
   const managerWithPaths = (logsImpl: () => Promise<unknown>): ContainerManager => {
     const docker = {
-      getContainer: () => ({ logs: logsImpl }),
+      getContainer: () => ({ logs: logsImpl, inspect: () => Promise.resolve(OWNED) }),
     } as unknown as ConstructorParameters<typeof ContainerManager>[0];
     const mgr = new ContainerManager(docker);
     // Populated by start() in production; set directly so the test is about the
@@ -82,7 +85,7 @@ describe('getLogs falls back to the DROP-owned files when the container is gone'
 
   it('returns empty for an app the platform has not started this boot', async () => {
     const docker = {
-      getContainer: () => ({ logs: () => Promise.reject(notFound()) }),
+      getContainer: () => ({ logs: () => Promise.reject(notFound()), inspect: () => Promise.resolve(OWNED) }),
     } as unknown as ConstructorParameters<typeof ContainerManager>[0];
     // No logPaths entry — same answer as before the fallback existed.
     expect(await new ContainerManager(docker).getLogs('unknown-app', 100)).toBe('');
@@ -160,7 +163,7 @@ describe('the log tailer captures from container start (#264 defect 1)', () => {
         Id: 'abc',
         Name: '/drop-my-app',
         State: { Running: true, Pid: 42, StartedAt: new Date().toISOString(), ExitCode: 0 },
-        Config: { Image: 'node:22-alpine' },
+        Config: { Image: 'node:22-alpine', Labels: { 'drop.managed': 'true' } },
       }),
       start: jest.fn().mockResolvedValue(undefined),
       remove: jest.fn().mockResolvedValue(undefined),

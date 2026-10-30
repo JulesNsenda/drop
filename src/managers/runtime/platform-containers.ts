@@ -21,12 +21,26 @@ export const REDIS_CONTAINER_NAME = `${CONTAINER_NAME_PREFIX}redis`;
 /** Every container name the platform owns. Add new service containers here. */
 export const PLATFORM_CONTAINER_NAMES: readonly string[] = [REDIS_CONTAINER_NAME];
 
+/** App names starting with this would share the `drop-build-*` build container namespace. */
+export const BUILD_NAME_PREFIX = 'build-';
+
 /**
- * Whether an app called `name` would get a container named like a platform one
- * (ignoring case: Docker names are case-sensitive, but the app-name rules are not).
+ * Whether an app called `name` would get a container named like a platform one,
+ * or one in the build container namespace (ignoring case: Docker names are
+ * case-sensitive, but the app-name rules are not).
  * Slot b (`<app>.b`) yields `drop-<app>.b`, which no platform name equals.
  */
 export function collidesWithPlatformContainer(name: string): boolean {
-  const cName = `${CONTAINER_NAME_PREFIX}${name}`.toLowerCase();
+  const lower = name.toLowerCase();
+  if (lower.startsWith(BUILD_NAME_PREFIX)) return true;
+  const cName = `${CONTAINER_NAME_PREFIX}${lower}`;
   return PLATFORM_CONTAINER_NAMES.some((reserved) => reserved.toLowerCase() === cName);
+}
+
+/** A platform service container: one of our names AND the service label. */
+export function isPlatformContainer(
+  cName: string,
+  labels: Record<string, string> | undefined
+): boolean {
+  return Boolean(labels?.[PLATFORM_SERVICE_LABEL]) && PLATFORM_CONTAINER_NAMES.includes(cName.replace(/^\//, ''));
 }
