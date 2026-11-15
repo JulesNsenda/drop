@@ -27,8 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-11-15
+
 ### Changed
 
+- **A suspended app's hostnames stay claimed (#392).** While an app is
+  suspended, no other app can take its hostname through `domains:` (a covering
+  wildcard is refused as well). A live monorepo group's `<group>.<suffix>`
+  hostname belongs to its container and members. An app that already owns that
+  name through `domains:` keeps it, but a new group whose hostname is taken is
+  refused. Every suspension check now goes through one resolver: the app's own
+  record, then its container's, then a frozen group.
 - Suspending a monorepo container now takes all of its services down (and revokes their keys), and lifting it leaves them stopped. It used to be refused with a 409 telling the caller to suspend the services one by one. The admin suspend route now also accepts a folder-dropped container (one with no state entry of its own) that has services.
 
 ### Security
@@ -59,6 +68,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not own, ignores stop/delete on one, acts through the inspected container id,
   and leaves such containers out of the app list and count. The bundled Redis
   start no longer removes a `drop-redis` container that is not its own.
+  `drop-platform` (DROP's own service name) is reserved the same way, so a
+  folder-dropped app with any of these names is no longer admitted. Rename it
+  before upgrading.
+- **hono 4.13.18 and `@hono/node-server` 2.1.8 (#405, #406).** These pick up
+  the upstream advisories. The one that matters most to DROP is in
+  `bodyLimit()`, which DROP's body-size limit uses: it kept every transfer chunk
+  of a request body in memory, so a request under the limit could still exhaust
+  memory. The others fix `validator()` skipping validation for some
+  `Content-Type` spellings, and `serveStatic()` path decoding.
+
+### Dependencies
+
+- jest 30 and eslint 10, both dev-only, in the root and the dashboard. The
+  dashboard's `eslint-plugin-react-hooks` moves from 5 to 7, which is the first
+  version that accepts eslint 10. Also patch updates: follow-redirects, the
+  aws-sdk clients, the MCP SDK, typescript-eslint, and the GitHub Actions in CI
+  (#398-#404).
 
 ## [1.8.0] - 2026-10-29
 
