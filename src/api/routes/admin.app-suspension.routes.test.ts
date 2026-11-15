@@ -67,6 +67,41 @@ describe('app suspension routes', () => {
     await teardownTestApiServer(t);
   });
 
+  describe("a container group trust follows its owner standing", () => {
+    const put = (url: string, body: unknown) =>
+      t.hono.request(url, {
+        method: 'PUT',
+        headers: { ...bearer(adminToken), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    beforeEach(async () => {
+      const sm = getStateManager();
+      await sm.registerApp('mono', path.join(t.tempDir, 'mono'));
+      await sm.updateApp('mono', { userId: ownerId, group: 'mono', isGroupContainer: true, groupTrusted: true });
+    });
+
+    it('is forgotten when the owner is demoted', async () => {
+      expect((await put(`/api/v1/auth/users/${ownerId}`, { role: 'readonly' })).status).toBe(200);
+      expect(getStateManager().getApp('mono')?.groupTrusted).toBeUndefined();
+    });
+
+    it('is kept by an update that changes nothing about their standing', async () => {
+      expect((await put(`/api/v1/auth/users/${ownerId}`, { role: 'user', maxApps: 5 })).status).toBe(200);
+      expect(getStateManager().getApp('mono')?.groupTrusted).toBe(true);
+    });
+
+    it('is forgotten when the owner is disabled', async () => {
+      expect((await put(`/api/v1/auth/users/${ownerId}`, { enabled: false })).status).toBe(200);
+      expect(getStateManager().getApp('mono')?.groupTrusted).toBeUndefined();
+    });
+
+    it('is forgotten when the owner is suspended', async () => {
+      expect((await post(`/api/v1/admin/users/${ownerId}/suspend`, adminToken)).status).toBe(200);
+      expect(getStateManager().getApp('mono')?.groupTrusted).toBeUndefined();
+    });
+  });
+
   describe('POST /admin/apps/:name/suspend', () => {
     it('suspends through the platform, attributing the admin and the reason, and logs it', async () => {
       const stub = ops();
@@ -110,18 +145,43 @@ describe('app suspension routes', () => {
       );
     });
 
-    it('409s on a monorepo container, naming its services', async () => {
+    it('suspends a monorepo container, reporting its services\' stop errors (prefixed) like any other', async () => {
       ops({
-        suspendApp: jest.fn().mockResolvedValue({ refused: 'group-container', services: ['mono-api', 'mono-web'] }),
+        suspendApp: jest
+          .fn()
+          .mockResolvedValue({ suspended: true, at: 'now', stopErrors: ['mono-api: mono-api.b: still present after delete'] }),
       });
 
       const res = await post('/api/v1/admin/apps/shop/suspend', adminToken);
 
-      expect(res.status).toBe(409);
-      const body = (await res.json()) as { error: { message: string; details: { services: string[] } } };
-      expect(body.error.message).toContain('mono-api, mono-web');
-      expect(body.error.details.services).toEqual(['mono-api', 'mono-web']);
-      expect(logSpy).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { data: { suspended: boolean; stopErrors?: string[] } };
+      expect(body.data.suspended).toBe(true);
+      expect(body.data.stopErrors).toEqual(['mono-api: mono-api.b: still present after delete']);
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ appName: 'shop', detail: expect.stringContaining('mono-api: mono-api.b') })
+      );
+    });
+
+    it('accepts a folder-dropped container (no state entry) that has services, and 404s one that has none', async () => {
+      const sm = getStateManager();
+      await sm.registerApp('dropped-web', path.join(t.tempDir, 'dropped-web'));
+      await sm.updateApp('dropped-web', { group: 'dropped' });
+      jest.spyOn(appConfigModule, 'getAppConfigServiceOrNull').mockReturnValue({
+        getConfig: (n: string) =>
+          n === 'dropped-web' ? { name: n, group: 'dropped', groupContainer: 'dropped' } : undefined,
+        getAllConfigs: () => [{ name: 'dropped-web', group: 'dropped', groupContainer: 'dropped' }],
+        getDomainOwners: () => new Map(),
+      } as never);
+      const stub = ops();
+
+      const res = await post('/api/v1/admin/apps/dropped/suspend', adminToken);
+      const none = await post('/api/v1/admin/apps/nothing-here/suspend', adminToken);
+
+      expect(res.status).toBe(200);
+      expect(stub.suspendApp).toHaveBeenCalledWith('dropped', expect.any(String), undefined);
+      expect(none.status).toBe(404);
     });
 
     it('answers 500, not success, when the record cannot be written', async () => {
@@ -181,6 +241,22 @@ describe('app suspension routes', () => {
       ops({ unsuspendApp: jest.fn().mockResolvedValue({ unsuspended: false }) });
       const res = await post('/api/v1/admin/apps/shop/unsuspend', adminToken);
       expect(res.status).toBe(404);
+    });
+
+    it("404s a child of a suspended container, naming the container whose suspension to lift", async () => {
+      const sm = getStateManager();
+      await sm.registerApp('shop-site', path.join(t.tempDir, 'shop-site'));
+      await sm.updateApp('shop-site', { isGroupContainer: true, group: 'shop-site' } as never);
+      await sm.updateApp('shop', { group: 'shop-site' } as never);
+      await getSuspensionStore().suspend('shop-site', 'admin-1');
+      ops({ unsuspendApp: jest.fn().mockResolvedValue({ unsuspended: false }) });
+
+      const res = await post('/api/v1/admin/apps/shop/unsuspend', adminToken);
+
+      expect(res.status).toBe(404);
+      const message = ((await res.json()) as { error: { message: string } }).error.message;
+      expect(message).toContain("'shop-site'");
+      expect(message).toContain('Lift that one');
     });
 
     it('answers 500 when the record cannot be removed', async () => {

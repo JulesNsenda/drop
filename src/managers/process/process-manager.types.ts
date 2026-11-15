@@ -126,6 +126,8 @@ export interface ProcessStatus {
   createdAt: Date | null;
   /** Last restart timestamp */
   restartedAt: Date | null;
+  /** The directory PM2 runs the process from (`pm_cwd`), when it reports one. */
+  cwd?: string;
 }
 
 /**
@@ -174,6 +176,7 @@ export interface PM2ProcessDescription {
     pm_pid_path?: string;
     pm_out_log_path?: string;
     pm_err_log_path?: string;
+    pm_cwd?: string;
     instances?: number;
     PORT?: string;
     [key: string]: unknown;

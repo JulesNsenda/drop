@@ -38,7 +38,7 @@ import { scopesAllowCreate } from './agent-scopes';
 import { isValidAppName } from './middleware/validate';
 import { getStateManager } from '../managers/app/state-manager';
 import { getPlatformOps, AppSuspendedError } from './platform-ops';
-import { getSuspensionStore } from '../managers/suspension';
+import { refusalForApp } from '../core/suspension-policy';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../utils/disk';
 import { getAppsDirectory } from './runtime-config';
 import { isNewNameRefused } from '../core/app-names';
@@ -106,8 +106,8 @@ export async function runUploadPreflight(
     // After the ownership answer (so this is never an oracle for a non-owner)
     // and before the generic "is stopped; start it" below, which is wrong for a
     // suspended app: starting it is refused too.
-    const suspension = getSuspensionStore().refusalFor(appName);
-    if (suspension) return { ok: false, error: new AppSuspendedError(appName, suspension) };
+    const suspension = refusalForApp(appName);
+    if (suspension) return { ok: false, error: new AppSuspendedError(appName, suspension.reason, suspension.via) };
     // A stopped app's rebuilds are deliberately dropped by the platform — a
     // 202 here would have the caller poll for an episode that never arrives.
     if (existingApp.status === 'stopped') {

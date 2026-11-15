@@ -68,11 +68,15 @@ export class AppSuspendedError extends Error {
 
   constructor(
     readonly appName: string,
-    readonly reason: AppSuspendedReason = 'record'
+    readonly reason: AppSuspendedReason = 'record',
+    /** The OTHER app whose record is the cause (its container, or a member of its group). Only for a `record`. */
+    readonly via?: string
   ) {
     super(
       reason === 'record'
-        ? `Application '${appName}' is suspended by an administrator`
+        ? via !== undefined && via !== appName
+          ? `Application '${appName}' is suspended because '${via}' is suspended by an administrator`
+          : `Application '${appName}' is suspended by an administrator`
         : reason === 'not-loaded'
           ? `Starting '${appName}' is refused: suspension store not loaded yet`
           : `The suspension store is unreadable, so starting '${appName}' is refused until it is repaired`
@@ -207,9 +211,16 @@ export type RedeployRefusal =
       message: string;
       retryAfterSeconds?: number;
       suspension?: undefined;
+      via?: undefined;
     }
-  // Why, so each surface renders it through AppSuspendedError.messageFor.
-  | { code: 'APP_SUSPENDED'; message: string; retryAfterSeconds?: undefined; suspension: AppSuspendedReason };
+  // Why (and, for a record held by another app, which), so each surface renders it through AppSuspendedError.messageFor.
+  | {
+      code: 'APP_SUSPENDED';
+      message: string;
+      retryAfterSeconds?: undefined;
+      suspension: AppSuspendedReason;
+      via?: string;
+    };
 
 /**
  * What an explicit redeploy came to: started (it has a builder slot and the
@@ -227,10 +238,12 @@ export type RedeployStart =
 
 /** What `suspendApp` did: the app is down, or the suspension was refused. */
 export type SuspendAppResult =
-  /** `stopErrors` names instances still live afterwards; the suspension is recorded regardless. */
+  /**
+   * `stopErrors` names what is still live afterwards; the suspension is recorded regardless.
+   * A monorepo container's services are taken down with it: an error of the app
+   * itself is unprefixed, one of a service is prefixed `<service>: `.
+   */
   | { suspended: true; at: string; stopErrors?: string[] }
-  /** A monorepo container runs nothing itself - its services are the runtime apps. */
-  | { refused: 'group-container'; services: string[] }
   /** Another existing app differs only in case; the store matches ignoring case, so it would be suspended too. */
   | { refused: 'case-collision'; names: string[] };
 

@@ -74,7 +74,7 @@ function makeInspectInfo(
     Created: new Date(Date.now() - 60000).toISOString(),
     RestartCount: restartCount,
     State: state,
-    Config: {},
+    Config: { Labels: { 'drop.managed': 'true' } },
     HostConfig: {},
     NetworkSettings: { Networks: {} },
   };
@@ -567,6 +567,132 @@ describe('ContainerManager', () => {
     });
   });
 
+  describe('platform service containers', () => {
+    const platformInfo = (): Record<string, unknown> => ({
+      ...makeInspectInfo('redis', makeState(true)),
+      Config: { Labels: { 'drop.managed': 'true', 'drop.service': 'redis' } },
+    });
+    const redisSpec = { ...baseSpec, name: 'redis' };
+
+    it('start() does not remove a drop.service container and creates nothing', async () => {
+      const container = makeMockContainer('redis', platformInfo());
+      const docker = makeDockerMock({ redis: container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      await expect(mgr.start(redisSpec)).rejects.toThrow(/platform service container/);
+
+      expect(container.remove).not.toHaveBeenCalled();
+      expect(docker.createContainer).not.toHaveBeenCalled();
+    });
+
+    it('stop() and delete() on it return quietly without touching it; restart() refuses', async () => {
+      const container = makeMockContainer('redis', platformInfo());
+      const docker = makeDockerMock({ redis: container }) as any;
+      const mgr = new ContainerManager(docker);
+
+      await expect(mgr.stop('redis')).resolves.toBeUndefined();
+      await expect(mgr.delete('redis')).resolves.toBeUndefined();
+      await expect(mgr.restart('redis')).rejects.toThrow(/platform service container/);
+
+      expect(container.stop).not.toHaveBeenCalled();
+      expect(container.restart).not.toHaveBeenCalled();
+      expect(container.remove).not.toHaveBeenCalled();
+    });
+
+    it('start() refuses a foreign unlabelled drop-x container and it survives', async () => {
+      const foreign = makeMockContainer('x', { ...makeInspectInfo('x', makeState(true)), Config: {} });
+      const docker = makeDockerMock({ x: foreign }) as any;
+      const mgr = new ContainerManager(docker);
+
+      await expect(mgr.start({ ...baseSpec, name: 'x' })).rejects.toThrow(
+        /container DROP does not manage/
+      );
+
+      expect(foreign.remove).not.toHaveBeenCalled();
+      expect(docker.createContainer).not.toHaveBeenCalled();
+    });
+
+    it('treats a drop.build container as not ours', async () => {
+      const build = makeMockContainer('b', {
+        ...makeInspectInfo('b', makeState(true)),
+        Config: { Labels: { 'drop.managed': 'true', 'drop.build': 'true' } },
+      });
+      const mgr = new ContainerManager(makeDockerMock({ b: build }) as any);
+
+      await expect(mgr.start({ ...baseSpec, name: 'b' })).rejects.toThrow(/not an app/);
+      await mgr.stop('b');
+      await mgr.delete('b');
+      expect(build.stop).not.toHaveBeenCalled();
+      expect(build.remove).not.toHaveBeenCalled();
+    });
+
+    it('acts through the inspected Id, not the name', async () => {
+      const container = makeMockContainer('my-app', {
+        ...makeInspectInfo('my-app', makeState(true)),
+        Id: 'abc123',
+      });
+      const docker = makeDockerMock() as any;
+      docker.getContainer.mockImplementation((id: string) =>
+        id === 'abc123' || id === 'drop-my-app' ? container : makeMockContainer(id, {})
+      );
+      const mgr = new ContainerManager(docker);
+
+      await mgr.stop('my-app');
+      await mgr.delete('my-app');
+
+      const ids = docker.getContainer.mock.calls.map((c: unknown[]) => c[0]);
+      expect(ids).toEqual(['drop-my-app', 'abc123', 'drop-my-app', 'abc123']);
+    });
+
+    it('getLogs() treats it as missing and streamLogs() yields nothing', async () => {
+      const container = makeMockContainer('redis', platformInfo());
+      const mgr = new ContainerManager(makeDockerMock({ redis: container }) as any);
+
+      expect(await mgr.getLogs('redis')).toBe('');
+      const stop = await mgr.streamLogs('redis', jest.fn());
+      expect(typeof stop).toBe('function');
+      expect(container.logs).not.toHaveBeenCalled();
+    });
+
+    it('countManaged() excludes platform service and build containers', async () => {
+      const docker = makeDockerMock() as any;
+      docker.listContainers.mockResolvedValue([
+        { Id: '1', Labels: { 'drop.managed': 'true', 'drop.app': 'a' } },
+        { Id: '2', Labels: { 'drop.managed': 'true', 'drop.service': 'redis' } },
+        { Id: '3', Labels: { 'drop.managed': 'true', 'drop.build': 'true' } },
+      ]);
+      expect(await new ContainerManager(docker).countManaged()).toBe(1);
+    });
+
+    it('getStatus() reports it as absent', async () => {
+      const container = makeMockContainer('redis', platformInfo());
+      const mgr = new ContainerManager(makeDockerMock({ redis: container }) as any);
+
+      expect(await mgr.getStatus('redis')).toBeNull();
+    });
+
+    it('getAllStatus() leaves it out of the app list', async () => {
+      const app = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
+      const docker = makeDockerMock({ 'my-app': app }) as any;
+      docker.listContainers.mockResolvedValue([
+        {
+          Id: 'abc123',
+          Names: ['/drop-my-app'],
+          Labels: { 'drop.managed': 'true', 'drop.app': 'my-app' },
+        },
+        {
+          Id: 'redis1',
+          Names: ['/drop-redis'],
+          Labels: { 'drop.managed': 'true', 'drop.service': 'redis' },
+        },
+      ]);
+      const mgr = new ContainerManager(docker);
+
+      const all = await mgr.getAllStatus();
+      expect(all.map((a) => a.name)).toEqual(['my-app']);
+    });
+  });
+
   describe('restart()', () => {
     it('calls container.restart() and returns updated info', async () => {
       const container = makeMockContainer('my-app', makeInspectInfo('my-app', makeState(true)));
@@ -795,7 +921,7 @@ describe('ContainerManager', () => {
       // Id must resolve to the fixture: the mock's getContainer() looks the
       // container up by whatever string it is handed.
       docker.listContainers.mockResolvedValue([
-        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.app': 'my-app' } },
+        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.managed': 'true', 'drop.app': 'my-app' } },
       ]);
       const mgr = new ContainerManager(docker);
 
@@ -877,7 +1003,7 @@ describe('ContainerManager', () => {
       container.stats = jest.fn().mockResolvedValue(makeStats());
       const docker = makeDockerMock({ 'my-app': container }) as any;
       docker.listContainers.mockResolvedValue([
-        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.app': 'my-app' } },
+        { Id: 'my-app', Names: ['/drop-my-app'], Labels: { 'drop.managed': 'true', 'drop.app': 'my-app' } },
       ]);
       const mgr = new ContainerManager(docker);
 
@@ -896,8 +1022,8 @@ describe('ContainerManager', () => {
 
       const docker = makeDockerMock({ alive, gone }) as any;
       docker.listContainers.mockResolvedValue([
-        { Id: 'gone', Names: ['/drop-gone'], Labels: { 'drop.app': 'gone' } },
-        { Id: 'alive', Names: ['/drop-alive'], Labels: { 'drop.app': 'alive' } },
+        { Id: 'gone', Names: ['/drop-gone'], Labels: { 'drop.managed': 'true', 'drop.app': 'gone' } },
+        { Id: 'alive', Names: ['/drop-alive'], Labels: { 'drop.managed': 'true', 'drop.app': 'alive' } },
       ]);
       const mgr = new ContainerManager(docker);
 
@@ -922,6 +1048,7 @@ describe('ContainerManager', () => {
     it('returns empty string when container not found', async () => {
       const docker = makeDockerMock() as any;
       docker.getContainer.mockReturnValue({
+        inspect: jest.fn().mockRejectedValue(new Error('No such container: 404')),
         logs: jest.fn().mockRejectedValue(new Error('No such container: 404')),
       });
       const mgr = new ContainerManager(docker);
@@ -1218,7 +1345,8 @@ describe('ContainerManager live instances (#298 step 4)', () => {
     await mgr.getStatus('my-app');
 
     const names = docker.getContainer.mock.calls.map((c: unknown[]) => c[0]);
-    expect(names).toEqual(['drop-my-app.b', 'drop-my-app.b']);
+    // stop() also inspects first (platform-container guard), so assert the target, not the call count.
+    expect(new Set(names)).toEqual(new Set(['drop-my-app.b']));
   });
 });
 

@@ -130,6 +130,40 @@ describe('POST /apps/:name/source (upload deploy)', () => {
     expect(deployMock).not.toHaveBeenCalled();
   });
 
+  it("answers an upload to a child of a suspended container 409 APP_SUSPENDED, naming the container; the DTO says so too", async () => {
+    const sm = getStateManager();
+    await sm.registerApp('alice-site', path.join(tempDir, 'alice-site'));
+    await sm.updateApp('alice-site', { userId: aliceId, isGroupContainer: true, group: 'alice-site' } as never);
+    await sm.registerApp('alice-kid', path.join(tempDir, 'alice-kid'));
+    await sm.updateApp('alice-kid', { userId: aliceId, group: 'alice-site', status: 'stopped' } as never);
+    await getSuspensionStore().suspend('alice-site', 'admin-1', 'abuse');
+
+    const res = await hono.request('/api/v1/apps/alice-kid/source', {
+      method: 'POST',
+      headers: authHeader(aliceToken),
+      body: Buffer.from('fake-archive-bytes'),
+    });
+    expect(res.status).toBe(409);
+    const json = (await res.json()) as { error: { code: string; message: string } };
+    expect(json.error.code).toBe('APP_SUSPENDED');
+    expect(json.error.message).toContain("'alice-site'");
+    expect(deployMock).not.toHaveBeenCalled();
+
+    // The same answer on the wire DTO: the owner learns whose suspension it is, but not who or why.
+    const asOwner = await hono.request('/api/v1/apps/alice-kid', { headers: authHeader(aliceToken) });
+    const ownerDto = ((await asOwner.json()) as { data: { suspended?: Record<string, unknown> } }).data.suspended;
+    expect(ownerDto).toMatchObject({ kind: 'record', via: 'alice-site' });
+    expect(ownerDto).not.toHaveProperty('by');
+    expect(ownerDto).not.toHaveProperty('reason');
+    const asAdmin = await hono.request('/api/v1/apps/alice-kid', { headers: authHeader(adminToken) });
+    expect(((await asAdmin.json()) as { data: { suspended?: unknown } }).data.suspended).toMatchObject({
+      kind: 'record',
+      via: 'alice-site',
+      by: 'admin-1',
+      reason: 'abuse',
+    });
+  });
+
   it('answers a suspended (and therefore stopped) app 409 APP_SUSPENDED, not "start or remove it"; a non-owner still gets 404', async () => {
     await getStateManager().setAppStatus('alice-app', 'stopped');
     await getSuspensionStore().suspend('alice-app', 'admin-1');

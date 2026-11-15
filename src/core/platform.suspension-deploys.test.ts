@@ -98,6 +98,7 @@ import { getSuspensionStore } from '../managers/suspension';
 import { getDeployTracker, getDeployDetailStore } from '../managers/deploy-tracker';
 import { getDeployBreaker } from '../managers/guardrail/deploy-breaker';
 import { AppSuspendedError } from '../api/platform-ops';
+import { StartRefused } from './suspension-policy';
 import { getAppConfigService } from '../managers/app/app-config';
 import { getDatabaseProvisioner } from '../managers/database';
 import { captureBeforeRedeploy, getRollbackStore } from '../managers/rollback';
@@ -404,6 +405,289 @@ describe('app suspension (platform, Item 2: the build choke point and the re-che
       const stopped = episodes.find((e) => getDeployDetailStore().getDetail(e.deployId)?.errorCode === 'DEPLOY_STOPPED');
       expect(stopped?.status).toBe('failed');
     }, 20000);
+  });
+
+  describe('the children of a suspended container (ported from #389, on the resolver)', () => {
+    /**
+     * A registered monorepo container 'site' and a deployed child 'site-web' of its group,
+     * stamped as expansion stamps it. The container is CURRENT (in state, isGroupContainer,
+     * for the group): a stamp to anything else names nothing.
+     */
+    async function groupedChild(): Promise<string> {
+      const containerPath = await createStaticApp('site');
+      await getStateManager().registerApp('site', containerPath, 'static');
+      await getStateManager().updateApp('site', { group: 'site', isGroupContainer: true } as never);
+      const childPath = await deploy('site-web');
+      await getStateManager().updateApp('site-web', { group: 'site' } as never);
+      await getAppConfigService().upsertSystemConfig('site-web', { groupContainer: 'site' });
+      return childPath;
+    }
+
+    it("a child's redeploy waiting for a build slot is refused when its container is suspended during the wait", async () => {
+      platform = makePlatform();
+      await platform.start();
+      const childPath = await groupedChild();
+      const builder = internals().builder as unknown as {
+        reserveSlot: (name: string) => Promise<() => void>;
+        waitingApps: Set<string>;
+      };
+      const build = jest.spyOn(internals().builder!, 'build');
+      const held = await Promise.all(['occ1', 'occ2', 'occ3'].map((n) => builder.reserveSlot(n)));
+
+      const run = internals().handleAppUpdate('site-web', childPath, 'file change', true);
+      for (let i = 0; i < 500 && !builder.waitingApps.has('site-web'); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(builder.waitingApps.has('site-web')).toBe(true);
+      await getSuspensionStore().suspend('site', 'admin-1');
+      held.forEach((release) => release());
+
+      expect(await run).toBe(false);
+      expect(build).not.toHaveBeenCalled();
+      expect(internals().appsInProgress.has('site-web')).toBe(false);
+    }, 20000);
+
+    it('drainPendingBuilds does not build a queued child of a suspended container', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const childPath = await groupedChild();
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const build = jest.spyOn(internals().builder!, 'build');
+      const starts = fakeRuntime.startCount;
+      const pending = platform as unknown as {
+        pendingBuilds: Map<string, { appPath: string; appType: string }>;
+        drainPendingBuilds: () => Promise<void>;
+      };
+      pending.pendingBuilds.set('site-web', { appPath: childPath, appType: 'static' });
+
+      await pending.drainPendingBuilds();
+      await new Promise((r) => setTimeout(r, 200));
+
+      expect(build).not.toHaveBeenCalled();
+      expect(fakeRuntime.startCount).toBe(starts);
+      expect(internals().appsInProgress.has('site-web')).toBe(false);
+    }, 20000);
+
+    it("the owner's start of a registered child is refused, naming the container", async () => {
+      platform = makePlatform();
+      await platform.start();
+      await groupedChild();
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const starts = fakeRuntime.startCount;
+      const restarts = fakeRuntime.restartCount;
+
+      await expect(platform.restartApp('site-web')).rejects.toMatchObject({
+        code: 'APP_SUSPENDED',
+        reason: 'record',
+        via: 'site',
+      });
+
+      expect(fakeRuntime.startCount).toBe(starts);
+      expect(fakeRuntime.restartCount).toBe(restarts);
+    }, 20000);
+
+    it('a child of an UNsuspended container is unaffected', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const childPath = await groupedChild();
+      await getSuspensionStore().suspend('other', 'admin-1');
+      const build = jest.spyOn(internals().builder!, 'build');
+
+      await expect(platform.restartApp('site-web')).resolves.toBeDefined();
+      expect(await internals().handleAppUpdate('site-web', childPath, 'file change', true)).toBe(true);
+      expect(build).toHaveBeenCalled();
+    }, 30000);
+
+    it('a bare stamp to an app that is not a container does not refuse the child', async () => {
+      platform = makePlatform();
+      await platform.start();
+      await deploy('site');
+      const childPath = await deploy('site-web');
+      await getAppConfigService().upsertSystemConfig('site-web', { groupContainer: 'site' });
+      await getSuspensionStore().suspend('site', 'admin-1');
+      const build = jest.spyOn(internals().builder!, 'build');
+
+      expect(await internals().handleAppUpdate('site-web', childPath, 'file change', true)).toBe(true);
+      expect(build).toHaveBeenCalled();
+    }, 30000);
+
+    it("a child's suspension freezes the container's own redeploy, and not the sibling's", async () => {
+      platform = makePlatform();
+      await platform.start();
+      const childPath = await groupedChild();
+      const siblingPath = await deploy('site-api');
+      await getStateManager().updateApp('site-api', { group: 'site' } as never);
+      await getSuspensionStore().suspend('site-web', 'admin-1');
+      const build = jest.spyOn(internals().builder!, 'build');
+
+      // The sibling still deploys; the suspended child and the container do not.
+      expect(await internals().handleAppUpdate('site-api', siblingPath, 'file change', true)).toBe(true);
+      build.mockClear();
+      expect(await internals().handleAppUpdate('site-web', childPath, 'file change', true)).toBe(false);
+      expect(await internals().handleAppUpdate('site', path.join(webappsDir, 'site'), 'file change', true)).toBe(false);
+      expect(build).not.toHaveBeenCalled();
+    }, 40000);
+  });
+
+  describe('the episode code says why the start was refused (ported from #389)', () => {
+    it('a reExpandContainer held while the store is unreadable closes its episode as DEPLOY_REFUSED', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deploy('site');
+      jest.spyOn(internals(), 'expandMonorepo').mockResolvedValue({ suspended: 'store-unreadable' });
+
+      await internals().reExpandContainer(
+        'site',
+        appPath,
+        { services: { web: { path: 'web', type: 'static' } } },
+        { principalId: 'p-1' },
+        jest.fn()
+      );
+
+      const episodes = getDeployTracker().getEpisodes('site');
+      const codes = episodes.map((e) => getDeployDetailStore().getDetail(e.deployId)?.errorCode);
+      expect(codes).toContain('DEPLOY_REFUSED');
+      expect(codes).not.toContain('DEPLOY_STOPPED');
+    }, 20000);
+
+    it('a first deploy refused because the store went unreadable is DEPLOY_REFUSED: nothing was replaced, so nobody stopped anything', async () => {
+      platform = makePlatform();
+      await platform.start();
+      jest.spyOn(console, 'error').mockImplementation();
+      const appPath = await createStaticApp('fresh');
+      await getStateManager().registerApp('fresh', appPath, 'static');
+      const original = internals().prepareDeployTarget.bind(platform);
+      jest.spyOn(internals(), 'prepareDeployTarget').mockImplementationOnce(async (...args) => {
+        const target = await original(...args);
+        await fs.writeFile(path.join(tempDir, 'data', 'drop-svc', 'suspensions.json'), '{ broken');
+        await getSuspensionStore().load();
+        return target;
+      });
+
+      await internals().handleBuildApp(appPath, 'fresh', 'static');
+
+      const [episode] = getDeployTracker().getEpisodes('fresh');
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
+    }, 20000);
+
+    it('the same refusal with an old instance still serving is DEPLOY_REFUSED', async () => {
+      platform = makePlatform();
+      await platform.start();
+      jest.spyOn(console, 'error').mockImplementation();
+      const appPath = await deploy('site');
+      expect(fakeRuntime.runningNames()).toContain('site');
+      const original = internals().prepareDeployTarget.bind(platform);
+      jest.spyOn(internals(), 'prepareDeployTarget').mockImplementationOnce(async (...args) => {
+        const target = await original(...args);
+        await fs.writeFile(path.join(tempDir, 'data', 'drop-svc', 'suspensions.json'), '{ broken');
+        await getSuspensionStore().load();
+        return target;
+      });
+      const before = getDeployTracker().getEpisodes('site').length;
+
+      await internals().handleBuildApp(appPath, 'site', 'static');
+
+      const episodes = getDeployTracker().getEpisodes('site');
+      expect(episodes.length).toBeGreaterThan(before);
+      expect(getDeployDetailStore().getDetail(episodes[0].deployId)?.errorCode).toBe('DEPLOY_REFUSED');
+      expect(fakeRuntime.runningNames()).toContain('site');
+    }, 20000);
+  });
+
+  describe('gateBeforeSwap: the seam for a stop', () => {
+    it('speaks the cause: a ctx stop is a stop, a refusal is a suspension, neither is an AppSuspendedError', async () => {
+      platform = makePlatform();
+      await platform.start();
+      const gate = (platform as unknown as { gateBeforeSwap: (a: string, c?: { stop?: boolean }) => void }).gateBeforeSwap.bind(platform);
+
+      expect(() => gate('site')).not.toThrow();
+      expect(() => gate('site', { stop: true })).toThrow(expect.objectContaining({ refusal: { kind: 'stopped' } }));
+      await getSuspensionStore().suspend('site', 'admin-1');
+      let thrown: unknown;
+      try {
+        gate('site');
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(StartRefused);
+      expect(thrown).not.toBeInstanceOf(AppSuspendedError);
+      expect((thrown as StartRefused).refusal).toEqual({ kind: 'suspended', reason: 'record' });
+      // A stop outranks a refusal, as it will when a stopped deploy is also suspended.
+      expect(() => gate('site', { stop: true })).toThrow(expect.objectContaining({ refusal: { kind: 'stopped' } }));
+    }, 20000);
+  });
+
+  describe('the gate right before the swap', () => {
+    const storeFile = (): string => path.join(tempDir, 'data', 'drop-svc', 'suspensions.json');
+
+    async function stageRedeploy(): Promise<{ appPath: string; replace: jest.SpyInstance }> {
+      platform = makePlatform();
+      await platform.start();
+      const appPath = await deploy('site');
+      const replace = jest.spyOn(platform as unknown as { replaceLiveProcess: () => Promise<void> }, 'replaceLiveProcess');
+      return { appPath, replace };
+    }
+
+    async function updateAndWaitForEpisode(appPath: string, episodesBefore: number): Promise<void> {
+      await fs.writeFile(path.join(appPath, 'index.html'), 'v2');
+      eventBus.publish('app:update', { name: 'site', path: appPath, reason: 'edit', bypassCooldown: true });
+      await waitFor(
+        () => getDeployTracker().getEpisodes('site').length > episodesBefore && !internals().appsInProgress.has('site')
+      );
+    }
+
+    it('an unreadable store after the build, before the swap: the old version keeps serving and the episode is REFUSED', async () => {
+      const { appPath, replace } = await stageRedeploy();
+      jest.spyOn(console, 'error').mockImplementation();
+      const episodesBefore = getDeployTracker().getEpisodes('site').length;
+      jest.spyOn(platform as unknown as { tryCutover: () => Promise<false> }, 'tryCutover').mockImplementationOnce(async () => {
+        await fs.writeFile(storeFile(), '{ broken');
+        await getSuspensionStore().load();
+        return false;
+      });
+
+      await updateAndWaitForEpisode(appPath, episodesBefore);
+
+      expect(replace).not.toHaveBeenCalled();
+      // The old version is still up: nothing was stopped, so nobody stopped anything.
+      expect(fakeRuntime.runningNames()).toContain('site');
+      const [episode] = getDeployTracker().getEpisodes('site');
+      expect(episode.status).toBe('failed');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_REFUSED');
+    }, 40000);
+
+    it("an administrator's record landing before the swap: nothing is replaced and the episode is STOPPED", async () => {
+      const { appPath, replace } = await stageRedeploy();
+      const episodesBefore = getDeployTracker().getEpisodes('site').length;
+      jest.spyOn(platform as unknown as { tryCutover: () => Promise<false> }, 'tryCutover').mockImplementationOnce(async () => {
+        await getSuspensionStore().suspend('site', 'admin-1');
+        return false;
+      });
+
+      await updateAndWaitForEpisode(appPath, episodesBefore);
+
+      expect(replace).not.toHaveBeenCalled();
+      const [episode] = getDeployTracker().getEpisodes('site');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+    }, 40000);
+
+    it('an unreadable store AFTER the swap (nothing left serving) closes the episode as STOPPED', async () => {
+      const { appPath } = await stageRedeploy();
+      jest.spyOn(console, 'error').mockImplementation();
+      const episodesBefore = getDeployTracker().getEpisodes('site').length;
+      const noteStart = jest.spyOn(platform as unknown as { noteRuntimeLogStart: (a: string) => Promise<void> }, 'noteRuntimeLogStart');
+      const real = (platform as unknown as { noteRuntimeLogStart: (a: string) => Promise<void> }).noteRuntimeLogStart.bind(platform);
+      noteStart.mockImplementationOnce(async (app: string) => {
+        await real(app);
+        await fs.writeFile(storeFile(), '{ broken');
+        await getSuspensionStore().load();
+      });
+
+      await updateAndWaitForEpisode(appPath, episodesBefore);
+
+      expect(fakeRuntime.runningNames()).not.toContain('site');
+      const [episode] = getDeployTracker().getEpisodes('site');
+      expect(getDeployDetailStore().getDetail(episode.deployId)?.errorCode).toBe('DEPLOY_STOPPED');
+    }, 40000);
   });
 
   describe('a re-check right before the build runs tenant code', () => {

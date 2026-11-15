@@ -29,6 +29,7 @@ import { getPublicUrl, setPublicUrl, isAccessGateEnabled, getIsolationMode } fro
 import { getMailCredentialStore, clearMailCredential } from '../../managers/mailer/mail-credential';
 import { sendMeteredMail } from './mail-quota';
 import { getPlatformOps } from '../platform-ops';
+import { refusalForApp, childrenOf } from '../../core/suspension-policy';
 import { getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import {
   getObjectStorageProvisioner,
@@ -314,7 +315,8 @@ admin.post('/apps/:name/suspend', async (c) => {
   const stateManager = getStateManager();
   const app = stateManager.getApp(appName);
 
-  if (!app) {
+  // A folder-dropped container has no state entry of its own, only children.
+  if (!app && childrenOf(appName).length === 0) {
     return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' not found`), 404);
   }
 
@@ -341,18 +343,7 @@ admin.post('/apps/:name/suspend', async (c) => {
   }
 
   if ('refused' in result) {
-    if (result.refused === 'case-collision') {
-      return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
-    }
-    return c.json(
-      error(
-        ErrorCodes.CONFLICT,
-        `'${appName}' is a monorepo container and runs nothing itself; suspend its services instead: ` +
-          (result.services.length > 0 ? result.services.join(', ') : '(none)'),
-        { services: result.services }
-      ),
-      409
-    );
+    return c.json(error(ErrorCodes.CONFLICT, caseCollisionMessage(appName, result.names), { names: result.names }), 409);
   }
 
   await logActivityFor(authCtx, {
@@ -401,7 +392,13 @@ admin.post('/apps/:name/unsuspend', async (c) => {
     return c.json(error(ErrorCodes.INTERNAL_ERROR, `Could not lift the suspension of '${appName}': ${message}`), 500);
   }
   if (!lifted) {
-    return c.json(error(ErrorCodes.NOT_FOUND, `Application '${appName}' is not suspended`), 404);
+    // A member of a suspended group has no record of its own: say whose it is.
+    const holder = refusalForApp(appName);
+    const detail =
+      holder?.reason === 'record' && holder.via !== undefined
+        ? `Application '${appName}' has no suspension of its own: it is suspended because '${holder.via}' is suspended. Lift that one.`
+        : `Application '${appName}' is not suspended`;
+    return c.json(error(ErrorCodes.NOT_FOUND, detail), 404);
   }
 
   await logActivityFor(authCtx, {

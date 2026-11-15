@@ -30,7 +30,7 @@ import { resolveGitBackedName } from '../git-backed';
 import { getStateManager } from '../../managers/app/state-manager';
 import { getAppConfigService, getAppConfigServiceOrNull } from '../../managers/app/app-config';
 import { getPlatformOps, AppInProgressError, AppSuspendedError } from '../../api/platform-ops';
-import { getSuspensionStore } from '../../managers/suspension';
+import { refusalForApp } from '../suspension-policy';
 import { getLogger } from '../../utils/logger';
 import { hasEnoughDisk, getMinFreeDiskMb } from '../../utils/disk';
 import { syncTree, DEFAULT_PRESERVE } from '../../utils/tree-sync';
@@ -412,8 +412,8 @@ export class UploadDeployService {
 
   /** Throws AppSuspendedError when the app is suspended (or the store cannot say), synchronously. */
   private assertNotSuspended(appName: string): void {
-    const suspension = getSuspensionStore().refusalFor(appName);
-    if (suspension) throw new AppSuspendedError(appName, suspension);
+    const suspension = refusalForApp(appName);
+    if (suspension) throw new AppSuspendedError(appName, suspension.reason, suspension.via);
   }
 
   /**

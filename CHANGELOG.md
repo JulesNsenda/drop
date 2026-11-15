@@ -27,6 +27,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-11-15
+
+### Changed
+
+- **A suspended app's hostnames stay claimed (#392).** While an app is
+  suspended, no other app can take its hostname through `domains:` (a covering
+  wildcard is refused as well). A live monorepo group's `<group>.<suffix>`
+  hostname belongs to its container and members. An app that already owns that
+  name through `domains:` keeps it, but a new group whose hostname is taken is
+  refused. Every suspension check now goes through one resolver: the app's own
+  record, then its container's, then a frozen group.
+- Suspending a monorepo container now takes all of its services down (and revokes their keys), and lifting it leaves them stopped. It used to be refused with a 409 telling the caller to suspend the services one by one. The admin suspend route now also accepts a folder-dropped container (one with no state entry of its own) that has services.
+
+### Security
+
+- **Nothing serves a suspended app, including after a restart.** No route is
+  written for an app (or monorepo group member) a suspension record holds: the
+  one route writer, `handleConfigureRoute`, withholds it (this is what controls
+  routes across a restart, since the managed Caddyfile is reset to its template
+  at every start), and a route reconfigure withdraws the routes instead of
+  rewriting them. Boot enforces the records before Caddy starts: a suspended
+  app's process is deleted (it would otherwise answer on its direct port and keep
+  its env key), as is an orphan instance of a suspended name that DROP has no
+  state for and that runs from an app or release tree, each deletion logged at
+  warn level; the orphan step also runs on the 15-minute pass. Minted keys of
+  every recorded name are revoked after the credentials load and before the API
+  listens. Withdrawal and deletion use the exact name attribution, never act
+  while the suspension file is unreadable (an error is logged every pass), and
+  never reach DROP's own service name, which a folder drop can no longer take.
+  A revoke that could not be made because the credentials are not loaded is now
+  reported (`api key: revoke deferred`) instead of reported as success.
+- **An app can no longer take the bundled Redis container's name.** Under
+  `isolation: docker` an app named `redis` ran as `drop-redis` and, on start,
+  force-removed the platform's Redis. The name, and the `build-` prefix (the
+  `drop-build-*` build container namespace), are now reserved ignoring case for
+  every caller including admins and folder-dropped apps. `ContainerManager`
+  only acts on containers labelled `drop.managed` that are neither
+  `drop.service` nor `drop.build`: it refuses to start over a container it does
+  not own, ignores stop/delete on one, acts through the inspected container id,
+  and leaves such containers out of the app list and count. The bundled Redis
+  start no longer removes a `drop-redis` container that is not its own.
+  `drop-platform` (DROP's own service name) is reserved the same way, so a
+  folder-dropped app with any of these names is no longer admitted. Rename it
+  before upgrading.
+- **hono 4.13.18 and `@hono/node-server` 2.1.8 (#405, #406).** These pick up
+  the upstream advisories. The one that matters most to DROP is in
+  `bodyLimit()`, which DROP's body-size limit uses: it kept every transfer chunk
+  of a request body in memory, so a request under the limit could still exhaust
+  memory. The others fix `validator()` skipping validation for some
+  `Content-Type` spellings, and `serveStatic()` path decoding.
+
+### Dependencies
+
+- jest 30 and eslint 10, both dev-only, in the root and the dashboard. The
+  dashboard's `eslint-plugin-react-hooks` moves from 5 to 7, which is the first
+  version that accepts eslint 10. Also patch updates: follow-redirects, the
+  aws-sdk clients, the MCP SDK, typescript-eslint, and the GitHub Actions in CI
+  (#398-#404).
+
 ## [1.8.0] - 2026-10-29
 
 ### Security

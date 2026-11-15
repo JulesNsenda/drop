@@ -32,6 +32,14 @@ import {
   CONTAINER_CAP_DROP,
   CONTAINER_SECURITY_OPT,
 } from '../runtime/container-config';
+import { REDIS_CONTAINER_NAME } from '../runtime/platform-containers';
+
+/** A container holds the platform Redis's name but is not the platform Redis. */
+class ForeignContainerError extends Error {
+  constructor(cName: string) {
+    super(`${cName} is held by a container that is not the platform Redis`);
+  }
+}
 
 export type RedisServerStatus = 'stopped' | 'starting' | 'running' | 'errored';
 
@@ -50,7 +58,7 @@ export interface RedisServerConfig {
   onLog?: (msg: string) => void;
 }
 
-const CONTAINER_NAME = 'drop-redis';
+const CONTAINER_NAME = REDIS_CONTAINER_NAME;
 const DEFAULT_IMAGE = 'redis:7-alpine';
 const DEFAULT_PORT = 6380;
 /** Non-root user shipped by the redis image; avoids the entrypoint's gosu (needs CAP_SETUID, which we drop). */
@@ -158,8 +166,17 @@ export class RedisServer {
     const docker = this.ensureDocker();
     try {
       const c = docker.getContainer(CONTAINER_NAME);
-      await c.remove({ force: true });
+      // Only ever remove our own: a tenant container that took the name is left alone.
+      const info = await c.inspect();
+      if (info?.Config?.Labels?.['drop.service'] !== 'redis') {
+        this.log(
+          `ERROR: ${CONTAINER_NAME} exists but is not the platform Redis; leaving it untouched, Redis will not start`
+        );
+        throw new ForeignContainerError(CONTAINER_NAME);
+      }
+      await docker.getContainer(info.Id ?? CONTAINER_NAME).remove({ force: true });
     } catch (err: unknown) {
+      if (err instanceof ForeignContainerError) throw err;
       // 404 = not present; anything else is unexpected but non-fatal for start
       // (createContainer will surface a real conflict).
       if (!this.isNotFound(err)) {

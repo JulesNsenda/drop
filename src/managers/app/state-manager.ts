@@ -171,6 +171,14 @@ export interface AppState {
    * expansion, so pre-existing phantoms self-heal on the next redeploy.
    */
   isGroupContainer?: boolean;
+  /**
+   * The trust `expandMonorepo` decided for this container (the operator's, or
+   * an enabled admin's: true; anyone else's: false), kept so a SYNCHRONOUS reader
+   * (the suspension resolver) can compare group names the way the expansion did:
+   * exactly when true, ignoring case when false. Absent on a legacy entry.
+   * Platform-written only; no route lets a client set it.
+   */
+  groupTrusted?: boolean;
 }
 
 export interface StateManagerConfig {
@@ -341,6 +349,24 @@ export class AppStateManager {
     return app;
   }
 
+  /**
+   * Forget the group-trust decision of every container this user owns. Asked
+   * when the user's standing changes (a role change, a disable): the decision
+   * was made for the owner they were. Returns the containers it cleared.
+   */
+  async clearGroupTrustOf(userId: string): Promise<string[]> {
+    const cleared: string[] = [];
+    for (const [name, app] of this.apps) {
+      if (app.userId !== userId || !app.isGroupContainer || app.groupTrusted === undefined) continue;
+      const updated: AppState = { ...app, updatedAt: new Date().toISOString() };
+      delete updated.groupTrusted;
+      this.apps.set(name, updated);
+      cleared.push(name);
+    }
+    if (cleared.length > 0) this.scheduleSave();
+    return cleared;
+  }
+
   async updateApp(name: string, updates: Partial<AppState>): Promise<AppState | null> {
     const app = this.apps.get(name);
     if (!app) return null;
@@ -350,6 +376,12 @@ export class AppStateManager {
       ...updates,
       updatedAt: new Date().toISOString(),
     };
+    // `groupTrusted` is the trust decision made for the owner who expanded this
+    // container. A new owner has made none: drop it (read as legacy, which gates
+    // cautiously and destroys narrowly) unless the same write sets it afresh.
+    if ('userId' in updates && updates.userId !== app.userId && updates.groupTrusted === undefined) {
+      delete updated.groupTrusted;
+    }
 
     this.apps.set(name, updated);
     this.scheduleSave();
@@ -575,6 +607,11 @@ export function getStateManager(config?: StateManagerConfig): AppStateManager {
     stateManagerInstance = new AppStateManager(config);
   }
   return stateManagerInstance;
+}
+
+/** `clearGroupTrustOf` on the platform's state, a no-op where there is none (an API served without a platform). */
+export async function clearGroupTrustForUser(userId: string): Promise<string[]> {
+  return stateManagerInstance ? stateManagerInstance.clearGroupTrustOf(userId) : [];
 }
 
 export function resetStateManager(): void {

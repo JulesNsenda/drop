@@ -17,7 +17,10 @@ function makeDockerMock() {
   const createContainer = jest.fn().mockResolvedValue({ start });
   const docker = {
     getImage: jest.fn().mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) }),
-    getContainer: jest.fn().mockReturnValue({ remove }),
+    getContainer: jest.fn().mockReturnValue({
+      remove,
+      inspect: jest.fn().mockResolvedValue({ Config: { Labels: { 'drop.service': 'redis' } } }),
+    }),
     createContainer,
     pull: jest.fn(),
     modem: { followProgress: jest.fn() },
@@ -78,6 +81,21 @@ describe('RedisServer', () => {
       const server = new RedisServer({ dropRoot: tmpDir, useDocker: true, docker: docker as never });
       await server.start();
       expect(remove).toHaveBeenCalledWith({ force: true });
+    });
+
+    it('leaves a drop-redis container it does not own untouched and fails the start', async () => {
+      const { docker, remove, createContainer } = makeDockerMock();
+      docker.getContainer.mockReturnValue({
+        remove,
+        inspect: jest.fn().mockResolvedValue({ Config: { Labels: { 'drop.managed': 'true' } } }),
+      });
+      const server = new RedisServer({ dropRoot: tmpDir, useDocker: true, docker: docker as never });
+
+      await expect(server.start()).rejects.toThrow(/not the platform Redis/);
+
+      expect(remove).not.toHaveBeenCalled();
+      expect(createContainer).not.toHaveBeenCalled();
+      expect(server.getStatus()).toBe('errored');
     });
 
     it('surfaces a start failure as errored and rethrows', async () => {

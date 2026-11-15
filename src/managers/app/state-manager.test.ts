@@ -372,6 +372,33 @@ describe('AppStateManager', () => {
       expect(updated!.pid).toBe(12345);
     });
 
+    it('clears groupTrusted when the owner changes, unless the same write sets it', async () => {
+      await manager.updateApp('update-app', { userId: 'alice', group: 'g', isGroupContainer: true, groupTrusted: true });
+      await manager.updateApp('update-app', { port: 1 });
+      expect(manager.getApp('update-app')!.groupTrusted).toBe(true);
+      await manager.updateApp('update-app', { userId: 'alice' });
+      expect(manager.getApp('update-app')!.groupTrusted).toBe(true);
+
+      await manager.updateApp('update-app', { userId: 'bob' });
+      expect(manager.getApp('update-app')!.groupTrusted).toBeUndefined();
+
+      await manager.updateApp('update-app', { groupTrusted: false });
+      await manager.updateApp('update-app', { userId: 'carol', groupTrusted: true });
+      expect(manager.getApp('update-app')!.groupTrusted).toBe(true);
+    });
+
+    it('clearGroupTrustOf clears only that user\'s containers', async () => {
+      await manager.registerApp('c1', '/p');
+      await manager.registerApp('c2', '/p');
+      await manager.updateApp('c1', { userId: 'u1', isGroupContainer: true, groupTrusted: true });
+      await manager.updateApp('c2', { userId: 'u2', isGroupContainer: true, groupTrusted: true });
+
+      expect(await manager.clearGroupTrustOf('u1')).toEqual(['c1']);
+
+      expect(manager.getApp('c1')!.groupTrusted).toBeUndefined();
+      expect(manager.getApp('c2')!.groupTrusted).toBe(true);
+    });
+
     it('should return null for non-existent app', async () => {
       const result = await manager.updateApp('non-existent', { port: 3000 });
       expect(result).toBeNull();

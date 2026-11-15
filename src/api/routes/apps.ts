@@ -27,6 +27,7 @@ import {
   type AttachableServiceId,
 } from '../platform-ops';
 import { getSuspensionStore } from '../../managers/suspension';
+import { refusalForApp } from '../../core/suspension-policy';
 import { getSecretManager } from '../../managers/secret';
 import { getDeployTracker } from '../../managers/deploy-tracker';
 import { migrateAppRuntime } from '../../managers/runtime/runtime-migrator';
@@ -176,28 +177,29 @@ function sanitizeRepoUrl(repoUrl: string): string {
 }
 
 /**
- * The suspension as the wire shows it, from the store's one refusal predicate.
- * Everyone learns THAT the app cannot be started (and, for a real record, since
- * when); who and why is for admins. A store that is unreadable or not loaded
- * refuses every app, and only an admin is told that is the cause: anyone else
- * just sees a suspension, and no detail of the platform's own state.
+ * The suspension as the wire shows it, from the one resolver (the app's own
+ * record, or its monorepo group's: `via` names the other app). Everyone learns
+ * THAT the app cannot be started (and, for a real record, since when); who and
+ * why is for admins. A store that is unreadable or not loaded refuses every app,
+ * and only an admin is told that is the cause: anyone else just sees a
+ * suspension, and no detail of the platform's own state.
  */
 function suspendedDto(appName: string, isAdmin: boolean): AppDto['suspended'] {
-  const store = getSuspensionStore();
-  const refusal = store.refusalFor(appName);
-  if (!refusal) return undefined;
-  if (refusal !== 'record') return isAdmin ? { kind: refusal } : { kind: 'record' };
-  const record = store.get(appName);
-  if (!record) return { kind: 'record' };
+  const verdict = refusalForApp(appName);
+  if (!verdict) return undefined;
+  if (verdict.reason !== 'record') return isAdmin ? { kind: verdict.reason } : { kind: 'record' };
+  const via = verdict.via !== undefined ? { via: verdict.via } : {};
+  const record = getSuspensionStore().get(verdict.via ?? appName);
+  if (!record) return { kind: 'record', ...via };
   return isAdmin
-    ? { kind: 'record', at: record.at, by: record.by, reason: record.reason }
-    : { kind: 'record', at: record.at };
+    ? { kind: 'record', ...via, at: record.at, by: record.by, reason: record.reason }
+    : { kind: 'record', ...via, at: record.at };
 }
 
 /** The refusal a start of this app would meet, for a route that must refuse BEFORE it changes anything. */
 function suspensionRefusal(appName: string): AppSuspendedError | null {
-  const refusal = getSuspensionStore().refusalFor(appName);
-  return refusal ? new AppSuspendedError(appName, refusal) : null;
+  const verdict = refusalForApp(appName);
+  return verdict ? new AppSuspendedError(appName, verdict.reason, verdict.via) : null;
 }
 
 // Helper to convert AppState to AppDto (role-aware)
@@ -1346,7 +1348,7 @@ const REDEPLOY_REFUSALS: Record<RedeployRefusalCode, { status: 400 | 404 | 409 |
 
 function redeployRefusalResponse(c: Context, refusal: RedeployRefusal, appName: string) {
   if (refusal.code === 'APP_SUSPENDED') {
-    return appSuspendedResponse(c, new AppSuspendedError(appName, refusal.suspension));
+    return appSuspendedResponse(c, new AppSuspendedError(appName, refusal.suspension, refusal.via));
   }
   const { status, code } = REDEPLOY_REFUSALS[refusal.code];
   if (refusal.retryAfterSeconds !== undefined) c.header('Retry-After', String(refusal.retryAfterSeconds));

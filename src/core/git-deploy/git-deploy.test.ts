@@ -2206,6 +2206,28 @@ describe('GitDeployService', () => {
       expect(service.findAppsForWebhook(`https://github.com/user/${appName}`, 'main')).toEqual([appName]);
     });
 
+    it("a git-deployed CONTAINER is frozen by a suspended member: no webhook match, no queued push, no pull", async () => {
+      const appName = 'frozen-site';
+      await service.deploy({ repoUrl: `https://github.com/user/${appName}`, branch: 'main', autoRedeploy: true });
+      const state = getStateManager();
+      await state.updateApp(appName, { isGroupContainer: true, group: appName } as never);
+      await state.registerApp('frozen-site-kid', path.join(tempDir, 'webapps', 'frozen-site-kid'), 'static');
+      await state.updateApp('frozen-site-kid', { group: appName } as never);
+      expect(service.findAppsForWebhook(`https://github.com/user/${appName}`, 'main')).toEqual([appName]);
+      await getSuspensionStore().suspend('frozen-site-kid', 'admin-1');
+      (execFile as unknown as jest.Mock).mockClear();
+
+      expect(service.findAppsForWebhook(`https://github.com/user/${appName}`, 'main')).toEqual([]);
+      service.queueRedeploy(appName, { automation: 'webhook' });
+      expect((service as unknown as { pending: Map<string, unknown> }).pending.size).toBe(0);
+      await expect(service.redeploy(appName, { automation: 'webhook' }, null)).rejects.toMatchObject({
+        code: 'APP_SUSPENDED',
+        via: 'frozen-site-kid',
+      });
+      expect(gitCalls('clone')).toHaveLength(0);
+      expect(gitCalls('pull')).toHaveLength(0);
+    });
+
     it('webhook matching skips every app while the store cannot answer', async () => {
       await service.deploy({ repoUrl: 'https://github.com/user/any-hook', branch: 'main', autoRedeploy: true });
       resetSuspensionStore();

@@ -14,6 +14,7 @@ import { pathTaken } from '../utils/paths';
 import type { AppStateManager } from '../managers/app/state-manager';
 import type { AppConfigService } from '../managers/app/app-config';
 import { getSuspensionStore } from '../managers/suspension';
+import { isReservedName } from '../managers/runtime/platform-containers';
 
 /**
  * Existing APP names (state and config) that equal `name` ignoring case but are
@@ -64,6 +65,9 @@ export function isNameTaken(
   // An unreadable suspension store cannot say which names it holds. (An UNLOADED one is not
   // treated the same: it is an early-boot state, and every test that never loads it would refuse.)
   if (getSuspensionStore().refusalFor(name) === 'store-unreadable') return true;
+  // DROP's own service name, or (under docker isolation, where an app's container is
+  // `drop-<name>`) `redis`, the bundled Redis: reserved for everyone.
+  if (isReservedName(name)) return true;
   const wanted = name.toLowerCase();
   const same = (other: string | undefined): boolean => other?.toLowerCase() === wanted;
   const own = deps.ownGroup?.toLowerCase();
@@ -111,6 +115,8 @@ export async function isNewNameRefused(
     appConfigService?: AppConfigService;
   }
 ): Promise<boolean> {
+  // Before the admin exemption: such a name can never run under docker, so no caller benefits from it.
+  if (isReservedName(name)) return true;
   if (deps.callerIsAdmin) return false;
   if (await pathTaken(path.join(deps.appsDirectory, name))) return true;
   return isNameTaken(name, { stateManager: deps.stateManager, appConfigService: deps.appConfigService });

@@ -144,21 +144,23 @@ export class SuspensionStore {
     return this.corrupt;
   }
 
+  /** Why the store cannot answer for ANY app (`not-loaded` or `store-unreadable`), or null when it can. */
+  availability(): Exclude<SuspensionRefusal, 'record'> | null {
+    if (!this.loaded) return 'not-loaded';
+    return this.corrupt ? 'store-unreadable' : null;
+  }
+
   /**
-   * THE refusal predicate: why a start of this app must be refused, or null.
+   * Why a start of THIS NAME must be refused by its own record, or null.
    * `not-loaded` and `store-unreadable` refuse EVERY app (the store cannot say
-   * either way); `record` is one app's own suspension. Everything that decides
-   * "refuse?" reads this, so no caller can disagree about what the cases are.
+   * either way); `record` is one name's own suspension. It knows nothing about
+   * an app's monorepo group, so it is not the answer to "is this app refused?":
+   * that is `refusalForApp` (core/suspension-policy), which every reader uses.
    */
   refusalFor(appName: string): SuspensionRefusal | null {
     if (!this.loaded) return 'not-loaded';
     if (this.corrupt) return 'store-unreadable';
     return this.records.has(keyOf(appName)) ? 'record' : null;
-  }
-
-  /** Whether starts and builds of the app must be refused (see `refusalFor`). */
-  isSuspended(appName: string): boolean {
-    return this.refusalFor(appName) !== null;
   }
 
   /** The app's record, or undefined (also undefined while unavailable: there is nothing to report). */

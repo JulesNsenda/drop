@@ -9,8 +9,8 @@ import * as path from 'path';
 import * as output from '../utils/output';
 import { DropPlatform } from '../../core/platform';
 import * as pm2Client from '../../managers/process/pm2-client';
+import { DROP_SERVICE_NAME } from '../../utils/service-name';
 
-const DROP_SERVICE_NAME = 'drop-platform';
 
 function printBanner(): void {
   output.print('');

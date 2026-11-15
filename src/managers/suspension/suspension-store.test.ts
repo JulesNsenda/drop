@@ -26,7 +26,7 @@ describe('SuspensionStore', () => {
     const store = new SuspensionStore(file);
     await store.load();
     expect(store.isCorrupt()).toBe(false);
-    expect(store.isSuspended('shop')).toBe(false);
+    expect(store.refusalFor('shop') !== null).toBe(false);
   });
 
   it('persists a suspension and reloads it', async () => {
@@ -34,13 +34,13 @@ describe('SuspensionStore', () => {
     await store.load();
     const record = await store.suspend('shop', 'admin-1', 'abuse');
     expect(record).toMatchObject({ by: 'admin-1', reason: 'abuse' });
-    expect(store.isSuspended('shop')).toBe(true);
+    expect(store.refusalFor('shop') !== null).toBe(true);
 
     const reloaded = new SuspensionStore(file);
     await reloaded.load();
-    expect(reloaded.isSuspended('shop')).toBe(true);
+    expect(reloaded.refusalFor('shop') !== null).toBe(true);
     expect(reloaded.get('shop')).toMatchObject({ by: 'admin-1', reason: 'abuse' });
-    expect(reloaded.isSuspended('other')).toBe(false);
+    expect(reloaded.refusalFor('other') !== null).toBe(false);
   });
 
   it('lifts a suspension on disk and in memory', async () => {
@@ -48,21 +48,21 @@ describe('SuspensionStore', () => {
     await store.load();
     await store.suspend('shop', 'admin-1');
     expect(await store.unsuspend('shop')).toBe(true);
-    expect(store.isSuspended('shop')).toBe(false);
+    expect(store.refusalFor('shop') !== null).toBe(false);
     expect(await store.unsuspend('shop')).toBe(false);
 
     const reloaded = new SuspensionStore(file);
     await reloaded.load();
-    expect(reloaded.isSuspended('shop')).toBe(false);
+    expect(reloaded.refusalFor('shop') !== null).toBe(false);
   });
 
   it('does not treat inherited object members as suspended names', async () => {
     const store = new SuspensionStore(file);
     await store.load();
     await store.suspend('shop', 'admin-1');
-    expect(store.isSuspended('constructor')).toBe(false);
-    expect(store.isSuspended('__proto__')).toBe(false);
-    expect(store.isSuspended('toString')).toBe(false);
+    expect(store.refusalFor('constructor') !== null).toBe(false);
+    expect(store.refusalFor('__proto__') !== null).toBe(false);
+    expect(store.refusalFor('toString') !== null).toBe(false);
   });
 
   it('fails closed on a corrupt file: every app is suspended and writes refuse', async () => {
@@ -72,7 +72,7 @@ describe('SuspensionStore', () => {
     const store = new SuspensionStore(file);
     await store.load();
     expect(store.isCorrupt()).toBe(true);
-    expect(store.isSuspended('anything')).toBe(true);
+    expect(store.refusalFor('anything') !== null).toBe(true);
     await expect(store.suspend('shop', 'admin-1')).rejects.toBeInstanceOf(SuspensionStoreCorruptError);
     await expect(store.unsuspend('shop')).rejects.toBeInstanceOf(SuspensionStoreCorruptError);
     // The unreadable bytes are left alone.
@@ -86,8 +86,8 @@ describe('SuspensionStore', () => {
     const store = new SuspensionStore(file);
     await store.load();
     expect(store.isCorrupt()).toBe(true);
-    expect(store.isSuspended('shop')).toBe(true);
-    expect(store.isSuspended('unrelated')).toBe(true);
+    expect(store.refusalFor('shop') !== null).toBe(true);
+    expect(store.refusalFor('unrelated') !== null).toBe(true);
   });
 
   it('fails closed when the path is unreadable for a reason other than absence', async () => {
@@ -96,7 +96,7 @@ describe('SuspensionStore', () => {
     const store = new SuspensionStore(file);
     await store.load();
     expect(store.isCorrupt()).toBe(true);
-    expect(store.isSuspended('anything')).toBe(true);
+    expect(store.refusalFor('anything') !== null).toBe(true);
   });
 
   it('a failed write changes nothing: a failed suspend suspends nothing, a failed unsuspend lifts nothing', async () => {
@@ -108,10 +108,10 @@ describe('SuspensionStore', () => {
     await fs.rm(file);
     await fs.mkdir(file);
     await expect(store.unsuspend('shop')).rejects.toBeDefined();
-    expect(store.isSuspended('shop')).toBe(true);
+    expect(store.refusalFor('shop') !== null).toBe(true);
 
     await expect(store.suspend('other', 'admin-1')).rejects.toBeDefined();
-    expect(store.isSuspended('other')).toBe(false);
+    expect(store.refusalFor('other') !== null).toBe(false);
   });
 
   it('serialises overlapping changes: an unsuspend then a suspend of the same app ends suspended, in memory and on disk', async () => {
@@ -124,7 +124,7 @@ describe('SuspensionStore', () => {
     const again = store.suspend('shop', 'admin-2');
     await Promise.all([lifted, again]);
 
-    expect(store.isSuspended('shop')).toBe(true);
+    expect(store.refusalFor('shop') !== null).toBe(true);
     expect(store.get('shop')?.by).toBe('admin-2');
     const reloaded = new SuspensionStore(file);
     await reloaded.load();
@@ -136,29 +136,29 @@ describe('SuspensionStore', () => {
     await store.load();
     await store.suspend('Shop', 'admin-1');
 
-    expect(store.isSuspended('shop')).toBe(true);
-    expect(store.isSuspended('SHOP')).toBe(true);
+    expect(store.refusalFor('shop') !== null).toBe(true);
+    expect(store.refusalFor('SHOP') !== null).toBe(true);
     expect(store.get('shop')?.app).toBe('Shop');
     expect(store.list()[0].name).toBe('Shop');
 
     const reloaded = new SuspensionStore(file);
     await reloaded.load();
-    expect(reloaded.isSuspended('sHoP')).toBe(true);
+    expect(reloaded.refusalFor('sHoP') !== null).toBe(true);
 
     expect(await store.unsuspend('sHOP')).toBe(true);
-    expect(store.isSuspended('Shop')).toBe(false);
+    expect(store.refusalFor('Shop') !== null).toBe(false);
   });
 
   it('fails closed until it has been loaded, and refuses changes meanwhile', async () => {
     const store = new SuspensionStore(file);
     expect(store.isCorrupt()).toBe(false);
     expect(store.refusalFor('anything')).toBe('not-loaded');
-    expect(store.isSuspended('anything')).toBe(true);
+    expect(store.refusalFor('anything') !== null).toBe(true);
     await expect(store.suspend('shop', 'admin-1')).rejects.toBeInstanceOf(SuspensionStoreCorruptError);
 
     await store.load();
     expect(store.refusalFor('anything')).toBeNull();
-    expect(store.isSuspended('anything')).toBe(false);
+    expect(store.refusalFor('anything') !== null).toBe(false);
   });
 
   it('refusalFor is the one predicate: a record, an unreadable store, or a store not loaded yet', async () => {
