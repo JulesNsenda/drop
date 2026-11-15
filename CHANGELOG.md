@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`install.sh --bootstrap --isolation=docker` no longer stops silently after
+  the image pre-pull.** `ensure_docker` ended on a `[[ … ]] && …` test that is
+  false unless `--userns-remap` is passed, so under `set -e` the installer exited
+  1 before writing the provisioning script, the systemd unit or Caddy. The same
+  line would have failed every deploy's `--provision` on a docker box once its
+  provisioning copy was current (#277). This has been broken since 1.6.0.
+
 ## [1.8.1] - 2026-11-15
 
 ### Changed
