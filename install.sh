@@ -324,7 +324,11 @@ ensure_docker() {
     docker pull "$img" 2>&1 | tail -1 || warn "Failed to pre-pull $img — will retry on first deploy"
   done
 
-  [[ "$USERNS_REMAP" == "1" ]] && ensure_userns_remap
+  # An `if`, not `[[ … ]] && …`: as a function's last command, a false test
+  # makes the function return 1, and `set -e` then aborts the whole install.
+  if [[ "$USERNS_REMAP" == "1" ]]; then
+    ensure_userns_remap
+  fi
 }
 
 # ── docker userns-remap (Tier B, OPT-IN) ─────────────────────────────────────
