@@ -2339,6 +2339,10 @@ backup:
     this.postgresServer = getPostgresServer({
       dropRoot: this.config.dropRoot,
       onLog: (msg) => this.logger.debug(msg, 'POSTGRES'),
+      // Running version + missing-security-fix warning (#410): must show at
+      // the default log level, which onLog's debug would hide.
+      onNotice: (level, msg) =>
+        level === 'warn' ? this.logger.warn(msg, 'DATABASE') : this.logger.info(msg, 'DATABASE'),
       // In docker mode the socket is bind-mounted into containers; a trust
       // pg_hba would give containers unauthenticated superuser access.
       strictSecure: this.config.isolation === 'docker',

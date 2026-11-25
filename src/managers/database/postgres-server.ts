@@ -8,7 +8,7 @@ import { spawn, ChildProcess, execSync } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { Pool, PoolConfig, escapeIdentifier, escapeLiteral } from 'pg';
-import { PostgresBinaries, BinaryPaths } from './postgres-binaries';
+import { PostgresBinaries, BinaryPaths, postgresSecurityWarning } from './postgres-binaries';
 import {
   resolveSuperuserPassword,
   hbaNeedsMigration,
@@ -22,6 +22,11 @@ export interface PostgresServerConfig {
   port?: number;
   /** Callback for log messages */
   onLog?: (message: string) => void;
+  /**
+   * Operator-facing notices that must survive the default log level (onLog is
+   * wired to debug by the platform). Falls back to onLog when absent.
+   */
+  onNotice?: (level: 'info' | 'warn', message: string) => void;
   /**
    * When true, a failure in secureSuperuser() throws instead of just logging.
    * Required in docker isolation mode — a trust pg_hba with socket-mounted
@@ -264,6 +269,7 @@ export class PostgresServer {
       this.status = 'running';
       await this.initializePool();
       await this.secureSuperuser();
+      await this.reportServerVersion();
       return;
     }
 
@@ -281,9 +287,40 @@ export class PostgresServer {
       await this.secureSuperuser();
       this.status = 'running';
       this.log(`PostgreSQL started on port ${this.port}`);
+      await this.reportServerVersion();
     } catch (error) {
       this.status = 'error';
       throw error;
+    }
+  }
+
+  /**
+   * Log the version of the server actually running (system package, download,
+   * or an adopted postmaster all look the same from here) and warn loudly when
+   * it misses security fixes (#410). Informational only: never throws, since a
+   * failed version query must not take the platform down.
+   */
+  private async reportServerVersion(): Promise<void> {
+    if (!this.pool) return;
+    try {
+      const res = await this.pool.query<{ v: string; n: string }>(
+        `SELECT current_setting('server_version') AS v, current_setting('server_version_num') AS n`
+      );
+      const row = res.rows[0];
+      if (!row) return;
+      this.notice('info', `PostgreSQL server version: ${row.v}`);
+      const warning = postgresSecurityWarning(Number(row.n));
+      if (warning) this.notice('warn', warning);
+    } catch (err) {
+      this.notice('warn', `Could not read PostgreSQL server version: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  private notice(level: 'info' | 'warn', message: string): void {
+    if (this.config.onNotice) {
+      this.config.onNotice(level, message);
+    } else {
+      this.log(level === 'warn' ? `WARNING: ${message}` : message);
     }
   }
 
