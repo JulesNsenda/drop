@@ -1196,8 +1196,8 @@ describe('selectBaseImage', () => {
     expect(tagOf(selectBaseImage('fastapi'))).toBe('python:3.12-slim');
   });
 
-  it('returns golang:1.22-alpine for go', () => {
-    expect(tagOf(selectBaseImage('go'))).toBe('golang:1.22-alpine');
+  it('returns golang:1.27-alpine for go', () => {
+    expect(tagOf(selectBaseImage('go'))).toBe('golang:1.27-alpine');
   });
 
   it('returns nginx:alpine for static', () => {

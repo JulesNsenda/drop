@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Tenant base images refreshed, and Go moves from 1.22 to 1.27** (#412).
+  `node:22-slim` (Node 22.23.5), `python:3.12-slim` and `nginx:alpine` get
+  current digests. `golang:1.22-alpine`, end-of-life since February 2025,
+  becomes `golang:1.27-alpine`; a module's `go` directive still decides its
+  language semantics. **Under `isolation: docker` every app redeploys once on
+  the first boot after upgrading.** Pre-pull the new images before restarting
+  (see docs/DOCKER-ISOLATION.md) or that boot can hit Docker Hub's anonymous
+  rate limit. Apps under `isolation: none` redeploy once on this upgrade too,
+  because the restart check's inputs changed shape. After that they never
+  redeploy for a base-image change: image pins now count only in docker mode.
+
 ### Fixed
 
 - **`install.sh --bootstrap --isolation=docker` no longer stops silently after

@@ -81,7 +81,7 @@ describe('toolchainIdFromImage', () => {
   it('is null for a non-node image or a tag-less/odd reference', () => {
     expect(toolchainIdFromImage('python:3.12-slim')).toBeNull();
     expect(toolchainIdFromImage('nginx:alpine')).toBeNull();
-    expect(toolchainIdFromImage('golang:1.22-alpine')).toBeNull();
+    expect(toolchainIdFromImage('golang:1.27-alpine')).toBeNull();
     expect(toolchainIdFromImage('node')).toBeNull();
     expect(toolchainIdFromImage('node:lts-slim')).toBeNull();
     expect(toolchainIdFromImage('evil/node:20-slim')).toBeNull();

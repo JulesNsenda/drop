@@ -25,6 +25,7 @@ import { NODE_RUNTIME_TYPES } from '../../core/builder/node-types';
 import type { AppType } from '../../core/detector/detector.types';
 
 const baseInputs: ContainerPolicyInputs = {
+  isolation: 'docker',
   apiPort: 3000,
   maxMemoryMbPerApp: 0,
   maxCpusPerApp: 0,
@@ -82,6 +83,7 @@ describe('containerPolicyFingerprint — pgSocketDir (DROP-072)', () => {
     const withUndefinedKey = containerPolicyFingerprint(baseInputs);
 
     const withoutKey = containerPolicyFingerprint({
+      isolation: baseInputs.isolation,
       apiPort: baseInputs.apiPort,
       maxMemoryMbPerApp: baseInputs.maxMemoryMbPerApp,
       maxCpusPerApp: baseInputs.maxCpusPerApp,
@@ -108,6 +110,35 @@ describe('containerPolicyFingerprint — pgSocketDir (DROP-072)', () => {
     expect(payloadKeys).toEqual(
       expect.arrayContaining(['imageDigests', 'readonlyRootfs', 'tmpfs', 'containerDataDir'])
     );
+  });
+});
+
+describe('containerPolicyFingerprint — isolation gating (#412)', () => {
+  const noneInputs: ContainerPolicyInputs = { ...baseInputs, isolation: 'none' };
+
+  it('hashes no container constants for a PM2 (isolation none) app', () => {
+    // A base-image digest refresh must not redeploy every PM2 app on every
+    // isolation-none install for an image it never runs.
+    expect(Object.keys(fingerprintPayloadForTest(noneInputs)).sort()).toEqual(
+      ['apiPort', 'maxCpusPerApp', 'maxMemoryMbPerApp']
+    );
+  });
+
+  it('still hashes the base images and digests under docker isolation', () => {
+    expect(Object.keys(fingerprintPayloadForTest(baseInputs))).toEqual(
+      expect.arrayContaining(['baseImages', 'imageDigests', 'imageUsers'])
+    );
+  });
+
+  it('still reacts to the operator-tunable inputs under isolation none', () => {
+    const a = containerPolicyFingerprint(noneInputs);
+    expect(containerPolicyFingerprint({ ...noneInputs, apiPort: 3001 })).not.toBe(a);
+    expect(containerPolicyFingerprint({ ...noneInputs, maxMemoryMbPerApp: 512 })).not.toBe(a);
+    expect(containerPolicyFingerprint({ ...noneInputs, maxCpusPerApp: 1 })).not.toBe(a);
+  });
+
+  it('gives the two modes different fingerprints for the same tunables', () => {
+    expect(containerPolicyFingerprint(noneInputs)).not.toBe(containerPolicyFingerprint(baseInputs));
   });
 });
 

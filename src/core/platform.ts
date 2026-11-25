@@ -2932,6 +2932,26 @@ backup:
   }
 
   /**
+   * The container-policy fingerprint for THIS box, right now. The ONE place its
+   * inputs are built: the deploy that records it and the boot check that
+   * compares it must agree exactly, or every app redeploys on every boot.
+   */
+  private currentPolicyFingerprint(): string {
+    return containerPolicyFingerprint({
+      isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
+      apiPort: this.config.apiPort,
+      maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
+      maxCpusPerApp: this.config.maxCpusPerApp,
+      // DROP-072: same gating as the actual mount/env-var call sites
+      // (buildStartSpec) — undefined outside docker isolation.
+      pgSocketDir:
+        this.config.isolation === 'docker'
+          ? (this.postgresServer?.getSocketDir() ?? undefined)
+          : undefined,
+    });
+  }
+
+  /**
    * Record the source-mtime signature, secret-set fingerprint, and current
    * runtime-spec revision observed at THIS successful deploy — read back by
    * reconcileAppsOnBoot (M1) on the NEXT boot to decide skip vs redeploy.
@@ -2974,17 +2994,7 @@ backup:
       await this.appConfigService.updateConfig(appName, {
         ...(sourceHash !== undefined ? { sourceHash } : {}),
         ...(secretFingerprint !== undefined ? { secretFingerprint } : {}),
-        runtimeSpecFingerprint: containerPolicyFingerprint({
-          apiPort: this.config.apiPort,
-          maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
-          maxCpusPerApp: this.config.maxCpusPerApp,
-          // DROP-072: same gating as the actual mount/env-var call sites
-          // (buildStartSpec) — undefined outside docker isolation.
-          pgSocketDir:
-            this.config.isolation === 'docker'
-              ? (this.postgresServer?.getSocketDir() ?? undefined)
-              : undefined,
-        }),
+        runtimeSpecFingerprint: this.currentPolicyFingerprint(),
       });
     } catch (error) {
       this.logger.warn(`Failed to record deploy signature for ${appName}`, 'BOOT', error);
@@ -3442,17 +3452,7 @@ backup:
       // CheapBootReconcileInput.runtimeSpecCurrent's doc comment.
       const runtimeSpecCurrent =
         config.runtimeSpecFingerprint ===
-        containerPolicyFingerprint({
-          apiPort: this.config.apiPort,
-          maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
-          maxCpusPerApp: this.config.maxCpusPerApp,
-          // DROP-072: same gating as the actual mount/env-var call sites
-          // (buildStartSpec) — undefined outside docker isolation.
-          pgSocketDir:
-            this.config.isolation === 'docker'
-              ? (this.postgresServer?.getSocketDir() ?? undefined)
-              : undefined,
-        });
+        this.currentPolicyFingerprint();
       // Port drift (M1 review item H): the skip path trusts config.port to
       // reconcile routing, but the runtime's own report is right there —
       // if they disagree, a routing-only skip would publish the app's

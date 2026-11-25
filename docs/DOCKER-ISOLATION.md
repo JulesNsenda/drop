@@ -131,7 +131,25 @@ pre-pull list in `install.sh` — a test fails the build if the two disagree.
 
 A refresh changes `containerPolicyFingerprint`, so every docker-mode app is
 redeployed once on the next boot. That is intended: recreating the container is
-the only way a new base image reaches an already-running app.
+the only way a new base image reaches an already-running app. Apps under
+`isolation: none` are not affected: the image constants are hashed only in
+docker mode.
+
+**On a running docker host, pre-pull before restarting into the new build.**
+DROP pulls anonymously (dockerode does not read `~/.docker/config.json`), so a
+boot that redeploys every app at once can hit Docker Hub's anonymous rate limit
+and fail every redeploy with a 429 (the old containers keep serving, but each
+app shows as errored and is retried on every boot). Pull the new references
+first; DROP inspects before pulling, so cached images skip the registry:
+
+```bash
+for ref in $(grep -oE '"[a-z0-9.:/-]+@sha256:[0-9a-f]{64}"' install.sh | tr -d '"'); do
+  docker pull "$ref" && docker image inspect "$ref" --format '{{.Id}}' >/dev/null
+done
+```
+
+Afterwards, `docker image rm` the superseded `@sha256:` references to reclaim
+disk.
 
 `DROP_DISABLE_IMAGE_PINNING=true` falls back to bare tags. It exists for an
 operator on a private mirror that does not carry these digests — a wrong pin
