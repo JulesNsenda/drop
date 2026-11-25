@@ -5916,6 +5916,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // start a duplicate build.
     this.pendingBuilds.delete(appName);
     this.appsInProgress.add(appName);
+    // #420: taken here, so it applies to this build only (see bootServedApps).
+    const bootServed = this.bootServedApps.get(appName);
+    this.bootServedApps.delete(appName);
 
     this.logger.appEvent('building', appName);
 
@@ -6085,14 +6088,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.appsInProgress.delete(appName);
         await this.discardDeployTarget(appName);
         this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
+        if (bootServed) this.bootServedApps.set(appName, bootServed);
         this.scheduleBuildDrain();
       } else {
         this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
-        if (this.stateManager) {
-          await this.stateManager.setAppStatus(appName, 'errored', {
-            error: result.errors?.[0]?.message || 'Build failed',
-          });
-        }
+        await this.settleFailedBuildStatus(appName, result.errors?.[0]?.message || 'Build failed', bootServed);
         // The COMMONEST failure, and the one a loop is actually made of: the
         // build ran and returned unsuccessfully. failDeployEpisode does not
         // fire here (the builder published its own episode), so without this
@@ -6129,9 +6129,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
       this.logger.appEvent('error', appName, err.message);
-      if (this.stateManager) {
-        await this.stateManager.setAppStatus(appName, 'errored', { error: err.message });
-      }
+      await this.settleFailedBuildStatus(
+        appName,
+        err.message,
+        this.deployEpisodeOpen(appName) ? undefined : bootServed
+      );
       // A throw BEFORE builder.build() (detection, the disk check,
       // resolveBuildEnv, a malformed drop.yaml) never opened a deploy episode,
       // so the MCP deploy tools would poll their full budget and report "still
@@ -12022,6 +12024,59 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * skip (or any of these) with no crash-loop watch would silently stop
    * noticing a dead or crash-looping app for the rest of the process's life.
    */
+  /**
+   * The status a failed fresh-path build leaves: 'errored', unless boot reconcile
+   * kept this app routed while redeploying it (`bootServed`, #420) and its old
+   * instance is still the one serving. Then 'running' with the error, and its
+   * watches re-armed, as failCutover does when a zero-downtime switch fails. The
+   * failure accounting (breaker, quota, deploy episode) is the caller's and is
+   * unchanged: the deploy still failed.
+   */
+  private async settleFailedBuildStatus(
+    appName: string,
+    message: string,
+    bootServed: { port: number; reason: string } | undefined
+  ): Promise<void> {
+    if (!this.stateManager) return;
+    if (bootServed && (await this.oldInstanceStillServing(appName, bootServed.port))) {
+      await this.stateManager.setAppStatus(appName, 'running', {
+        port: bootServed.port,
+        error: `Build failed (boot redeploy: ${bootServed.reason}): ${message}`,
+      });
+      this.logger.warn(`Build of ${appName} failed; its previous version is still serving`, 'BUILD');
+      // Its source is unchanged since the last deploy (servedUnchangedOnBoot), so
+      // the source drop.yaml holds the healthCheck the serving version shipped with.
+      let healthCheckPath: string | undefined;
+      try {
+        const appPath = path.join(this.config.appsDirectory, appName);
+        healthCheckPath = (await parseDropYaml(appPath)).config?.healthCheck;
+      } catch {
+        healthCheckPath = undefined;
+      }
+      this.armPostDeployWatches(appName, bootServed.port, healthCheckPath);
+      return;
+    }
+    await this.stateManager.setAppStatus(appName, 'errored', { error: message });
+  }
+
+  /**
+   * Whether the instance a failed build was meant to replace is still the one
+   * serving on `port`: nothing re-marked the app during the build (a stop, a park
+   * or a suspension writes a status other than building), no suspension refuses
+   * it, and the runtime reports it running on that port. Never throws: it runs in
+   * a failure path whose accounting must not be skipped.
+   */
+  private async oldInstanceStillServing(appName: string, port: number): Promise<boolean> {
+    if (this.stateManager?.getApp(appName)?.status !== 'building') return false;
+    try {
+      if (refusalForApp(appName)) return false;
+      const info = await this.runtime?.getStatus(appName).catch(() => null);
+      return info?.status === 'running' && info.port === port;
+    } catch {
+      return false;
+    }
+  }
+
   private armPostDeployWatches(appName: string, port: number, healthCheckPath: string | undefined): void {
     if (healthCheckPath && this.runtime?.type === 'pm2') {
       this.startHealthProber(appName, port, healthCheckPath);

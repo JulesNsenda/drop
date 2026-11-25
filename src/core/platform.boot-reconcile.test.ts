@@ -102,6 +102,7 @@ import { getStateManager, resetStateManager } from '../managers/app/state-manage
 import { getAppConfigService, resetAppConfigService } from '../managers/app/app-config';
 import { getSecretManager } from '../managers/secret';
 import { RouterService } from './router';
+import { BuilderService } from './builder';
 
 /** Poll until `predicate` holds or the timeout elapses (drives async handlers). */
 async function waitFor(
@@ -1061,5 +1062,144 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     // observe leaves the watcher-driven path alone: let its redeploy settle
     // before afterEach's stop() drains.
     await waitFor(() => getStateManager().getApp('site')?.status === 'running');
+  }, 30000);
+
+  // ── #420 item 2: a failed boot redeploy leaves the serving app running ──
+
+  const failedBuild = (message: string) =>
+    ({
+      success: false,
+      status: 'failed',
+      duration: 1,
+      stages: [],
+      artifacts: [],
+      outputPath: null,
+      errors: [{ message }],
+      warnings: [],
+      startedAt: new Date(),
+      completedAt: new Date(),
+    }) as never;
+
+  type Priv = {
+    appsInProgress: Set<string>;
+    recordDeployOutcome: (app: string, ok: boolean) => void;
+    startCrashLoopWatch: (app: string) => void;
+    deployEpisodeOpen: (app: string) => boolean;
+  };
+
+  /**
+   * Deploy 'site', make its runtime spec stale (an eligible keep-routed
+   * redeploy, unless changeSource), restart into mode 'on' with the build
+   * replaced by the given one, and wait until the failed deploy has settled.
+   */
+  async function bootRedeployWithFailingBuild(
+    build: () => Promise<unknown>,
+    opts: { changeSource?: boolean; beforeStart?: (p: DropPlatform) => void } = {}
+  ): Promise<{ priv: Priv; outcome: jest.SpyInstance; crashWatch: jest.SpyInstance; port: number }> {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    const port = getAppConfigService().getConfig('site')?.port as number;
+    await getAppConfigService().updateConfig('site', { runtimeSpecFingerprint: 'stale-fingerprint' });
+    await crossPlatformRestart();
+    if (opts.changeSource) await fs.writeFile(path.join(appPath, 'extra.html'), '<p>new</p>');
+
+    let buildRan = false;
+    jest.spyOn(BuilderService.prototype, 'build').mockImplementation((async () => {
+      buildRan = true;
+      return build();
+    }) as never);
+    platform2 = makePlatform({ bootReconcileMode: 'on' });
+    const priv = platform2 as unknown as Priv;
+    const outcome = jest.spyOn(priv, 'recordDeployOutcome');
+    const crashWatch = jest.spyOn(priv, 'startCrashLoopWatch');
+    opts.beforeStart?.(platform2);
+    await platform2.start();
+    await waitFor(() => buildRan);
+    await waitFor(() => !priv.appsInProgress.has('site'));
+    return { priv, outcome, crashWatch, port };
+  }
+
+  const siteRouted = (): boolean =>
+    (platform2 as unknown as { router: RouterService }).router.getRoutes().some((r) => r.owner === 'site');
+
+  it('#420 failed boot redeploy of a serving app: stays running on its port, routed, watched, failure counted', async () => {
+    const { outcome, crashWatch, port } = await bootRedeployWithFailingBuild(async () =>
+      failedBuild('pull access denied: 429 Too Many Requests')
+    );
+
+    const app = getStateManager().getApp('site');
+    expect(app?.status).toBe('running');
+    expect(app?.port).toBe(port);
+    expect(app?.error).toMatch(/^Build failed \(boot redeploy: runtime spec revision is stale\): pull access denied/);
+    expect(siteRouted()).toBe(true);
+    expect(crashWatch).toHaveBeenCalledWith('site');
+    // Still a failed deploy to the breaker.
+    expect(outcome).toHaveBeenCalledWith('site', false);
+  }, 30000);
+
+  it('#420 failed boot redeploy whose old instance died during the build: errored', async () => {
+    const { outcome } = await bootRedeployWithFailingBuild(async () => {
+      await fakeRuntime.stop('site');
+      return failedBuild('boom');
+    });
+
+    expect(getStateManager().getApp('site')?.status).toBe('errored');
+    expect(outcome).toHaveBeenCalledWith('site', false);
+  }, 30000);
+
+  it('#420 failed boot redeploy of an app stopped during the build: stays stopped', async () => {
+    await bootRedeployWithFailingBuild(async () => {
+      await getStateManager().setAppStatus('site', 'stopped');
+      return failedBuild('boom');
+    });
+
+    // The stop wins: not overwritten with 'running' (nor with 'errored', which
+    // is today's behaviour for a stop racing a failed build).
+    expect(getStateManager().getApp('site')?.status).not.toBe('running');
+  }, 30000);
+
+  it('#420 failed boot redeploy where the runtime status read rejects: errored, failure still counted', async () => {
+    const { outcome } = await bootRedeployWithFailingBuild(async () => {
+      jest.spyOn(fakeRuntime, 'getStatus').mockRejectedValue(new Error('runtime unreachable'));
+      return failedBuild('boom');
+    });
+
+    expect(getStateManager().getApp('site')?.status).toBe('errored');
+    expect(outcome).toHaveBeenCalledWith('site', false);
+  }, 30000);
+
+  it('#420 failed boot redeploy whose source changed: errored, as before', async () => {
+    await bootRedeployWithFailingBuild(async () => failedBuild('boom'), { changeSource: true });
+
+    expect(getStateManager().getApp('site')?.status).toBe('errored');
+  }, 30000);
+
+  it('#420 a thrown build failure with a deploy episode still open: errored, never closed as a success', async () => {
+    await bootRedeployWithFailingBuild(
+      async () => {
+        throw new Error('builder exploded');
+      },
+      {
+        beforeStart: (p) => {
+          jest
+            .spyOn(p as unknown as Priv, 'deployEpisodeOpen')
+            .mockImplementation((app: string) => app === 'site');
+        },
+      }
+    );
+
+    expect(getStateManager().getApp('site')?.status).toBe('errored');
+  }, 30000);
+
+  it('#420 a thrown build failure with no episode open: stays running', async () => {
+    await bootRedeployWithFailingBuild(async () => {
+      throw new Error('builder exploded');
+    });
+
+    const app = getStateManager().getApp('site');
+    expect(app?.status).toBe('running');
+    expect(app?.error).toMatch(/builder exploded/);
   }, 30000);
 });
