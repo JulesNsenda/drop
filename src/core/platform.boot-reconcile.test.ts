@@ -946,4 +946,120 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     await waitFor(() => getStateManager().getApp('site')?.status === 'running');
     unsub();
   }, 30000);
+  // ── #420: a redeploy of a healthy, unchanged, serving app keeps its route ──
+  //
+  // Routes live only in memory, so before #420 a redeploying app had no Caddy
+  // route until its new instance started, and none at all if the build failed
+  // (2026-11-25: four apps offline while their old containers kept running).
+
+  /**
+   * Restart into mode 'on' and report, for 'site': whether a route was added
+   * BEFORE its build started, and whether reconcile logged that it kept it routed.
+   */
+  async function restartAndObserveSite(
+    mode: 'on' | 'observe' = 'on'
+  ): Promise<{ routedBeforeBuild: boolean | undefined; keptRouted: boolean }> {
+    let routedBeforeBuild: boolean | undefined;
+    const unsub = eventBus.subscribe('build:started', (p) => {
+      if (p.appId !== 'site' || routedBeforeBuild !== undefined) return;
+      routedBeforeBuild = addRouteSpy.mock.calls.some(
+        (call) => (call[0] as { owner?: string }).owner === 'site'
+      );
+    });
+    platform2 = makePlatform({ bootReconcileMode: mode });
+    const infoSpy = jest.spyOn(
+      (platform2 as unknown as { logger: { info: (...a: unknown[]) => void } }).logger,
+      'info'
+    );
+    await platform2.start();
+    if (mode === 'on') {
+      await waitFor(() => routedBeforeBuild !== undefined);
+      await waitFor(() => getStateManager().getApp('site')?.status === 'running');
+    }
+    unsub();
+    const keptRouted = infoSpy.mock.calls.some(
+      (call) => typeof call[0] === 'string' && call[0].includes("'site' stays routed on port")
+    );
+    return { routedBeforeBuild, keptRouted };
+  }
+
+  it('#420 mode on, stale runtime spec with an unchanged source: stays routed through the redeploy', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    await getAppConfigService().updateConfig('site', { runtimeSpecFingerprint: 'stale-fingerprint' });
+    await crossPlatformRestart();
+    addRouteSpy.mockClear();
+
+    const { routedBeforeBuild, keptRouted } = await restartAndObserveSite();
+
+    expect(keptRouted).toBe(true);
+    expect(routedBeforeBuild).toBe(true);
+  }, 30000);
+
+  it('#420 mode on, stale runtime spec but the source ALSO changed: not routed before the build', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    await getAppConfigService().updateConfig('site', { runtimeSpecFingerprint: 'stale-fingerprint' });
+    await crossPlatformRestart();
+    // A changed source means the source drop.yaml may carry routing that was
+    // never built or promoted: it must not go live ahead of the build.
+    await fs.writeFile(path.join(appPath, 'extra.html'), '<p>new</p>');
+    addRouteSpy.mockClear();
+
+    const { routedBeforeBuild, keptRouted } = await restartAndObserveSite();
+
+    expect(keptRouted).toBe(false);
+    expect(routedBeforeBuild).toBe(false);
+  }, 30000);
+
+  it('#420 mode on, an app that was errored before the restart: not routed before the build', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    await getStateManager().setAppStatus('site', 'errored', { error: 'readiness failed' });
+    await crossPlatformRestart();
+    addRouteSpy.mockClear();
+
+    const { routedBeforeBuild, keptRouted } = await restartAndObserveSite();
+
+    expect(keptRouted).toBe(false);
+    expect(routedBeforeBuild).toBe(false);
+  }, 30000);
+
+  it('#420 mode on, runtime port drifted from the persisted port: not routed before the build', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    const configuredPort = getAppConfigService().getConfig('site')?.port as number;
+    await crossPlatformRestart();
+    fakeRuntime.seedRunning('site', configuredPort + 1);
+    addRouteSpy.mockClear();
+
+    const { routedBeforeBuild, keptRouted } = await restartAndObserveSite();
+
+    expect(keptRouted).toBe(false);
+    expect(routedBeforeBuild).toBe(false);
+  }, 30000);
+
+  it('#420 mode observe: never routes ahead of a redeploy', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    await getAppConfigService().updateConfig('site', { runtimeSpecFingerprint: 'stale-fingerprint' });
+    await crossPlatformRestart();
+
+    const { keptRouted } = await restartAndObserveSite('observe');
+
+    expect(keptRouted).toBe(false);
+    // observe leaves the watcher-driven path alone: let its redeploy settle
+    // before afterEach's stop() drains.
+    await waitFor(() => getStateManager().getApp('site')?.status === 'running');
+  }, 30000);
 });
