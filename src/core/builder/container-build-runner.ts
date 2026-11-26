@@ -316,7 +316,9 @@ export function createContainerExecCommand(
 
 /**
  * Host variables a container build still gets: an outbound proxy, so package
- * installs work on a box that can only reach the internet through one.
+ * installs work on a box that can only reach the internet through one. The
+ * value is passed as is, so credentials in a proxy URL (`user:pass@`) reach
+ * every tenant build: the operator's choice, documented in the CHANGELOG.
  */
 const HOST_VARS_FOR_CONTAINER_BUILDS: readonly string[] = [
   'HTTP_PROXY',
