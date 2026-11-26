@@ -133,23 +133,6 @@ export interface AppDetectedPayload extends BaseEvent {
    * failures in one shared bucket and let any user lock out every other.
    */
   actorUserId?: string;
-  /**
-   * Set only by boot reconciliation, on a redeploy of an app that was serving,
-   * healthy and unchanged (#420): it was kept routed on `port`, and if this
-   * deploy's build fails, its previous instance keeps serving (status 'running'
-   * with the error) instead of being marked errored. `healthCheckPath` is the
-   * serving version's, read before the build ran. `sourceHash` is the source it
-   * vouches for (re-checked when the build is admitted). `token` is private to the
-   * platform that minted it: a marker without it is ignored. Carried through
-   * every re-queue of this one deploy, and by nothing else.
-   */
-  keepServing?: {
-    port: number;
-    reason: string;
-    healthCheckPath: string | undefined;
-    sourceHash: string;
-    token: symbol;
-  };
 }
 
 export interface AppCreatedPayload extends BaseEvent {
