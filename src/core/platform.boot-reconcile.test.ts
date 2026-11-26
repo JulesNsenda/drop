@@ -1155,9 +1155,8 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
       return failedBuild('boom');
     });
 
-    // The stop wins: not overwritten with 'running' (nor with 'errored', which
-    // is today's behaviour for a stop racing a failed build).
-    expect(getStateManager().getApp('site')?.status).not.toBe('running');
+    // The stop wins: neither 'running' nor 'errored' is written over it.
+    expect(getStateManager().getApp('site')?.status).toBe('stopped');
   }, 30000);
 
   it('#420 failed boot redeploy where the runtime status read rejects: errored, failure still counted', async () => {
