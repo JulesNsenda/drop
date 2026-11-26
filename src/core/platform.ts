@@ -3333,14 +3333,9 @@ backup:
               config.port as number,
               result.keepServing.healthCheckPath
             ));
-          if (keptServing) anySkipped = true; // joins the batched reload below
-          // Publish, don't call handleBuildApp directly: this is the exact
-          // same event/subscriber a real watcher-driven detection uses, so
-          // the monorepo services: interception and the
-          // isCloning/isUploading/autoBuild guards inside handleAppDetected
-          // all apply automatically instead of being bypassed.
           published = true;
           if (keptServing) {
+            anySkipped = true; // its route joins the batched reload below
             // #420: rebuilt as a redeploy of a RUNNING app (handleAppUpdate),
             // which keeps the old instance serving until the new one has
             // built, and leaves it running if the build fails.
@@ -3351,6 +3346,11 @@ backup:
               bypassCooldown: true,
             });
           } else {
+            // Publish, don't call handleBuildApp directly: this is the exact
+            // same event/subscriber a real watcher-driven detection uses, so
+            // the monorepo services: interception and the
+            // isCloning/isUploading/autoBuild guards inside handleAppDetected
+            // all apply automatically instead of being bypassed.
             this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
           }
         }
@@ -3558,8 +3558,7 @@ backup:
             }
           }
         } else {
-          const dropYaml = await parseDropYaml(appPath);
-          healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+          healthCheckPath = await this.sourceHealthCheckPath(appPath);
         }
         if (childYamlProblem !== undefined) {
           decision = {
@@ -3640,11 +3639,16 @@ backup:
     }
     if (hash !== config.sourceHash) return null;
     try {
-      const dropYaml = await parseDropYaml(appPath);
-      return { healthCheckPath: dropYaml.success ? dropYaml.config?.healthCheck : undefined };
+      return { healthCheckPath: await this.sourceHealthCheckPath(appPath) };
     } catch {
       return null;
     }
+  }
+
+  /** The healthCheck an app's drop.yaml declares (undefined when it is invalid). Throws when unreadable. */
+  private async sourceHealthCheckPath(appPath: string): Promise<string | undefined> {
+    const dropYaml = await parseDropYaml(appPath);
+    return dropYaml.success ? dropYaml.config?.healthCheck : undefined;
   }
 
   /**
@@ -9632,14 +9636,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   }
 
   /**
-   * Report a cutover that did not happen. The old instance is still serving,
-   * so the app ends `running` — but the deploy FAILED, and the tracker closes
-   * an episode as failed only on `errored`. So: publish the boot failure, mark
-   * `errored` (closing the episode and its detail), then put the true status
-   * back and re-arm the old instance's supervision, which the `errored`
-   * transition tore down.
-   */
-  /**
    * A redeploy failed before it replaced the app's running instance (#420) and
    * the runtime still reports it on its port: back to 'running' with the error,
    * watched again. Its healthCheck is read from the source drop.yaml.
@@ -9648,10 +9644,18 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     const info = await this.runtime?.getStatus(appName).catch(() => null);
     if (info?.status !== 'running' || info.port !== port) return;
     await this.stateManager?.setAppStatus(appName, 'running', { port, error });
-    const dropYaml = await parseDropYaml(this.sourcePathOf(appName)).catch(() => null);
-    this.armPostDeployWatches(appName, port, dropYaml?.success ? dropYaml.config?.healthCheck : undefined);
+    const healthCheckPath = await this.sourceHealthCheckPath(this.sourcePathOf(appName)).catch(() => undefined);
+    this.armPostDeployWatches(appName, port, healthCheckPath);
   }
 
+  /**
+   * Report a cutover that did not happen. The old instance is still serving,
+   * so the app ends `running` — but the deploy FAILED, and the tracker closes
+   * an episode as failed only on `errored`. So: publish the boot failure, mark
+   * `errored` (closing the episode and its detail), then put the true status
+   * back and re-arm the old instance's supervision, which the `errored`
+   * transition tore down.
+   */
   private async failCutover(
     appName: string,
     oldPort: number,

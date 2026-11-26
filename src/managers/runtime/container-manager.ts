@@ -218,6 +218,11 @@ export async function probeTenantNetworkIsolation(
   return tenantNetworkIsolation;
 }
 
+/** The image a start of this app type runs (start and prepareStart must agree). */
+function baseImageFor(appType: string | undefined, runtimeImage?: string): string {
+  return selectBaseImage((appType as AppType) ?? 'nodejs', runtimeImage);
+}
+
 export class ContainerManager implements AppRuntime {
   readonly type = 'docker' as const;
 
@@ -248,14 +253,11 @@ export class ContainerManager implements AppRuntime {
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
   async prepareStart(appType: string): Promise<void> {
-    await this.ensureImage(selectBaseImage((appType as AppType) ?? 'nodejs'));
+    await this.ensureImage(baseImageFor(appType));
   }
 
   async start(spec: AppStartSpec): Promise<AppProcessInfo> {
-    const image = selectBaseImage(
-      (spec.appType as AppType) ?? 'nodejs',
-      spec.runtimeImage
-    );
+    const image = baseImageFor(spec.appType, spec.runtimeImage);
 
     await this.ensureImage(image);
     await this.ensureNetwork();
