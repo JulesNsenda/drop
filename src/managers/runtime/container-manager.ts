@@ -247,6 +247,10 @@ export class ContainerManager implements AppRuntime {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
+  async prepareStart(appType: string): Promise<void> {
+    await this.ensureImage(selectBaseImage((appType as AppType) ?? 'nodejs'));
+  }
+
   async start(spec: AppStartSpec): Promise<AppProcessInfo> {
     const image = selectBaseImage(
       (spec.appType as AppType) ?? 'nodejs',

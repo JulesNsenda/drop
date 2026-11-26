@@ -3502,10 +3502,6 @@ backup:
         dependenciesStale: status !== 'stopped' && (await this.servingTreeIsStale(config)),
       });
       let scanned = false;
-      // #420: the scanned source hash (null = the scan failed), and whether the
-      // verdict came from a failed readiness probe. Both feed `keepServing`.
-      let scannedHash: string | null | undefined;
-      let failedReadiness = false;
 
       if (!decision) {
         scanned = true;
@@ -3522,7 +3518,6 @@ backup:
           );
           currentSignature = undefined;
         }
-        scannedHash = currentSignature?.hash ?? null;
 
         decision = decideBootReconciliationSignature({
           recordedHash: config.sourceHash,
@@ -3576,22 +3571,24 @@ backup:
             action: 'redeploy',
             reason: 'skip candidate did not answer a readiness probe',
           };
-          failedReadiness = true;
         }
       }
 
+      // #420: only for a CHEAP-phase redeploy (stale runtime spec, API key
+      // rotation, stale dependencies): the serving instance is fine and only the
+      // platform's spec for it moved. A signature-phase one (secret set changed,
+      // failed readiness) may not start again once its process is replaced.
       // Only computed when this pass will act on it: `ignoreGroup` is passed as
       // `mode === 'on'`, and the act phase never acts in any other mode.
       const keepServing =
-        ignoreGroup && decision.action === 'redeploy' && !failedReadiness
+        ignoreGroup && decision.action === 'redeploy' && !scanned
           ? await this.servedUnchangedOnBoot(
               config,
               appPath,
               // The PRE-sync snapshot only, no fallback: sync can turn an errored app
               // whose process is still up into 'running'.
               bootStatusSnapshot?.get(config.name),
-              runtimeProc,
-              scannedHash
+              runtimeProc
             )
           : null;
 
@@ -3613,9 +3610,8 @@ backup:
    * - no suspension refusal of any kind (the build gate's view, not the route gate's);
    * - it lives at its default path, the tree handleConfigureRoute reads;
    * - its source signature equals the last successful deploy's. handleConfigureRoute
-   *   reads domains/tls/route/access from the SOURCE drop.yaml, so only an unchanged
-   *   source re-emits the route that was live, never unbuilt routing. (The same
-   *   signature the skip verdict already trusts.)
+   *   reads domains/tls/route/access from the SOURCE drop.yaml, so the route it
+   *   re-emits carries exactly the trust the skip branch's does (same signature).
    * Returns the serving version's healthCheck, read now, before any build runs in
    * that tree. Group children are not decided here: their routing has its own branch.
    */
@@ -3623,23 +3619,24 @@ backup:
     config: AppConfig,
     appPath: string,
     snapshotStatus: AppStatus | undefined,
-    runtimeProc: AppProcessInfo | undefined,
-    scannedHash: string | null | undefined
+    runtimeProc: AppProcessInfo | undefined
   ): Promise<{ healthCheckPath: string | undefined } | null> {
     // Without autoBuild a boot redeploy never builds: leave that as it is.
-    if (!this.config.autoBuild || config.group || snapshotStatus !== 'running') return null;
+    // A reserved name is refused by the ordinary detect path; keep it there.
+    if (!this.config.autoBuild || config.group || isReservedName(config.name) || snapshotStatus !== 'running') {
+      return null;
+    }
     if (!runtimeProc || runtimeProc.port === null || runtimeProc.port !== config.port) return null;
     if (refusalForApp(config.name)) return null;
     if (path.resolve(appPath) !== path.resolve(this.config.appsDirectory, config.name)) return null;
-    if (config.sourceHash === undefined || scannedHash === null) return null;
-    let hash = scannedHash;
-    if (hash === undefined) {
-      // The cheap phase decided without scanning (e.g. a stale runtime spec).
-      try {
-        hash = (await this.computeSourceMtimeMs(appPath)).hash;
-      } catch {
-        return null;
-      }
+    if (config.sourceHash === undefined) return null;
+    // The cheap phase decided without scanning, so this is the only scan (up to
+    // the scan budget per eligible app, in the decide phase).
+    let hash: string;
+    try {
+      hash = (await this.computeSourceMtimeMs(appPath)).hash;
+    } catch {
+      return null;
     }
     if (hash !== config.sourceHash) return null;
     try {
@@ -3656,9 +3653,10 @@ backup:
    * routed; it is then redeployed the ordinary way. `routeOnly`: nothing is persisted.
    * `skipCaddyReload`: joins the one batched reload after the loop, like the skip
    * branch; until then Caddy serves the previous run's file, which already
-   * routes this app. A reload here would push a file missing every app later in
-   * the loop. Never throws: it must not abort reconciliation for the rest of
-   * the fleet.
+   * routes this app. No reload is issued from the act loop itself (an app whose
+   * redeploy finishes during the loop reloads on its own start, as any boot
+   * redeploy does). Never throws: it must not abort reconciliation for the rest
+   * of the fleet.
    */
   private async keepServingWhileRedeploying(
     appName: string,
@@ -9182,6 +9180,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Unconditional, as in doRestart: the STORED status says nothing
       // reliable about the process (an 'errored' or crash-looping app can
       // still hold a live one). See replaceLiveProcess.
+      // Fetch what the new start needs (Docker: its runtime image) while the old
+      // version still serves: a failed pull must fail the deploy BEFORE the
+      // replace, not leave the app with no instance at all (#420).
+      await this.runtime!.prepareStart?.(detection.type);
       this.logger.info(`Replacing ${appName}'s process (if any) with the new build...`, 'UPDATE');
       // The last refusal that leaves the old version SERVING: a suspension that
       // landed during the build is caught here, with nothing awaited between
@@ -9270,10 +9272,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.recordDeployOutcome(appName, false);
         return false;
       }
-      this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
-      await this.stateManager!.setAppStatus(appName, 'errored', {
-        error: error instanceof Error ? error.message : 'Hot-reload failed',
-      });
+      const message = error instanceof Error ? error.message : 'Hot-reload failed';
+      this.logger.appEvent('error', appName, message);
+      await this.stateManager!.setAppStatus(appName, 'errored', { error: message });
+      if (admitted.wasRunning && !progress.replaced && admitted.originalPort) {
+        // Failed before the old version was replaced: it is still serving, as on
+        // a failed build. errored -> running, as failCutover does, so the tracker
+        // closes the episode as failed; the errored write stopped its watches.
+        await this.restoreStillServing(appName, admitted.originalPort, `Redeploy failed: ${message}`);
+      }
       // A throw BEFORE builder.build() (detect, prepareDeployTarget,
       // resolveBuildEnv, buildToolchainFor, a malformed drop.yaml) never opened
       // a deploy episode, so the setAppStatus above had nothing to close.
@@ -9632,6 +9639,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * back and re-arm the old instance's supervision, which the `errored`
    * transition tore down.
    */
+  /**
+   * A redeploy failed before it replaced the app's running instance (#420) and
+   * the runtime still reports it on its port: back to 'running' with the error,
+   * watched again. Its healthCheck is read from the source drop.yaml.
+   */
+  private async restoreStillServing(appName: string, port: number, error: string): Promise<void> {
+    const info = await this.runtime?.getStatus(appName).catch(() => null);
+    if (info?.status !== 'running' || info.port !== port) return;
+    await this.stateManager?.setAppStatus(appName, 'running', { port, error });
+    const dropYaml = await parseDropYaml(this.sourcePathOf(appName)).catch(() => null);
+    this.armPostDeployWatches(appName, port, dropYaml?.success ? dropYaml.config?.healthCheck : undefined);
+  }
+
   private async failCutover(
     appName: string,
     oldPort: number,

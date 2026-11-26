@@ -997,6 +997,20 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
 
     expect(keptRouted).toBe(true);
     expect(routedBeforeBuild).toBe(true);
+
+    // The kept redeploy recorded its signature, so the NEXT boot skips it.
+    await waitFor(() => getAppConfigService().getConfig('site')?.runtimeSpecFingerprint !== 'stale-fingerprint');
+    await platform2!.stop();
+    resetStateManager();
+    resetAppConfigService();
+    platform2 = makePlatform({ bootReconcileMode: 'on' });
+    const infoSpy = jest.spyOn(
+      (platform2 as unknown as { logger: { info: (...a: unknown[]) => void } }).logger,
+      'info'
+    );
+    await platform2.start();
+    const redeployed = infoSpy.mock.calls.some((c) => typeof c[0] === 'string' && c[0].includes("redeploying 'site'"));
+    expect(redeployed).toBe(false);
   }, 30000);
 
   it('#420 mode on, stale runtime spec but the source ALSO changed: not routed before the build', async () => {
@@ -1267,7 +1281,7 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     ).toBe(false);
   }, 30000);
 
-  it('#420 two apps: every Caddy reload sees the routes of BOTH the keep-routed app and the skipped one', async () => {
+  it('#420 two apps: the act loop issues no reload missing either the keep-routed or the skipped app', async () => {
     platform = makePlatform();
     await platform.start();
     await deploy('aaa', await createStaticApp('aaa'));
@@ -1296,14 +1310,14 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     }
   }, 30000);
 
-  it('#420 a later ordinary failed deploy of a once-kept app is errored: the marker does not outlive its boot deploy', async () => {
+  it('#420 a later ordinary failed deploy of a once-kept app fails as an ordinary deploy: errored', async () => {
     await bootRedeployWithFailingBuild(async () => failedBuild('first failure'));
     expect(getStateManager().getApp('site')?.status).toBe('running');
     const priv = platform2 as unknown as Priv;
     const buildMock = BuilderService.prototype.build as unknown as jest.Mock;
     const before = buildMock.mock.calls.length;
 
-    // An ordinary deploy: no keepServing on the event.
+    // An ordinary fresh deploy (app:detected).
     eventBus.publish('app:detected', {
       name: 'site',
       path: path.join(webappsDir, 'site'),
@@ -1316,7 +1330,7 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     expect(app?.status).toBe('errored');
     expect(app?.error).toMatch(/first failure/);
   }, 30000);
-  it('#420 a boot redeploy refused before it builds leaves the serving app as the skip verdict would: running, routed', async () => {
+  it('#420 a boot redeploy refused before it builds leaves the serving app running and routed (its reason waits for the next boot)', async () => {
     platform = makePlatform();
     await platform.start();
     const appPath = await createStaticApp('site');
@@ -1345,7 +1359,7 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     expect(siteRouted()).toBe(true);
   }, 30000);
 
-  it('#420 autoBuild off: a redeploy verdict never keeps the app routed (nothing would settle it)', async () => {
+  it('#420 autoBuild off: a redeploy verdict never keeps the app routed (a boot redeploy never builds then)', async () => {
     platform = makePlatform();
     await platform.start();
     const appPath = await createStaticApp('site');
@@ -1364,5 +1378,38 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
       (call) => typeof call[0] === 'string' && call[0].includes("'site' stays routed on port")
     );
     expect(keptRouted).toBe(false);
+  }, 30000);
+
+  it('#420 a redeploy whose runtime image cannot be fetched fails BEFORE the old instance is replaced: still running, routed', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    const port = getAppConfigService().getConfig('site')?.port as number;
+    await getAppConfigService().updateConfig('site', { runtimeSpecFingerprint: 'stale-fingerprint' });
+    await crossPlatformRestart();
+
+    const rt = fakeRuntime as unknown as { prepareStart?: (appType: string) => Promise<void> };
+    const prepareStart = jest.fn().mockRejectedValue(new Error('toomanyrequests: 429 Too Many Requests'));
+    rt.prepareStart = prepareStart;
+    try {
+      platform2 = makePlatform({ bootReconcileMode: 'on' });
+      const priv = platform2 as unknown as Priv;
+      const outcome = jest.spyOn(priv, 'recordDeployOutcome');
+      await platform2.start();
+      await waitFor(() => outcome.mock.calls.some((c) => c[0] === 'site'));
+      await waitFor(() => !priv.appsInProgress.has('site'));
+
+      expect(prepareStart).toHaveBeenCalled();
+      expect((await fakeRuntime.getStatus('site'))?.status).toBe('running');
+      const app = getStateManager().getApp('site');
+      expect(app?.status).toBe('running');
+      expect(app?.port).toBe(port);
+      expect(app?.error).toMatch(/^Redeploy failed: toomanyrequests/);
+      expect(siteRouted()).toBe(true);
+      expect(outcome).toHaveBeenCalledWith('site', false);
+    } finally {
+      delete rt.prepareStart;
+    }
   }, 30000);
 });
