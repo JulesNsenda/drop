@@ -5838,7 +5838,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (suspendedHere) {
       this.logger.info(`Not building ${payload.name} - app is suspended`, 'BUILD');
     } else if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
-      await this.handleBuildApp(payload.path, payload.name, payload.type as string, payload, payload.keepServing);
+      await this.handleBuildApp(
+        payload.path,
+        payload.name,
+        payload.type as string,
+        payload,
+        ...(payload.keepServing ? [payload.keepServing] : [])
+      );
     } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
       // Detection couldn't resolve a type: the build guard above never fires
       // for 'unknown', which used to leave the app registered at `pending`
@@ -6441,7 +6447,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         continue;
       }
       this.pendingBuilds.delete(appName);
-      void this.handleBuildApp(info.appPath, appName, info.appType, info.actor, info.keepServing);
+      void this.handleBuildApp(
+        info.appPath,
+        appName,
+        info.appType,
+        info.actor,
+        ...(info.keepServing ? [info.keepServing] : [])
+      );
     }
     if (this.pendingBuilds.size > 0) this.scheduleBuildDrain();
   }
