@@ -46,6 +46,13 @@ export interface AppRuntime {
    */
   setManagedRoots?(roots: string[]): void;
 
+  /**
+   * Fetch what a start of this app type needs (Docker: its runtime image)
+   * without touching any instance, so a caller replacing a live instance can
+   * fail BEFORE the replace. A runtime with nothing to fetch (PM2) omits it.
+   */
+  prepareStart?(appType: string): Promise<void>;
+
   /** Start an app; resolves when it is running */
   start(spec: AppStartSpec): Promise<AppProcessInfo>;
 

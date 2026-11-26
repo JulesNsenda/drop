@@ -48,7 +48,7 @@ const BASE_IMAGES: Partial<Record<AppType, string>> = {
   django: 'python:3.12-slim',
   flask: 'python:3.12-slim',
   fastapi: 'python:3.12-slim',
-  go: 'golang:1.22-alpine',
+  go: 'golang:1.27-alpine',
   static: 'nginx:alpine',
   // SPAs are served by the same nginx path as plain static apps
   // (buildStartSpec treats 'static' and 'spa' identically); without this
@@ -89,10 +89,10 @@ const FALLBACK_IMAGE = 'node:22-slim';
  * is not "edit the source and rebuild".
  */
 const IMAGE_DIGESTS: Record<string, string> = {
-  'node:22-slim': 'sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d',
-  'python:3.12-slim': 'sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217',
-  'golang:1.22-alpine': 'sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052',
-  'nginx:alpine': 'sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913',
+  'node:22-slim': 'sha256:be979e5523c76fa4d5ca4ebd3099078f220aa47ec39c48ad5b5df9314debd6eb',
+  'python:3.12-slim': 'sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b',
+  'golang:1.27-alpine': 'sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280',
+  'nginx:alpine': 'sha256:7fc0fb4af7bf006aeb31aea88069976060f8f0a0a86b667126742cc17f4e31ae',
 };
 
 /** Whether digest pinning is active. Read per call so tests can toggle it. */
@@ -322,6 +322,14 @@ export const CONTAINER_DATA_DIR = '/data';
  * per DROP install (env vars) without any code change.
  */
 export interface ContainerPolicyInputs {
+  /**
+   * The box's isolation mode. Required, not optional, so every caller has to
+   * say which one it means. The docker-only constants (base images, digests,
+   * image users, rootfs/tmpfs, network, socket dir) are hashed only under
+   * `docker`: before this gate, refreshing a digest made every PM2 app on every
+   * `isolation: none` install redeploy once for an image it never runs (#412).
+   */
+  isolation: 'docker' | 'none';
   /** this.config.apiPort — baked into every container's DROP_API_URL env var. */
   apiPort: number;
   /** DROP_MAX_MEMORY_MB_PER_APP — this.config.maxMemoryMbPerApp. */
@@ -364,12 +372,12 @@ export interface ContainerPolicyInputs {
  * own, but are included so a future edit to any of them is automatically
  * covered without a second manual bump) and the operator-tunable inputs
  * passed in (apiPort, maxMemoryMbPerApp, maxCpusPerApp) that DO vary per
- * install and per restart if an env var changed. Deliberately NOT gated to
- * docker isolation by the caller: apiPort/maxMemoryMbPerApp both affect a
- * PM2 app's env/max_memory_restart too (see pm2-runtime.ts), so hashing the
- * docker-only constants alongside them under PM2 is harmless (they're
- * static and never trigger a mismatch there) while still catching the parts
- * that DO apply everywhere. Also covers `pgSocketDir` (DROP-072) — see that
+ * install and per restart if an env var changed. Checked under BOTH isolation
+ * modes, because apiPort/maxMemoryMbPerApp/maxCpusPerApp also affect a PM2
+ * app's env/max_memory_restart (see pm2-runtime.ts). The docker-only
+ * constants are hashed only when `inputs.isolation` is docker. They are
+ * static between boots but NOT between releases: a digest refresh used to
+ * redeploy every PM2 app for an image it never runs (#412). Also covers `pgSocketDir` (DROP-072) — see that
  * field's doc comment on ContainerPolicyInputs for why it's included and
  * what forcing its one-time mismatch protects against.
  */
@@ -390,6 +398,7 @@ export function containerPolicyFingerprint(inputs: ContainerPolicyInputs): strin
  */
 export function fingerprintPayloadForTest(
   inputs: ContainerPolicyInputs = {
+    isolation: 'docker',
     apiPort: 0,
     maxMemoryMbPerApp: 0,
     maxCpusPerApp: 0,
@@ -400,6 +409,16 @@ export function fingerprintPayloadForTest(
 }
 
 function buildFingerprintPayload(inputs: ContainerPolicyInputs): Record<string, unknown> {
+  if (inputs.isolation !== 'docker') {
+    // A PM2 app runs on the host: only these three reach its env /
+    // max_memory_restart (pm2-runtime.ts). Hashing the container constants here
+    // would redeploy every PM2 app whenever a base-image digest is refreshed.
+    return {
+      apiPort: inputs.apiPort,
+      maxMemoryMbPerApp: inputs.maxMemoryMbPerApp,
+      maxCpusPerApp: inputs.maxCpusPerApp,
+    };
+  }
   const payload = {
     capDrop: CONTAINER_CAP_DROP,
     securityOpt: CONTAINER_SECURITY_OPT,

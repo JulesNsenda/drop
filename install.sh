@@ -320,11 +320,15 @@ ensure_docker() {
   # lists disagree, because the failure is otherwise silent and only shows up
   # as a slow first deploy on a box nobody is watching.
   info "Pre-pulling DROP base images (this may take a few minutes)..."
-  for img in     "node:22-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d"     "python:3.12-slim@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217"     "golang:1.22-alpine@sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052"     "nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913"; do
+  for img in     "node:22-slim@sha256:be979e5523c76fa4d5ca4ebd3099078f220aa47ec39c48ad5b5df9314debd6eb"     "python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b"     "golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280"     "nginx:alpine@sha256:7fc0fb4af7bf006aeb31aea88069976060f8f0a0a86b667126742cc17f4e31ae"; do
     docker pull "$img" 2>&1 | tail -1 || warn "Failed to pre-pull $img — will retry on first deploy"
   done
 
-  [[ "$USERNS_REMAP" == "1" ]] && ensure_userns_remap
+  # An `if`, not `[[ … ]] && …`: as a function's last command, a false test
+  # makes the function return 1, and `set -e` then aborts the whole install.
+  if [[ "$USERNS_REMAP" == "1" ]]; then
+    ensure_userns_remap
+  fi
 }
 
 # ── docker userns-remap (Tier B, OPT-IN) ─────────────────────────────────────

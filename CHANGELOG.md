@@ -27,6 +27,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-11-26
+
+### Security
+
+- **Bundled PostgreSQL pinned to 16.16, with a warning when the running server
+  is older** (#410). The November 2026 PostgreSQL release fixes 52 CVEs,
+  including several "object creator executes arbitrary code" bugs, and every
+  DROP app owns its own database. Changing the pin never upgrades binaries a box
+  already has, so DROP now reads the server version on every start, logs it, and
+  warns with platform-specific upgrade steps when the server is below the
+  patched minor for its major or on an end-of-life major. On Linux that is
+  `apt-get install --only-upgrade postgresql-<major>`.
+- **Moderate npm advisories cleared** (#413): minimatch ReDoS
+  (GHSA-g3hv-75wg-m249) and glob (GHSA-3g3m-2fjr-6pw4), both dev-only.
+  `npm audit` reports nothing in either package.
+
+### Changed
+
+- **DROP now requires Node 22** (`engines.node` `>=22`). Node 20 is end of
+  life, and `install.sh` and CI already required 22.
+- **Tenant base images refreshed, and Go moves from 1.22 to 1.27** (#412).
+  `node:22-slim` (Node 22.23.5), `python:3.12-slim` and `nginx:alpine` get
+  current digests. `golang:1.22-alpine`, end-of-life since February 2025,
+  becomes `golang:1.27-alpine`; a module's `go` directive still decides its
+  language semantics. **Under `isolation: docker` every app redeploys once on
+  the first boot after upgrading.** Pre-pull the new images before restarting
+  (see docs/DOCKER-ISOLATION.md) or that boot can hit Docker Hub's anonymous
+  rate limit. Apps under `isolation: none` redeploy once on this upgrade too,
+  because the restart check's inputs changed shape. After that they never
+  redeploy for a base-image change: image pins now count only in docker mode.
+
+### Fixed
+
+- **A failed redeploy no longer takes a serving app offline** (#420). When a
+  boot reconcile redeployed an app that was still running, unchanged and
+  healthy (for example after a base-image refresh), a failed build or image
+  pull left it `errored` and unrouted even though the old instance was still
+  up. Those apps now stay routed and are rebuilt through the running-app
+  redeploy path, so a failure leaves the old instance serving and the app
+  `running` with the error recorded. Under `isolation: docker` any redeploy of
+  a running app (boot, upload, git or watcher) now pulls the runtime image
+  before it replaces the old container, so a Docker Hub rate limit no longer
+  leaves nothing serving.
+- **`install.sh --bootstrap --isolation=docker` no longer stops silently after
+  the image pre-pull.** `ensure_docker` ended on a `[[ … ]] && …` test that is
+  false unless `--userns-remap` is passed, so under `set -e` the installer exited
+  1 before writing the provisioning script, the systemd unit or Caddy. The same
+  line would have failed every deploy's `--provision` on a docker box once its
+  provisioning copy was current (#277). This has been broken since 1.6.0.
+
 ## [1.8.1] - 2026-11-15
 
 ### Changed

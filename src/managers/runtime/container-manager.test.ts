@@ -518,6 +518,31 @@ describe('ContainerManager', () => {
     });
   });
 
+  describe('prepareStart() (#420)', () => {
+    it('pulls the runtime image a start would use, without touching any container', async () => {
+      const docker = makeDockerMock() as any;
+      docker.getImage().inspect.mockRejectedValueOnce(new Error('no such image'));
+      docker.pull.mockImplementation((_img: string, cb: (e: Error | null, s: unknown) => void) => cb(null, {}));
+      docker.modem.followProgress.mockImplementation((_s: unknown, done: (e: Error | null) => void) => done(null));
+      const mgr = new ContainerManager(docker);
+
+      await mgr.prepareStart('nodejs');
+
+      expect(docker.pull).toHaveBeenCalledWith(selectBaseImage('nodejs'), expect.any(Function));
+      expect(docker.createContainer).not.toHaveBeenCalled();
+      expect(docker.getContainer).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the pull fails, so a caller can stop before replacing anything', async () => {
+      const docker = makeDockerMock() as any;
+      docker.getImage().inspect.mockRejectedValueOnce(new Error('no such image'));
+      docker.pull.mockImplementation((_img: string, cb: (e: Error | null) => void) => cb(new Error('toomanyrequests')));
+      const mgr = new ContainerManager(docker);
+
+      await expect(mgr.prepareStart('static')).rejects.toThrow('toomanyrequests');
+    });
+  });
+
   describe('ensureNetwork() — pinned drop-net IPAM', () => {
     it('creates drop-net with the pinned subnet and gateway when it does not exist yet', async () => {
       const docker = makeDockerMock() as any;
@@ -1196,8 +1221,8 @@ describe('selectBaseImage', () => {
     expect(tagOf(selectBaseImage('fastapi'))).toBe('python:3.12-slim');
   });
 
-  it('returns golang:1.22-alpine for go', () => {
-    expect(tagOf(selectBaseImage('go'))).toBe('golang:1.22-alpine');
+  it('returns golang:1.27-alpine for go', () => {
+    expect(tagOf(selectBaseImage('go'))).toBe('golang:1.27-alpine');
   });
 
   it('returns nginx:alpine for static', () => {

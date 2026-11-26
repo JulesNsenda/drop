@@ -12,8 +12,58 @@ import * as http from 'http';
 import { createWriteStream, existsSync } from 'fs';
 import { spawn } from 'child_process';
 
-// PostgreSQL version to use
-const PG_VERSION = '16.1';
+// PostgreSQL version to use for a fresh download. Bumping this does NOT
+// upgrade a box that already downloaded binaries (isInstalled() is true), which
+// is why postgresSecurityWarning() checks the RUNNING server at every start.
+const PG_VERSION = '16.16';
+
+/**
+ * Lowest minor of each supported major that carries the latest security
+ * release (12 Nov 2026: 52 CVEs, several "object creator executes arbitrary
+ * code" — and every DROP app owns its own database, so every tenant is an
+ * object creator). Raise these with each PostgreSQL security release, and
+ * raise OLDEST_SUPPORTED_MAJOR when a major reaches end-of-life (14 did with
+ * the Nov 2026 release: 14.25 was its last).
+ */
+export const PATCHED_MINOR_FLOOR: Readonly<Record<number, number>> = {
+  15: 20,
+  16: 16,
+  17: 12,
+  18: 7,
+};
+const OLDEST_SUPPORTED_MAJOR = 15;
+
+/**
+ * A warning for the operator when the running server misses security fixes,
+ * or null when it is current (or newer than this table knows about).
+ * Takes `server_version_num` (e.g. 160016), which is stable to parse, unlike
+ * `server_version` (distro builds append suffixes such as "(Debian 16.16-1)").
+ */
+export function postgresSecurityWarning(
+  serverVersionNum: number,
+  platform: NodeJS.Platform = process.platform
+): string | null {
+  if (!Number.isInteger(serverVersionNum) || serverVersionNum <= 0) return null;
+  const major = Math.floor(serverVersionNum / 10000);
+  const minor = serverVersionNum % 10000;
+  if (major < OLDEST_SUPPORTED_MAJOR) {
+    return `PostgreSQL ${major} is end-of-life and receives no security fixes. Upgrade to a supported major.`;
+  }
+  const floor = PATCHED_MINOR_FLOOR[major];
+  if (floor === undefined || minor >= floor) return null;
+  // Linux boxes run the system package (symlinked by setupFromSystemPackage).
+  // Elsewhere the binaries were downloaded: the WHOLE pgsql directory must go,
+  // since extraction cannot rename lib/ and share/ over the old ones.
+  const fix =
+    platform === 'linux'
+      ? `Upgrade the system package (e.g. apt-get install --only-upgrade postgresql-${major}) and restart DROP.`
+      : `Stop DROP, delete the apps/drop-svc/pgsql directory under the DROP root (all of it, not just bin) ` +
+        `so ${PG_VERSION} is downloaded, and restart.`;
+  return (
+    `PostgreSQL ${major}.${minor} is missing security fixes (need ${major}.${floor} or later). ${fix} ` +
+    `If this persists after a restart, DROP adopted an old running server: stop it first with pg_ctl stop -D <data dir>.`
+  );
+}
 
 // Download URLs for PostgreSQL binaries (fallback when no system package found)
 const DOWNLOAD_URLS: Record<string, string> = {

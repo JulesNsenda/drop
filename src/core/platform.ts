@@ -2339,6 +2339,10 @@ backup:
     this.postgresServer = getPostgresServer({
       dropRoot: this.config.dropRoot,
       onLog: (msg) => this.logger.debug(msg, 'POSTGRES'),
+      // Running version + missing-security-fix warning (#410): must show at
+      // the default log level, which onLog's debug would hide.
+      onNotice: (level, msg) =>
+        level === 'warn' ? this.logger.warn(msg, 'DATABASE') : this.logger.info(msg, 'DATABASE'),
       // In docker mode the socket is bind-mounted into containers; a trust
       // pg_hba would give containers unauthenticated superuser access.
       strictSecure: this.config.isolation === 'docker',
@@ -2928,6 +2932,26 @@ backup:
   }
 
   /**
+   * The container-policy fingerprint for THIS box, right now. The ONE place its
+   * inputs are built: the deploy that records it and the boot check that
+   * compares it must agree exactly, or every app redeploys on every boot.
+   */
+  private currentPolicyFingerprint(): string {
+    return containerPolicyFingerprint({
+      isolation: this.config.isolation === 'docker' ? 'docker' : 'none',
+      apiPort: this.config.apiPort,
+      maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
+      maxCpusPerApp: this.config.maxCpusPerApp,
+      // DROP-072: same gating as the actual mount/env-var call sites
+      // (buildStartSpec) — undefined outside docker isolation.
+      pgSocketDir:
+        this.config.isolation === 'docker'
+          ? (this.postgresServer?.getSocketDir() ?? undefined)
+          : undefined,
+    });
+  }
+
+  /**
    * Record the source-mtime signature, secret-set fingerprint, and current
    * runtime-spec revision observed at THIS successful deploy — read back by
    * reconcileAppsOnBoot (M1) on the NEXT boot to decide skip vs redeploy.
@@ -2970,17 +2994,7 @@ backup:
       await this.appConfigService.updateConfig(appName, {
         ...(sourceHash !== undefined ? { sourceHash } : {}),
         ...(secretFingerprint !== undefined ? { secretFingerprint } : {}),
-        runtimeSpecFingerprint: containerPolicyFingerprint({
-          apiPort: this.config.apiPort,
-          maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
-          maxCpusPerApp: this.config.maxCpusPerApp,
-          // DROP-072: same gating as the actual mount/env-var call sites
-          // (buildStartSpec) — undefined outside docker isolation.
-          pgSocketDir:
-            this.config.isolation === 'docker'
-              ? (this.postgresServer?.getSocketDir() ?? undefined)
-              : undefined,
-        }),
+        runtimeSpecFingerprint: this.currentPolicyFingerprint(),
       });
     } catch (error) {
       this.logger.warn(`Failed to record deploy signature for ${appName}`, 'BOOT', error);
@@ -3312,13 +3326,33 @@ backup:
           if (config.group) this.bootCurrentChildren.add(config.name);
         } else {
           this.logger.info(`Boot reconcile: redeploying '${config.name}' — ${decision.reason}`, 'BOOT');
-          // Publish, don't call handleBuildApp directly: this is the exact
-          // same event/subscriber a real watcher-driven detection uses, so
-          // the monorepo services: interception and the
-          // isCloning/isUploading/autoBuild guards inside handleAppDetected
-          // all apply automatically instead of being bypassed.
+          const keptServing =
+            result.keepServing !== null &&
+            (await this.keepServingWhileRedeploying(
+              config.name,
+              config.port as number,
+              result.keepServing.healthCheckPath
+            ));
           published = true;
-          this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+          if (keptServing) {
+            anySkipped = true; // its route joins the batched reload below
+            // #420: rebuilt as a redeploy of a RUNNING app (handleAppUpdate),
+            // which keeps the old instance serving until the new one has
+            // built, and leaves it running if the build fails.
+            this.eventBus.publish('app:update', {
+              name: config.name,
+              path: appPath,
+              reason: `boot reconcile: ${decision.reason}`,
+              bypassCooldown: true,
+            });
+          } else {
+            // Publish, don't call handleBuildApp directly: this is the exact
+            // same event/subscriber a real watcher-driven detection uses, so
+            // the monorepo services: interception and the
+            // isCloning/isUploading/autoBuild guards inside handleAppDetected
+            // all apply automatically instead of being bypassed.
+            this.eventBus.publish('app:detected', { name: config.name, path: appPath, type: undefined });
+          }
         }
       } catch (error) {
         // Any unexpected failure anywhere above must not strand this app OR
@@ -3406,6 +3440,12 @@ backup:
         decision: BootReconcileDecision;
         scanned: boolean;
         healthCheckPath: string | undefined;
+        /**
+         * A redeploy of a healthy, unchanged, serving app (#420): keep it routed and
+         * serving. Carries the serving version's healthCheck, read from the tree
+         * whose signature was just verified. Null when not eligible.
+         */
+        keepServing: { healthCheckPath: string | undefined } | null;
       }
   > {
     const appPath = config.path || path.join(this.config.appsDirectory, config.name);
@@ -3438,17 +3478,7 @@ backup:
       // CheapBootReconcileInput.runtimeSpecCurrent's doc comment.
       const runtimeSpecCurrent =
         config.runtimeSpecFingerprint ===
-        containerPolicyFingerprint({
-          apiPort: this.config.apiPort,
-          maxMemoryMbPerApp: this.config.maxMemoryMbPerApp,
-          maxCpusPerApp: this.config.maxCpusPerApp,
-          // DROP-072: same gating as the actual mount/env-var call sites
-          // (buildStartSpec) — undefined outside docker isolation.
-          pgSocketDir:
-            this.config.isolation === 'docker'
-              ? (this.postgresServer?.getSocketDir() ?? undefined)
-              : undefined,
-        });
+        this.currentPolicyFingerprint();
       // Port drift (M1 review item H): the skip path trusts config.port to
       // reconcile routing, but the runtime's own report is right there —
       // if they disagree, a routing-only skip would publish the app's
@@ -3528,8 +3558,7 @@ backup:
             }
           }
         } else {
-          const dropYaml = await parseDropYaml(appPath);
-          healthCheckPath = dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+          healthCheckPath = await this.sourceHealthCheckPath(appPath);
         }
         if (childYamlProblem !== undefined) {
           decision = {
@@ -3544,10 +3573,114 @@ backup:
         }
       }
 
-      return { kind: 'decided', config, appPath, decision, scanned, healthCheckPath };
+      // #420: only for a CHEAP-phase redeploy (stale runtime spec, API key
+      // rotation, stale dependencies): the serving instance is fine and only the
+      // platform's spec for it moved. A signature-phase one (secret set changed,
+      // failed readiness) may not start again once its process is replaced.
+      // Only computed when this pass will act on it: `ignoreGroup` is passed as
+      // `mode === 'on'`, and the act phase never acts in any other mode.
+      const keepServing =
+        ignoreGroup && decision.action === 'redeploy' && !scanned
+          ? await this.servedUnchangedOnBoot(
+              config,
+              appPath,
+              // The PRE-sync snapshot only, no fallback: sync can turn an errored app
+              // whose process is still up into 'running'.
+              bootStatusSnapshot?.get(config.name),
+              runtimeProc
+            )
+          : null;
+
+      return { kind: 'decided', config, appPath, decision, scanned, healthCheckPath, keepServing };
     } catch (error) {
       const reason = `error during decision: ${error instanceof Error ? error.message : String(error)}`;
       return { kind: 'error', config, appPath, reason, error };
+    }
+  }
+
+  /**
+   * #420: whether an app boot reconcile is about to REDEPLOY was serving, healthy
+   * and unchanged, so it can stay routed and be rebuilt as a redeploy of a running
+   * app, which keeps the old instance serving if the build fails. Without this, a
+   * redeploying app has no route until its new instance starts (routes live only
+   * in memory), and none at all if the build fails. Every condition is required:
+   * - it was 'running' before this boot (never an errored or crash-looping app);
+   * - the runtime reports it running on a KNOWN port equal to the persisted one;
+   * - no suspension refusal of any kind (the build gate's view, not the route gate's);
+   * - it lives at its default path, the tree handleConfigureRoute reads;
+   * - its source signature equals the last successful deploy's. handleConfigureRoute
+   *   reads domains/tls/route/access from the SOURCE drop.yaml, so the route it
+   *   re-emits carries exactly the trust the skip branch's does (same signature).
+   * Returns the serving version's healthCheck, read now, before any build runs in
+   * that tree. Group children are not decided here: their routing has its own branch.
+   */
+  private async servedUnchangedOnBoot(
+    config: AppConfig,
+    appPath: string,
+    snapshotStatus: AppStatus | undefined,
+    runtimeProc: AppProcessInfo | undefined
+  ): Promise<{ healthCheckPath: string | undefined } | null> {
+    // Without autoBuild a boot redeploy never builds: leave that as it is.
+    // A reserved name is refused by the ordinary detect path; keep it there.
+    if (!this.config.autoBuild || config.group || isReservedName(config.name) || snapshotStatus !== 'running') {
+      return null;
+    }
+    if (!runtimeProc || runtimeProc.port === null || runtimeProc.port !== config.port) return null;
+    if (refusalForApp(config.name)) return null;
+    if (path.resolve(appPath) !== path.resolve(this.config.appsDirectory, config.name)) return null;
+    if (config.sourceHash === undefined) return null;
+    // The cheap phase decided without scanning, so this is the only scan (up to
+    // the scan budget per eligible app, in the decide phase).
+    let hash: string;
+    try {
+      hash = (await this.computeSourceMtimeMs(appPath)).hash;
+    } catch {
+      return null;
+    }
+    if (hash !== config.sourceHash) return null;
+    try {
+      return { healthCheckPath: await this.sourceHealthCheckPath(appPath) };
+    } catch {
+      return null;
+    }
+  }
+
+  /** The healthCheck an app's drop.yaml declares (undefined when it is invalid). Throws when unreadable. */
+  private async sourceHealthCheckPath(appPath: string): Promise<string | undefined> {
+    const dropYaml = await parseDropYaml(appPath);
+    return dropYaml.success ? dropYaml.config?.healthCheck : undefined;
+  }
+
+  /**
+   * #420: put an app boot reconcile is about to redeploy back in the state the skip
+   * branch leaves a serving app: routed and watched. False when it could not be
+   * routed; it is then redeployed the ordinary way. `routeOnly`: nothing is persisted.
+   * `skipCaddyReload`: joins the one batched reload after the loop, like the skip
+   * branch; until then Caddy serves the previous run's file, which already
+   * routes this app. No reload is issued from the act loop itself (an app whose
+   * redeploy finishes during the loop reloads on its own start, as any boot
+   * redeploy does). Never throws: it must not abort reconciliation for the rest
+   * of the fleet.
+   */
+  private async keepServingWhileRedeploying(
+    appName: string,
+    port: number,
+    healthCheckPath: string | undefined
+  ): Promise<boolean> {
+    try {
+      // Re-checked here: the decide phase ran concurrently, possibly seconds ago.
+      if (refusalForApp(appName)) return false;
+      await this.handleConfigureRoute(appName, port, { routeOnly: true, skipCaddyReload: true });
+      // Route keys are per host, not the app name: ask by owner.
+      if (!this.router?.getRoutes().some((r) => r.owner === appName)) return false;
+      // Supervised as the skip branch leaves it; the redeploy's own process
+      // replacement stops the prober first (replaceLiveProcess).
+      this.armPostDeployWatches(appName, port, healthCheckPath);
+      this.logger.info(`Boot reconcile: '${appName}' stays routed on port ${port} while it redeploys`, 'BOOT');
+      return true;
+    } catch (error) {
+      this.logger.warn(`Boot reconcile: could not keep '${appName}' routed while it redeploys`, 'BOOT', error);
+      return false;
     }
   }
 
@@ -9051,6 +9184,10 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // Unconditional, as in doRestart: the STORED status says nothing
       // reliable about the process (an 'errored' or crash-looping app can
       // still hold a live one). See replaceLiveProcess.
+      // Fetch what the new start needs (Docker: its runtime image) while the old
+      // version still serves: a failed pull must fail the deploy BEFORE the
+      // replace, not leave the app with no instance at all (#420).
+      await this.runtime!.prepareStart?.(detection.type);
       this.logger.info(`Replacing ${appName}'s process (if any) with the new build...`, 'UPDATE');
       // The last refusal that leaves the old version SERVING: a suspension that
       // landed during the build is caught here, with nothing awaited between
@@ -9139,10 +9276,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.recordDeployOutcome(appName, false);
         return false;
       }
-      this.logger.appEvent('error', appName, error instanceof Error ? error.message : 'Hot-reload failed');
-      await this.stateManager!.setAppStatus(appName, 'errored', {
-        error: error instanceof Error ? error.message : 'Hot-reload failed',
-      });
+      const message = error instanceof Error ? error.message : 'Hot-reload failed';
+      this.logger.appEvent('error', appName, message);
+      await this.stateManager!.setAppStatus(appName, 'errored', { error: message });
+      if (admitted.wasRunning && !progress.replaced && admitted.originalPort) {
+        // Failed before the old version was replaced: it is still serving, as on
+        // a failed build. errored -> running, as failCutover does, so the tracker
+        // closes the episode as failed; the errored write stopped its watches.
+        await this.restoreStillServing(appName, admitted.originalPort, `Redeploy failed: ${message}`);
+      }
       // A throw BEFORE builder.build() (detect, prepareDeployTarget,
       // resolveBuildEnv, buildToolchainFor, a malformed drop.yaml) never opened
       // a deploy episode, so the setAppStatus above had nothing to close.
@@ -9491,6 +9633,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     this.armPostDeployWatches(appName, newPort, spec.healthCheckPath);
     this.logger.info(`Zero-downtime cutover of ${appName} complete: now serving from ${newInstance}`, 'CUTOVER');
     return { ok: true, port: newPort };
+  }
+
+  /**
+   * A redeploy failed before it replaced the app's running instance (#420) and
+   * the runtime still reports it on its port: back to 'running' with the error,
+   * watched again. Its healthCheck is read from the source drop.yaml.
+   */
+  private async restoreStillServing(appName: string, port: number, error: string): Promise<void> {
+    const info = await this.runtime?.getStatus(appName).catch(() => null);
+    if (info?.status !== 'running' || info.port !== port) return;
+    await this.stateManager?.setAppStatus(appName, 'running', { port, error });
+    const healthCheckPath = await this.sourceHealthCheckPath(this.sourcePathOf(appName)).catch(() => undefined);
+    this.armPostDeployWatches(appName, port, healthCheckPath);
   }
 
   /**
