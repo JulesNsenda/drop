@@ -103,7 +103,6 @@ import { getAppConfigService, resetAppConfigService } from '../managers/app/app-
 import { getSecretManager } from '../managers/secret';
 import { RouterService } from './router';
 import { BuilderService } from './builder';
-import { DeployTracker } from '../managers/deploy-tracker/deploy-tracker';
 
 /** Poll until `predicate` holds or the timeout elapses (drives async handlers). */
 async function waitFor(
@@ -1085,7 +1084,6 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     appsInProgress: Set<string>;
     recordDeployOutcome: (app: string, ok: boolean) => void;
     startCrashLoopWatch: (app: string) => void;
-    deployEpisodeOpen: (app: string) => boolean;
   };
 
   /**
@@ -1133,42 +1131,10 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     const app = getStateManager().getApp('site');
     expect(app?.status).toBe('running');
     expect(app?.port).toBe(port);
-    expect(app?.error).toMatch(/^Build failed \(boot redeploy: runtime spec revision is stale\): pull access denied/);
+    expect(app?.error).toMatch(/^Build failed: pull access denied/);
     expect(siteRouted()).toBe(true);
     expect(crashWatch).toHaveBeenCalledWith('site');
     // Still a failed deploy to the breaker.
-    expect(outcome).toHaveBeenCalledWith('site', false);
-  }, 30000);
-
-  it('#420 failed boot redeploy whose old instance died during the build: errored', async () => {
-    const { outcome } = await bootRedeployWithFailingBuild(async () => {
-      await fakeRuntime.stop('site');
-      return failedBuild('boom');
-    });
-
-    expect(getStateManager().getApp('site')?.status).toBe('errored');
-    expect(outcome).toHaveBeenCalledWith('site', false);
-    // Nothing serves on the kept port any more: the route is taken down.
-    expect(siteRouted()).toBe(false);
-  }, 30000);
-
-  it('#420 failed boot redeploy of an app stopped during the build: stays stopped', async () => {
-    await bootRedeployWithFailingBuild(async () => {
-      await getStateManager().setAppStatus('site', 'stopped');
-      return failedBuild('boom');
-    });
-
-    // The stop wins: neither 'running' nor 'errored' is written over it.
-    expect(getStateManager().getApp('site')?.status).toBe('stopped');
-  }, 30000);
-
-  it('#420 failed boot redeploy where the runtime status read rejects: errored, failure still counted', async () => {
-    const { outcome } = await bootRedeployWithFailingBuild(async () => {
-      jest.spyOn(fakeRuntime, 'getStatus').mockRejectedValue(new Error('runtime unreachable'));
-      return failedBuild('boom');
-    });
-
-    expect(getStateManager().getApp('site')?.status).toBe('errored');
     expect(outcome).toHaveBeenCalledWith('site', false);
   }, 30000);
 
@@ -1176,33 +1142,6 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     await bootRedeployWithFailingBuild(async () => failedBuild('boom'), { changeSource: true });
 
     expect(getStateManager().getApp('site')?.status).toBe('errored');
-  }, 30000);
-
-  it('#420 a thrown build failure with a deploy episode still open: errored, never closed as a success', async () => {
-    await bootRedeployWithFailingBuild(
-      async () => {
-        throw new Error('builder exploded');
-      },
-      {
-        beforeStart: () => {
-          jest
-            .spyOn(DeployTracker.prototype, 'hasOpenEpisode')
-            .mockImplementation((app: string) => app === 'site');
-        },
-      }
-    );
-
-    expect(getStateManager().getApp('site')?.status).toBe('errored');
-  }, 30000);
-
-  it('#420 a thrown build failure with no episode open: stays running', async () => {
-    await bootRedeployWithFailingBuild(async () => {
-      throw new Error('builder exploded');
-    });
-
-    const app = getStateManager().getApp('site');
-    expect(app?.status).toBe('running');
-    expect(app?.error).toMatch(/builder exploded/);
   }, 30000);
 
   // #420: the guards that keep an app from being routed ahead of its build.
@@ -1377,41 +1316,7 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     expect(app?.status).toBe('errored');
     expect(app?.error).toMatch(/first failure/);
   }, 30000);
-  it('#420 a failed boot redeploy when the deploy tracker cannot be read: errored and unrouted (counted as an open episode)', async () => {
-    await bootRedeployWithFailingBuild(async () => failedBuild('boom'), {
-      beforeStart: () => {
-        jest.spyOn(DeployTracker.prototype, 'hasOpenEpisode').mockImplementation(() => {
-          throw new Error('tracker unreadable');
-        });
-      },
-    });
-
-    expect(getStateManager().getApp('site')?.status).toBe('errored');
-    expect(siteRouted()).toBe(false);
-  }, 30000);
-
-  it('#420 a source change between the boot decision and the build: errored and unrouted', async () => {
-    await bootRedeployWithFailingBuild(async () => failedBuild('boom'), {
-      beforeStart: (p) => {
-        const priv = p as unknown as {
-          appsInProgress: Set<string>;
-          computeSourceMtimeMs: (appPath: string) => Promise<{ hash: string }>;
-        };
-        const real = priv.computeSourceMtimeMs.bind(p);
-        // Once the build is admitted, the tree reads as different.
-        jest
-          .spyOn(priv, 'computeSourceMtimeMs')
-          .mockImplementation(async (appPath: string) =>
-            priv.appsInProgress.has('site') ? { ...(await real(appPath)), hash: 'changed-since-boot' } : real(appPath)
-          );
-      },
-    });
-
-    expect(getStateManager().getApp('site')?.status).toBe('errored');
-    expect(siteRouted()).toBe(false);
-  }, 30000);
-
-  it('#420 a kept route whose build is refused before it runs is taken down', async () => {
+  it('#420 a boot redeploy refused before it builds leaves the serving app as the skip verdict would: running, routed', async () => {
     platform = makePlatform();
     await platform.start();
     const appPath = await createStaticApp('site');
@@ -1422,18 +1327,22 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     platform2 = makePlatform({ bootReconcileMode: 'on' });
     const priv = platform2 as unknown as {
       checkGuardrails: () => { allowed: boolean; failures: number; retryAfterSeconds?: number };
-      bootKeptRoutes: Map<string, unknown>;
       logger: { info: (...a: unknown[]) => void };
     };
     const infoSpy = jest.spyOn(priv.logger, 'info');
-    jest.spyOn(priv, 'checkGuardrails').mockReturnValue({ allowed: false, failures: 5, retryAfterSeconds: 60 });
+    const guard = jest
+      .spyOn(priv, 'checkGuardrails')
+      .mockReturnValue({ allowed: false, failures: 5, retryAfterSeconds: 60 });
+    const build = jest.spyOn(BuilderService.prototype, 'build');
     await platform2.start();
     await waitFor(() =>
       infoSpy.mock.calls.some((c) => typeof c[0] === 'string' && c[0].includes("'site' stays routed on port"))
     );
-    await waitFor(() => !priv.bootKeptRoutes.has('site') && !siteRouted());
+    await waitFor(() => guard.mock.calls.length > 0);
 
-    expect(siteRouted()).toBe(false);
+    expect(build).not.toHaveBeenCalled();
+    expect(getStateManager().getApp('site')?.status).toBe('running');
+    expect(siteRouted()).toBe(true);
   }, 30000);
 
   it('#420 autoBuild off: a redeploy verdict never keeps the app routed (nothing would settle it)', async () => {
