@@ -21,7 +21,7 @@ import Docker from 'dockerode';
 import { Readable, Writable } from 'stream';
 import { AppType } from '../detector/detector.types';
 import { CommandResult } from './builder.types';
-import { sanitizeBuildEnv } from './strategies/base';
+import { filterBuildOverrides } from './strategies/base';
 import {
   DROP_NETWORK,
   CONTAINER_CAP_DROP,
@@ -80,18 +80,7 @@ export async function executeCommandInContainer(
   // Unique name to avoid collisions in concurrent builds.
   const containerName = `drop-build-${appName}-${Date.now()}`;
 
-  const sanitizedEnv = sanitizeBuildEnv(env);
-  // The build runs as a NON-ROOT uid (`buildUser` below), so HOME must point at
-  // a path that uid can write. The inherited HOME (the platform user's
-  // /home/<user>) isn't writable inside the container, and a numeric uid with
-  // no /etc/passwd entry (python/go slim images) would otherwise resolve HOME
-  // to '/'. /tmp (mode 1777, the container's own ephemeral fs) covers
-  // npm/pnpm/yarn/pip caches in one line. Set after sanitizeBuildEnv so it
-  // overrides any inherited or drop.yaml HOME.
-  sanitizedEnv.HOME = '/tmp';
-  const dockerEnv = Object.entries(sanitizedEnv)
-    .filter((entry): entry is [string, string] => entry[1] !== undefined)
-    .map(([k, v]) => `${k}=${v}`);
+  const dockerEnv = Object.entries(containerBuildEnv(env)).map(([k, v]) => `${k}=${v}`);
 
   // Run the build as the platform's OWN uid — deterministically the owner of
   // the cloned app dir (the platform process cloned/copied it). The default
@@ -324,6 +313,48 @@ export function createContainerExecCommand(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Host variables a container build still gets: an outbound proxy, so package
+ * installs work on a box that can only reach the internet through one.
+ */
+const HOST_VARS_FOR_CONTAINER_BUILDS: readonly string[] = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'no_proxy',
+];
+
+/**
+ * The env of a build container (#419): the build's overrides (drop.yaml env,
+ * depends_on URLs, the platform's own build vars) plus the host's proxy
+ * variables, and nothing else from the host. The build is untrusted code, so
+ * the platform's environment (tokens, mail or database credentials a
+ * self-hoster's unit sets) never reaches it.
+ *
+ * PATH is never passed, from the host or from the app: an Env entry replaces
+ * the image's own PATH, and the golang image keeps `go` in /usr/local/go/bin,
+ * which a host PATH does not list.
+ *
+ * The build runs as a NON-ROOT uid, so HOME must point at a path that uid can
+ * write. A numeric uid with no /etc/passwd entry (python/go slim images) would
+ * otherwise resolve HOME to '/'. /tmp (mode 1777, the container's own
+ * ephemeral fs) covers npm/pnpm/yarn/pip/go caches, and overrides any
+ * drop.yaml HOME.
+ */
+export function containerBuildEnv(overrides: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const name of HOST_VARS_FOR_CONTAINER_BUILDS) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  Object.assign(env, filterBuildOverrides(overrides));
+  delete env.PATH;
+  env.HOME = '/tmp';
+  return env;
+}
 
 async function ensureBuildImage(docker: Docker, image: string): Promise<void> {
   try {
