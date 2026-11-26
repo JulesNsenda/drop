@@ -1127,6 +1127,13 @@ export class DropPlatform {
   // reachable for the exact case it exists for. Cleared after boot
   // reconciliation runs so it can't leak into a later start() on this instance.
   private bootStatusSnapshot: Map<string, AppStatus> | null = null;
+  /**
+   * #420: apps boot reconcile kept routed while it redeploys them (see
+   * servedUnchangedOnBoot), with the port they serve on and the redeploy reason.
+   * handleBuildApp takes the entry: a failed build of such an app leaves its
+   * old instance serving instead of marking it errored.
+   */
+  private readonly bootServedApps = new Map<string, { port: number; reason: string }>();
   // THE BOOT-SKIP RULE (monorepo children). A group child that boot reconcile
   // found running, current and routed may be left unbuilt by its container's
   // expansion, and only when ALL of these hold: reconcile ran in mode 'on' and
@@ -3326,6 +3333,9 @@ backup:
           if (config.group) this.bootCurrentChildren.add(config.name);
         } else {
           this.logger.info(`Boot reconcile: redeploying '${config.name}' — ${decision.reason}`, 'BOOT');
+          if (result.keepRouted) {
+            await this.keepRoutedWhileRedeploying(config.name, config.port as number, decision.reason);
+          }
           // Publish, don't call handleBuildApp directly: this is the exact
           // same event/subscriber a real watcher-driven detection uses, so
           // the monorepo services: interception and the
@@ -3420,6 +3430,8 @@ backup:
         decision: BootReconcileDecision;
         scanned: boolean;
         healthCheckPath: string | undefined;
+        /** Redeploy of a healthy, unchanged, serving app: keep it routed (#420). */
+        keepRouted: boolean;
       }
   > {
     const appPath = config.path || path.join(this.config.appsDirectory, config.name);
@@ -3476,6 +3488,10 @@ backup:
         dependenciesStale: status !== 'stopped' && (await this.servingTreeIsStale(config)),
       });
       let scanned = false;
+      // #420: the scanned source hash (null = the scan failed), and whether the
+      // verdict came from a failed readiness probe. Both feed `keepRouted`.
+      let scannedHash: string | null | undefined;
+      let failedReadiness = false;
 
       if (!decision) {
         scanned = true;
@@ -3492,6 +3508,7 @@ backup:
           );
           currentSignature = undefined;
         }
+        scannedHash = currentSignature?.hash ?? null;
 
         decision = decideBootReconciliationSignature({
           recordedHash: config.sourceHash,
@@ -3545,13 +3562,77 @@ backup:
             action: 'redeploy',
             reason: 'skip candidate did not answer a readiness probe',
           };
+          failedReadiness = true;
         }
       }
 
-      return { kind: 'decided', config, appPath, decision, scanned, healthCheckPath };
+      // `ignoreGroup` is true only in mode 'on', the only mode that acts.
+      const keepRouted =
+        ignoreGroup &&
+        decision.action === 'redeploy' &&
+        !failedReadiness &&
+        (await this.servedUnchangedOnBoot(config, appPath, status, runtimeProc, scannedHash));
+
+      return { kind: 'decided', config, appPath, decision, scanned, healthCheckPath, keepRouted };
     } catch (error) {
       const reason = `error during decision: ${error instanceof Error ? error.message : String(error)}`;
       return { kind: 'error', config, appPath, reason, error };
+    }
+  }
+
+  /**
+   * #420: whether an app boot reconcile is about to REDEPLOY was serving, healthy
+   * and unchanged, so it can stay routed during the build and keep serving if the
+   * build fails. Without this, a redeploying app has no route until its new
+   * instance starts (routes live only in memory), and none at all if the build
+   * fails. Every condition is required:
+   * - it was 'running' before this boot (never an errored or crash-looping app);
+   * - the runtime reports it running on a KNOWN port equal to the persisted one;
+   * - no suspension refusal of any kind (the build gate's view, not the route gate's);
+   * - its source is unchanged since the last successful deploy. handleConfigureRoute
+   *   reads domains/tls/route/access from the SOURCE drop.yaml, so only an unchanged
+   *   source re-emits exactly the route that was live: never unbuilt routing.
+   * Group children are not decided here: their routing has its own branch.
+   */
+  private async servedUnchangedOnBoot(
+    config: AppConfig,
+    appPath: string,
+    status: AppStatus | undefined,
+    runtimeProc: AppProcessInfo | undefined,
+    scannedHash: string | null | undefined
+  ): Promise<boolean> {
+    if (config.group || status !== 'running') return false;
+    if (!runtimeProc || runtimeProc.port === null || runtimeProc.port !== config.port) return false;
+    if (refusalForApp(config.name)) return false;
+    if (config.sourceHash === undefined || scannedHash === null) return false;
+    let hash = scannedHash;
+    if (hash === undefined) {
+      // The cheap phase decided without scanning (e.g. a stale runtime spec).
+      try {
+        hash = (await this.computeSourceMtimeMs(appPath)).hash;
+      } catch {
+        return false;
+      }
+    }
+    return hash === config.sourceHash;
+  }
+
+  /**
+   * #420: re-emit the route of an app boot reconcile is about to redeploy, and
+   * remember it so a failed build leaves the old instance serving. `routeOnly`:
+   * nothing is persisted. A real reload, not the batched one, so the access-gate
+   * bookkeeping records the gate as applied. Never throws: this must not abort
+   * reconciliation for the rest of the fleet.
+   */
+  private async keepRoutedWhileRedeploying(appName: string, port: number, reason: string): Promise<void> {
+    try {
+      await this.handleConfigureRoute(appName, port, { routeOnly: true });
+      // Route keys are per host, not the app name: ask by owner.
+      if (!this.router?.getRoutes().some((r) => r.owner === appName)) return;
+      this.bootServedApps.set(appName, { port, reason });
+      this.logger.info(`Boot reconcile: '${appName}' stays routed on port ${port} while it redeploys`, 'BOOT');
+    } catch (error) {
+      this.logger.warn(`Boot reconcile: could not keep '${appName}' routed while it redeploys`, 'BOOT', error);
     }
   }
 
@@ -5835,6 +5916,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // start a duplicate build.
     this.pendingBuilds.delete(appName);
     this.appsInProgress.add(appName);
+    // #420: taken here, so it applies to this build only (see bootServedApps).
+    const bootServed = this.bootServedApps.get(appName);
+    this.bootServedApps.delete(appName);
 
     this.logger.appEvent('building', appName);
 
@@ -6004,14 +6088,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.appsInProgress.delete(appName);
         await this.discardDeployTarget(appName);
         this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
+        if (bootServed) this.bootServedApps.set(appName, bootServed);
         this.scheduleBuildDrain();
       } else {
         this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
-        if (this.stateManager) {
-          await this.stateManager.setAppStatus(appName, 'errored', {
-            error: result.errors?.[0]?.message || 'Build failed',
-          });
-        }
+        await this.settleFailedBuildStatus(appName, result.errors?.[0]?.message || 'Build failed', bootServed);
         // The COMMONEST failure, and the one a loop is actually made of: the
         // build ran and returned unsuccessfully. failDeployEpisode does not
         // fire here (the builder published its own episode), so without this
@@ -6048,9 +6129,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
       this.logger.appEvent('error', appName, err.message);
-      if (this.stateManager) {
-        await this.stateManager.setAppStatus(appName, 'errored', { error: err.message });
-      }
+      await this.settleFailedBuildStatus(
+        appName,
+        err.message,
+        this.deployEpisodeOpen(appName) ? undefined : bootServed
+      );
       // A throw BEFORE builder.build() (detection, the disk check,
       // resolveBuildEnv, a malformed drop.yaml) never opened a deploy episode,
       // so the MCP deploy tools would poll their full budget and report "still
@@ -11941,6 +12024,59 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
    * skip (or any of these) with no crash-loop watch would silently stop
    * noticing a dead or crash-looping app for the rest of the process's life.
    */
+  /**
+   * The status a failed fresh-path build leaves: 'errored', unless boot reconcile
+   * kept this app routed while redeploying it (`bootServed`, #420) and its old
+   * instance is still the one serving. Then 'running' with the error, and its
+   * watches re-armed, as failCutover does when a zero-downtime switch fails. The
+   * failure accounting (breaker, quota, deploy episode) is the caller's and is
+   * unchanged: the deploy still failed.
+   */
+  private async settleFailedBuildStatus(
+    appName: string,
+    message: string,
+    bootServed: { port: number; reason: string } | undefined
+  ): Promise<void> {
+    if (!this.stateManager) return;
+    if (bootServed && (await this.oldInstanceStillServing(appName, bootServed.port))) {
+      await this.stateManager.setAppStatus(appName, 'running', {
+        port: bootServed.port,
+        error: `Build failed (boot redeploy: ${bootServed.reason}): ${message}`,
+      });
+      this.logger.warn(`Build of ${appName} failed; its previous version is still serving`, 'BUILD');
+      // Its source is unchanged since the last deploy (servedUnchangedOnBoot), so
+      // the source drop.yaml holds the healthCheck the serving version shipped with.
+      let healthCheckPath: string | undefined;
+      try {
+        const appPath = path.join(this.config.appsDirectory, appName);
+        healthCheckPath = (await parseDropYaml(appPath)).config?.healthCheck;
+      } catch {
+        healthCheckPath = undefined;
+      }
+      this.armPostDeployWatches(appName, bootServed.port, healthCheckPath);
+      return;
+    }
+    await this.stateManager.setAppStatus(appName, 'errored', { error: message });
+  }
+
+  /**
+   * Whether the instance a failed build was meant to replace is still the one
+   * serving on `port`: nothing re-marked the app during the build (a stop, a park
+   * or a suspension writes a status other than building), no suspension refuses
+   * it, and the runtime reports it running on that port. Never throws: it runs in
+   * a failure path whose accounting must not be skipped.
+   */
+  private async oldInstanceStillServing(appName: string, port: number): Promise<boolean> {
+    if (this.stateManager?.getApp(appName)?.status !== 'building') return false;
+    try {
+      if (refusalForApp(appName)) return false;
+      const info = await this.runtime?.getStatus(appName).catch(() => null);
+      return info?.status === 'running' && info.port === port;
+    } catch {
+      return false;
+    }
+  }
+
   private armPostDeployWatches(appName: string, port: number, healthCheckPath: string | undefined): void {
     if (healthCheckPath && this.runtime?.type === 'pm2') {
       this.startHealthProber(appName, port, healthCheckPath);
