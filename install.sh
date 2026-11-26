@@ -451,6 +451,29 @@ ensure_caddy() {
   if command -v setcap &>/dev/null && [[ -n "$caddy_bin" ]]; then
     setcap 'cap_net_bind_service=+ep' "$caddy_bin" \
       || warn "setcap failed — Caddy may not bind :80/:443 as the '$DROP_USER' user"
+    ensure_caddy_cap_hook "$caddy_bin" "$(command -v setcap)"
+  fi
+}
+
+# Upgrading the caddy package replaces the binary, and the new file has no
+# capabilities. The running Caddy keeps its ports, so nothing breaks until the
+# next DROP restart (a reboot, say), when every site goes down (#417). This
+# dpkg hook re-grants the capability after every apt/dpkg run. It is a no-op
+# when caddy is gone, and it never fails the apt run.
+CADDY_CAP_HOOK="/etc/apt/apt.conf.d/99drop-caddy-cap"
+ensure_caddy_cap_hook() {
+  local caddy_bin="$1" setcap_bin="$2"
+  # The paths go into a root-run apt.conf string, so allow plain paths only.
+  if [[ ! "$caddy_bin" =~ ^/[A-Za-z0-9/._-]+$ || ! "$setcap_bin" =~ ^/[A-Za-z0-9/._-]+$ ]]; then
+    warn "Not installing $CADDY_CAP_HOOK: unexpected caddy or setcap path"
+    return 0
+  fi
+  local hook
+  hook="DPkg::Post-Invoke { \"if [ -x $caddy_bin ]; then $setcap_bin cap_net_bind_service=+ep $caddy_bin || true; fi\"; };"
+  if [[ "$(cat "$CADDY_CAP_HOOK" 2>/dev/null)" != "$hook" ]]; then
+    printf '%s\n' "$hook" > "$CADDY_CAP_HOOK"
+    chmod 0644 "$CADDY_CAP_HOOK"
+    info "Installed $CADDY_CAP_HOOK (keeps Caddy's port capability across caddy upgrades)"
   fi
 }
 

@@ -4,6 +4,7 @@
 
 import * as fs from 'fs/promises';
 import {
+  bindDeniedHint,
   CaddyServer,
   getCaddyServer,
   resetCaddyServer,
@@ -403,6 +404,64 @@ describe('CaddyServer', () => {
       // Should not attempt to start
       expect(mockExecSync).not.toHaveBeenCalled();
       expect(testConfig.onLog).toHaveBeenCalledWith('Caddy not available - skipping start');
+    });
+
+    describe('a refused privileged bind (#417)', () => {
+      // Caddy 2.11's own line, captured from a non-root Caddy with no capability.
+      const REAL_LINE =
+        '{"level":"error","ts":1795724034.23318,"msg":"loading initial config: loading new config: ' +
+        'http app module: start: listening on :80: listen tcp :80: bind: permission denied"}';
+
+      function spawnEmitting(stderrLine: string): void {
+        mockSpawn.mockImplementation(() => {
+          const proc = {
+            stdout: { on: jest.fn() },
+            stderr: {
+              on: jest.fn((event: string, cb: (d: Buffer) => void) => {
+                if (event === 'data') setTimeout(() => cb(Buffer.from(stderrLine)), 5);
+              }),
+            },
+            on: jest.fn(),
+            kill: jest.fn(),
+            once: jest.fn(),
+          };
+          return proc;
+        });
+      }
+
+      it('fails at once with the fix instead of waiting out the startup timeout', async () => {
+        const onError = jest.fn();
+        mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+        spawnEmitting(REAL_LINE);
+        const server = new CaddyServer({ ...testConfig, onError });
+
+        const began = Date.now();
+        await expect(server.start()).rejects.toThrow(bindDeniedHint('80'));
+
+        expect(Date.now() - began).toBeLessThan(5000);
+        expect(server.getStatus()).toBe('error');
+        expect(onError).toHaveBeenCalledWith(bindDeniedHint('80'));
+      });
+
+      it('names the port for an IPv6 listener too', async () => {
+        mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+        spawnEmitting('Error: listen tcp [::]:443: bind: permission denied');
+        const server = new CaddyServer(testConfig);
+
+        await expect(server.start()).rejects.toThrow('Caddy may not bind port 443.');
+      });
+
+      it('gives the setcap fix on Linux only', () => {
+        const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        try {
+          Object.defineProperty(process, 'platform', { value: 'linux' });
+          expect(bindDeniedHint('443')).toContain('sudo setcap cap_net_bind_service=+ep');
+          Object.defineProperty(process, 'platform', { value: 'darwin' });
+          expect(bindDeniedHint('443')).not.toContain('setcap');
+        } finally {
+          Object.defineProperty(process, 'platform', platform);
+        }
+      });
     });
   });
 

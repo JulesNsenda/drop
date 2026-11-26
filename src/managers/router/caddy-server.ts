@@ -21,6 +21,24 @@ const STARTUP_TIMEOUT_MS = 10000;
 const HEALTH_CHECK_INTERVAL_MS = 500;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 5000;
 
+/** Caddy's stderr when it may not listen on a port below 1024. */
+const BIND_DENIED = /listen tcp \S*?:(\d+): bind: permission denied/i;
+
+/**
+ * What to do about it (#417). On Linux, DROP runs Caddy as a non-root user
+ * that may bind 80/443 only through the binary's cap_net_bind_service, and
+ * upgrading the caddy package replaces the binary without it.
+ */
+export function bindDeniedHint(port: string): string {
+  const base = `Caddy may not bind port ${port}.`;
+  if (process.platform !== 'linux') return `${base} Run DROP with permission to bind ports below 1024.`;
+  return (
+    `${base} The caddy binary has probably lost cap_net_bind_service, which upgrading the caddy package does. ` +
+    'Fix: sudo setcap cap_net_bind_service=+ep "$(command -v caddy)" && sudo systemctl restart drop-platform. ' +
+    "Running install.sh --upgrade adds an apt hook that re-grants it after every upgrade."
+  );
+}
+
 export class CaddyServer {
   private readonly config: CaddyServerConfig;
   private readonly port: number;
@@ -28,6 +46,8 @@ export class CaddyServer {
   private serverProcess: ChildProcess | null = null;
   private status: CaddyServerStatus = 'stopped';
   private installed: boolean | null = null;
+  /** Set when Caddy's output shows a refused privileged bind: startup fails at once, with the fix. */
+  private bindDenied: string | false = false;
 
   constructor(config: CaddyServerConfig) {
     this.config = config;
@@ -188,6 +208,7 @@ export class CaddyServer {
     }
 
     try {
+      this.bindDenied = false;
       await this.startServer();
       await this.waitForStartup();
       this.status = 'running';
@@ -354,6 +375,11 @@ export class CaddyServer {
         // Caddy logs operational info (incl. TLS errors) to stderr — surface
         // at error level, not debug, so they aren't invisible in production.
         this.logError(`[Caddy] ${message}`);
+        const denied = BIND_DENIED.exec(message);
+        if (denied && !this.bindDenied) {
+          this.bindDenied = bindDeniedHint(denied[1]);
+          this.logError(this.bindDenied);
+        }
       }
     });
 
@@ -380,6 +406,9 @@ export class CaddyServer {
     const startTime = Date.now();
 
     while (Date.now() - startTime < STARTUP_TIMEOUT_MS) {
+      if (this.bindDenied) {
+        throw new Error(this.bindDenied);
+      }
       if (await this.isServerRunning()) {
         return;
       }
