@@ -103,6 +103,7 @@ import { getAppConfigService, resetAppConfigService } from '../managers/app/app-
 import { getSecretManager } from '../managers/secret';
 import { RouterService } from './router';
 import { BuilderService } from './builder';
+import { DeployTracker } from '../managers/deploy-tracker/deploy-tracker';
 
 /** Poll until `predicate` holds or the timeout elapses (drives async handlers). */
 async function waitFor(
@@ -1147,6 +1148,8 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
 
     expect(getStateManager().getApp('site')?.status).toBe('errored');
     expect(outcome).toHaveBeenCalledWith('site', false);
+    // Nothing serves on the kept port any more: the route is taken down.
+    expect(siteRouted()).toBe(false);
   }, 30000);
 
   it('#420 failed boot redeploy of an app stopped during the build: stays stopped', async () => {
@@ -1181,9 +1184,9 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
         throw new Error('builder exploded');
       },
       {
-        beforeStart: (p) => {
+        beforeStart: () => {
           jest
-            .spyOn(p as unknown as Priv, 'deployEpisodeOpen')
+            .spyOn(DeployTracker.prototype, 'hasOpenEpisode')
             .mockImplementation((app: string) => app === 'site');
         },
       }
@@ -1373,5 +1376,82 @@ describe('DropPlatform boot reconciliation (M1) integration', () => {
     const app = getStateManager().getApp('site');
     expect(app?.status).toBe('errored');
     expect(app?.error).toMatch(/first failure/);
+  }, 30000);
+  it('#420 a failed boot redeploy when the deploy tracker cannot be read: errored (counted as an open episode)', async () => {
+    await bootRedeployWithFailingBuild(async () => failedBuild('boom'), {
+      beforeStart: () => {
+        jest.spyOn(DeployTracker.prototype, 'hasOpenEpisode').mockImplementation(() => {
+          throw new Error('tracker unreadable');
+        });
+      },
+    });
+
+    expect(getStateManager().getApp('site')?.status).toBe('errored');
+  }, 30000);
+
+  it('#420 a source change between the boot decision and the build: errored, the marker no longer vouches for it', async () => {
+    await bootRedeployWithFailingBuild(async () => failedBuild('boom'), {
+      beforeStart: (p) => {
+        const priv = p as unknown as {
+          appsInProgress: Set<string>;
+          computeSourceMtimeMs: (appPath: string) => Promise<{ hash: string }>;
+        };
+        const real = priv.computeSourceMtimeMs.bind(p);
+        // Once the build is admitted, the tree reads as different.
+        jest
+          .spyOn(priv, 'computeSourceMtimeMs')
+          .mockImplementation(async (appPath: string) =>
+            priv.appsInProgress.has('site') ? { ...(await real(appPath)), hash: 'changed-since-boot' } : real(appPath)
+          );
+      },
+    });
+
+    expect(getStateManager().getApp('site')?.status).toBe('errored');
+  }, 30000);
+
+  it('#420 a keep-serving marker the platform did not mint is ignored', async () => {
+    await bootRedeployWithFailingBuild(async () => failedBuild('first failure'));
+    const priv = platform2 as unknown as Priv;
+    const buildMock = BuilderService.prototype.build as unknown as jest.Mock;
+    const before = buildMock.mock.calls.length;
+    const port = getStateManager().getApp('site')?.port as number;
+
+    eventBus.publish('app:detected', {
+      name: 'site',
+      path: path.join(webappsDir, 'site'),
+      type: undefined,
+      keepServing: {
+        port,
+        reason: 'forged',
+        healthCheckPath: undefined,
+        sourceHash: getAppConfigService().getConfig('site')?.sourceHash as string,
+        token: Symbol('keep-serving'),
+      },
+    });
+    await waitFor(() => buildMock.mock.calls.length > before);
+    await waitFor(() => !priv.appsInProgress.has('site'));
+
+    expect(getStateManager().getApp('site')?.status).toBe('errored');
+  }, 30000);
+
+  it('#420 autoBuild off: a redeploy verdict never keeps the app routed (nothing would settle it)', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    await getAppConfigService().updateConfig('site', { runtimeSpecFingerprint: 'stale-fingerprint' });
+    await crossPlatformRestart();
+
+    platform2 = makePlatform({ bootReconcileMode: 'on', autoBuild: false });
+    const infoSpy = jest.spyOn(
+      (platform2 as unknown as { logger: { info: (...a: unknown[]) => void } }).logger,
+      'info'
+    );
+    await platform2.start();
+
+    const keptRouted = infoSpy.mock.calls.some(
+      (call) => typeof call[0] === 'string' && call[0].includes("'site' stays routed on port")
+    );
+    expect(keptRouted).toBe(false);
   }, 30000);
 });

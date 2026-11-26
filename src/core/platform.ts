@@ -1146,6 +1146,8 @@ export class DropPlatform {
   private toolchainBackfill: Promise<void> | null = null;
   private usedPorts: Map<number, string> = new Map(); // port -> appName ownership
   private appsInProgress: Set<string> = new Set(); // Track apps being built/started
+  /** #420: carried by every keep-serving marker this platform mints; any other marker is ignored. */
+  private readonly keepServingToken = Symbol('keep-serving');
   /** Apps whose folder a git deploy is writing (a subset of appsInProgress). */
   private gitReserved: Set<string> = new Set();
   /**
@@ -3334,7 +3336,8 @@ backup:
                 config.name,
                 config.port as number,
                 decision.reason,
-                result.keepServing.healthCheckPath
+                result.keepServing.healthCheckPath,
+                result.keepServing.sourceHash
               )
             : undefined;
           if (keepServing) anySkipped = true; // joins the batched reload below
@@ -3442,7 +3445,7 @@ backup:
          * serving. Carries the serving version's healthCheck, read from the tree
          * whose signature was just verified. Null when not eligible.
          */
-        keepServing: { healthCheckPath: string | undefined } | null;
+        keepServing: { healthCheckPath: string | undefined; sourceHash: string } | null;
       }
   > {
     const appPath = config.path || path.join(this.config.appsDirectory, config.name);
@@ -3622,8 +3625,9 @@ backup:
     snapshotStatus: AppStatus | undefined,
     runtimeProc: AppProcessInfo | undefined,
     scannedHash: string | null | undefined
-  ): Promise<{ healthCheckPath: string | undefined } | null> {
-    if (config.group || snapshotStatus !== 'running') return null;
+  ): Promise<{ healthCheckPath: string | undefined; sourceHash: string } | null> {
+    // Without autoBuild the redeploy never builds, so nothing would ever settle the marker.
+    if (!this.config.autoBuild || config.group || snapshotStatus !== 'running') return null;
     if (!runtimeProc || runtimeProc.port === null || runtimeProc.port !== config.port) return null;
     if (refusalForApp(config.name)) return null;
     if (path.resolve(appPath) !== path.resolve(this.config.appsDirectory, config.name)) return null;
@@ -3639,7 +3643,8 @@ backup:
     }
     if (hash !== config.sourceHash) return null;
     try {
-      return { healthCheckPath: (await parseDropYaml(appPath)).config?.healthCheck };
+      const dropYaml = await parseDropYaml(appPath);
+      return { healthCheckPath: dropYaml.success ? dropYaml.config?.healthCheck : undefined, sourceHash: hash };
     } catch {
       return null;
     }
@@ -3659,7 +3664,8 @@ backup:
     appName: string,
     port: number,
     reason: string,
-    healthCheckPath: string | undefined
+    healthCheckPath: string | undefined,
+    sourceHash: string
   ): Promise<AppDetectedPayload['keepServing']> {
     try {
       // Re-checked here: the decide phase ran concurrently, possibly seconds ago.
@@ -3667,8 +3673,10 @@ backup:
       await this.handleConfigureRoute(appName, port, { routeOnly: true, skipCaddyReload: true });
       // Route keys are per host, not the app name: ask by owner.
       if (!this.router?.getRoutes().some((r) => r.owner === appName)) return undefined;
+      // Supervised while it serves, as the skip branch does.
+      this.armPostDeployWatches(appName, port, healthCheckPath);
       this.logger.info(`Boot reconcile: '${appName}' stays routed on port ${port} while it redeploys`, 'BOOT');
-      return { port, reason, healthCheckPath };
+      return { port, reason, healthCheckPath, sourceHash, token: this.keepServingToken };
     } catch (error) {
       this.logger.warn(`Boot reconcile: could not keep '${appName}' routed while it redeploys`, 'BOOT', error);
       return undefined;
@@ -5838,12 +5846,13 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     if (suspendedHere) {
       this.logger.info(`Not building ${payload.name} - app is suspended`, 'BUILD');
     } else if (this.config.autoBuild && payload.type !== 'unknown' && currentApp?.status !== 'stopped') {
+      const { keepServing, ...detected } = payload;
       await this.handleBuildApp(
         payload.path,
         payload.name,
         payload.type as string,
-        payload,
-        ...(payload.keepServing ? [payload.keepServing] : [])
+        detected,
+        ...(keepServing?.token === this.keepServingToken ? [keepServing] : [])
       );
     } else if (payload.type === 'unknown' && currentApp?.status !== 'stopped') {
       // Detection couldn't resolve a type: the build guard above never fires
@@ -5897,7 +5906,8 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       this.uploadDeployService?.isUploading(appName)
     ) {
       this.logger.debug(`Deferring ${appName} - a git deploy is landing its files`, 'BUILD');
-      this.pendingBuilds.set(appName, { appPath, appType: _appType, actor, keepServing });
+      // No keep-serving marker: the files it vouched for are being replaced.
+      this.pendingBuilds.set(appName, { appPath, appType: _appType, actor });
       this.scheduleBuildDrain();
       return;
     }
@@ -5963,6 +5973,14 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // start a duplicate build.
     this.pendingBuilds.delete(appName);
     this.appsInProgress.add(appName);
+
+    // #420: the marker vouches for the source boot reconcile saw. If it changed
+    // since, a failure here is an ordinary failed deploy.
+    let keepServingNow = keepServing;
+    if (keepServingNow) {
+      const hash = await this.computeSourceMtimeMs(appPath).then((sig) => sig.hash, () => null);
+      if (hash !== keepServingNow.sourceHash) keepServingNow = undefined;
+    }
 
     this.logger.appEvent('building', appName);
 
@@ -6135,7 +6153,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         this.scheduleBuildDrain();
       } else {
         this.logger.appEvent('error', appName, result.errors?.[0]?.message || 'Build failed');
-        await this.settleFailedBuildStatus(appName, result.errors?.[0]?.message || 'Build failed', keepServing);
+        await this.settleFailedBuildStatus(appName, result.errors?.[0]?.message || 'Build failed', keepServingNow);
         // The COMMONEST failure, and the one a loop is actually made of: the
         // build ran and returned unsuccessfully. failDeployEpisode does not
         // fire here (the builder published its own episode), so without this
@@ -6172,7 +6190,7 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         return;
       }
       this.logger.appEvent('error', appName, err.message);
-      await this.settleFailedBuildStatus(appName, err.message, keepServing);
+      await this.settleFailedBuildStatus(appName, err.message, keepServingNow);
       // A throw BEFORE builder.build() (detection, the disk check,
       // resolveBuildEnv, a malformed drop.yaml) never opened a deploy episode,
       // so the MCP deploy tools would poll their full budget and report "still
@@ -12070,8 +12088,15 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
   ): Promise<void> {
     if (!this.stateManager) return;
     // A still-open episode belongs to this deploy: a running write would close it
-    // as succeeded. (The builder's build:failed normally closed it already.)
-    if (keepServing && !this.deployEpisodeOpen(appName)) {
+    // as succeeded. (The builder's build:failed normally closed it already.) An
+    // unreadable tracker counts as open.
+    let episodeOpen = true;
+    try {
+      episodeOpen = getDeployTracker().hasOpenEpisode(appName);
+    } catch {
+      // stays true
+    }
+    if (keepServing && !episodeOpen) {
       try {
         if (this.stateManager.getApp(appName)?.status === 'stopped') return;
         const info = await this.runtime?.getStatus(appName).catch(() => null);
@@ -12092,11 +12117,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
           return;
         }
         if (this.stateManager.getApp(appName)?.status === 'stopped') return;
+        // Kept routed at boot, but its old instance no longer serves on that port:
+        // take the route down rather than proxy to a dead upstream.
+        await this.router?.removeRoutesForApp(appName);
+        await this.reloadCaddyIfRunning();
       } catch (error) {
         this.logger.warn(`Could not keep ${appName}'s previous version serving`, 'BUILD', error);
       }
     }
-    await this.stateManager.setAppStatus(appName, 'errored', { error: message });
+    try {
+      await this.stateManager.setAppStatus(appName, 'errored', { error: message });
+    } catch (error) {
+      this.logger.warn(`Could not mark ${appName} errored`, 'BUILD', error);
+    }
   }
 
   /**
