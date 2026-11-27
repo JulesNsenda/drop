@@ -458,18 +458,25 @@ ensure_caddy() {
 # Upgrading the caddy package replaces the binary, and the new file has no
 # capabilities. The running Caddy keeps its ports, so nothing breaks until the
 # next DROP restart (a reboot, say), when every site goes down (#417). This
-# dpkg hook re-grants the capability after every apt/dpkg run. It is a no-op
-# when caddy is gone, and it never fails the apt run.
+# dpkg hook re-grants the capability after every apt/dpkg run. It grants it
+# only to a root-owned regular file nobody else can write (`find -type f`
+# does not follow a symlink), so the path can never lend the capability to
+# code the drop user controls. It is a no-op when caddy is gone, and it never
+# fails the apt run. Removing DROP from a box means deleting this file too.
 CADDY_CAP_HOOK="/etc/apt/apt.conf.d/99drop-caddy-cap"
 ensure_caddy_cap_hook() {
-  local caddy_bin="$1" setcap_bin="$2"
+  local caddy_bin="$1" setcap_bin="$2" find_bin
+  find_bin="$(command -v find)"
   # The paths go into a root-run apt.conf string, so allow plain paths only.
-  if [[ ! "$caddy_bin" =~ ^/[A-Za-z0-9/._-]+$ || ! "$setcap_bin" =~ ^/[A-Za-z0-9/._-]+$ ]]; then
-    warn "Not installing $CADDY_CAP_HOOK: unexpected caddy or setcap path"
-    return 0
-  fi
+  local p
+  for p in "$caddy_bin" "$setcap_bin" "$find_bin"; do
+    if [[ ! "$p" =~ ^/[A-Za-z0-9/._-]+$ ]]; then
+      warn "Not installing $CADDY_CAP_HOOK: unexpected path '$p'"
+      return 0
+    fi
+  done
   local hook
-  hook="DPkg::Post-Invoke { \"if [ -x $caddy_bin ]; then $setcap_bin cap_net_bind_service=+ep $caddy_bin || true; fi\"; };"
+  hook="DPkg::Post-Invoke { \"$find_bin $caddy_bin -maxdepth 0 -type f -user 0 ! -perm /022 -exec $setcap_bin cap_net_bind_service=+ep {} + 2>/dev/null || true\"; };"
   if [[ "$(cat "$CADDY_CAP_HOOK" 2>/dev/null)" != "$hook" ]]; then
     printf '%s\n' "$hook" > "$CADDY_CAP_HOOK"
     chmod 0644 "$CADDY_CAP_HOOK"

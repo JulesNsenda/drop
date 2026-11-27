@@ -29,14 +29,26 @@ const BIND_DENIED = /listen tcp \S*?:(\d+): bind: permission denied/i;
  * that may bind 80/443 only through the binary's cap_net_bind_service, and
  * upgrading the caddy package replaces the binary without it.
  */
-export function bindDeniedHint(port: string): string {
+export function bindDeniedHint(port: string, caddyPath: string): string {
   const base = `Caddy may not bind port ${port}.`;
   if (process.platform !== 'linux') return `${base} Run DROP with permission to bind ports below 1024.`;
   return (
     `${base} The caddy binary has probably lost cap_net_bind_service, which upgrading the caddy package does. ` +
-    'Fix: sudo setcap cap_net_bind_service=+ep "$(command -v caddy)" && sudo systemctl restart drop-platform. ' +
-    "Running install.sh --upgrade adds an apt hook that re-grants it after every upgrade."
+    `Fix: sudo setcap cap_net_bind_service=+ep ${caddyPath} && sudo systemctl restart drop-platform. ` +
+    'Running a trusted install.sh --bootstrap as root (see docs/HETZNER-DEPLOY.md; not the drop-owned ' +
+    '/opt/drop/install.sh) adds an apt hook that re-grants it after every upgrade.'
   );
+}
+
+/** The caddy binary DROP runs, by the same PATH lookup as its spawn. */
+function resolvedCaddyPath(): string {
+  try {
+    const found = execSync('command -v caddy', { stdio: 'pipe', shell: '/bin/sh' }).toString().trim();
+    if (found.startsWith('/')) return found;
+  } catch {
+    // fall through
+  }
+  return '/usr/bin/caddy';
 }
 
 export class CaddyServer {
@@ -377,7 +389,7 @@ export class CaddyServer {
         this.logError(`[Caddy] ${message}`);
         const denied = BIND_DENIED.exec(message);
         if (denied && !this.bindDenied) {
-          this.bindDenied = bindDeniedHint(denied[1]);
+          this.bindDenied = bindDeniedHint(denied[1], resolvedCaddyPath());
           this.logError(this.bindDenied);
         }
       }
@@ -406,11 +418,13 @@ export class CaddyServer {
     const startTime = Date.now();
 
     while (Date.now() - startTime < STARTUP_TIMEOUT_MS) {
-      if (this.bindDenied) {
-        throw new Error(this.bindDenied);
-      }
       if (await this.isServerRunning()) {
         return;
+      }
+      // Only once Caddy has exited: the same text inside a non-fatal log line
+      // (an upstream's error, say) must not fail a Caddy that is up.
+      if (this.bindDenied && this.serverProcess === null) {
+        throw new Error(this.bindDenied);
       }
       await this.sleep(HEALTH_CHECK_INTERVAL_MS);
     }

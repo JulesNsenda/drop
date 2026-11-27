@@ -51,8 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Nothing broke until the next DROP restart, often a reboot days later.
   `install.sh` now installs an apt hook (`/etc/apt/apt.conf.d/99drop-caddy-cap`)
   that re-grants the capability after every package run. **An existing box gets
-  it on its next `install.sh --upgrade` or `--bootstrap`**: a CI deploy's
-  `--provision` does not refresh provisioning logic. If Caddy is refused a
+  it when a trusted `install.sh` is run as root with `--bootstrap`** (copied
+  in, as docs/HETZNER-DEPLOY.md describes; never the drop-owned
+  `/opt/drop/install.sh`). A CI deploy's `--provision` does not refresh
+  provisioning logic. The hook grants the capability only to a root-owned
+  regular file that only root can write. If Caddy is refused a
   privileged port anyway, DROP now fails Caddy's start at once with the
   `setcap` command that fixes it, instead of a generic timeout after 10s.
 
