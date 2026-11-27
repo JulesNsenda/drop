@@ -12,9 +12,11 @@ import { isReservedEnvName } from '../../../utils/reserved-env';
 
 // Reserved env prefixes (DROP_, AWS_, CF_) carry platform secrets and must never
 // be exposed to a deployed app's (untrusted) build scripts; the list lives in
-// utils/reserved-env.ts, shared with the PM2 start path. Everything else from
-// the parent env is preserved — PATH, SystemRoot/APPDATA/COMSPEC (Windows needs
-// these to run node/npm at all), proxy vars, NODE_EXTRA_CA_CERTS, npm_config_*.
+// utils/reserved-env.ts, shared with the PM2 start path. For a build on the
+// host, everything else from the parent env is preserved — PATH,
+// SystemRoot/APPDATA/COMSPEC (Windows needs these to run node/npm at all),
+// proxy vars, NODE_EXTRA_CA_CERTS, npm_config_*. A container build gets almost
+// none of it: see `containerBuildEnv` in container-build-runner.ts.
 
 /**
  * Reserved-prefix names the platform itself sets for a build and allows through
@@ -42,17 +44,25 @@ const PLATFORM_SET_BUILD_VARS: ReadonlySet<string> = new Set(['DROP_GIT_COMMIT']
  * gets a diagnosable failure instead of a mystery.
  */
 export function sanitizeBuildEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const isSecretKey = isReservedEnvName;
-
   const out: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (isSecretKey(key)) continue;
+    if (isReservedEnvName(key)) continue;
     out[key] = value;
   }
+  return { ...out, ...filterBuildOverrides(overrides) };
+}
 
+/**
+ * A build's overrides minus reserved-prefix names (except the platform-set
+ * ones), warning about each one dropped. Shared by the host env above and the
+ * container build env (`container-build-runner.ts`), so both refuse the same
+ * names.
+ */
+export function filterBuildOverrides(overrides: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
   const refused: string[] = [];
   for (const [key, value] of Object.entries(overrides)) {
-    if (isSecretKey(key) && !PLATFORM_SET_BUILD_VARS.has(key)) {
+    if (isReservedEnvName(key) && !PLATFORM_SET_BUILD_VARS.has(key)) {
       refused.push(key);
       continue;
     }
@@ -63,7 +73,6 @@ export function sanitizeBuildEnv(overrides: Record<string, string> = {}): NodeJS
       `[build-env] refusing to pass reserved-prefix variables to a build command: ${refused.join(', ')}`
     );
   }
-
   return out;
 }
 

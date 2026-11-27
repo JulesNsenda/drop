@@ -565,9 +565,11 @@ export class BuilderService {
     // app's encrypted secrets), the GitHub webhook secret and the DNS API
     // tokens were all reachable from a one-line `postinstall`.
     //
-    // Nothing is lost by dropping it: the parent env (PATH, SystemRoot,
-    // proxies, npm_config_*, …) is still supplied — filtered — by
-    // `sanitizeBuildEnv` at the point each command is actually executed. What
+    // The env each command really gets is decided where it is executed: a
+    // host build gets the filtered parent env (PATH, SystemRoot, proxies,
+    // npm_config_*, …) from `sanitizeBuildEnv`; a container build gets only the
+    // host proxy variables, from `containerBuildEnv` (#419). Never add host
+    // values here to fix a container build: this is how they leaked. What
     // remains here is exactly what SHOULD be an override: the app's own
     // drop.yaml `env`/`build_env`, its depends_on URLs, and NODE_ENV.
     const env = {
@@ -605,7 +607,8 @@ export class BuilderService {
     // (forced by executeEnvironment for the compile, and/or set via the app's drop.yaml env) makes npm
     // omit devDependencies, so the build step can't find its compiler. Force dev deps in for INSTALL
     // only; the build/compile stage keeps context.env (NODE_ENV=production) so output stays a production
-    // bundle. sanitizeBuildEnv (base.ts) preserves npm_config_*; npm>=7 include=dev overrides the omit.
+    // bundle. Passed as an override, so it reaches host and container builds alike; npm>=7
+    // include=dev overrides the omit.
     const installEnv = { ...context.env, npm_config_include: 'dev' };
 
     // The install really runs from here (not for a skipped one): the dependency

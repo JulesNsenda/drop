@@ -27,6 +27,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-11-27
+
+### Security
+
+- **Docker-isolation builds no longer inherit the platform's environment, and
+  Go builds work again** (#419). A build container used to receive every host
+  variable outside the reserved `DROP_`/`AWS_`/`CF_` prefixes, so credentials
+  in the platform's own environment (a `GITHUB_TOKEN`, SMTP or database
+  settings) reached untrusted build commands. The host `PATH` also replaced
+  the image's, and the golang image keeps `go` outside it, so every Go build
+  under `isolation: docker` failed with `go: not found`. A container build now
+  gets only its app's `drop.yaml` env, the platform's own build variables and
+  the host's proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, either
+  case). Proxy URLs are passed as is, credentials included. Host
+  `npm_config_*` and CA-bundle variables (`NODE_EXTRA_CA_CERTS`) are no longer
+  inherited: set what a build needs in `drop.yaml` `build_env`. Builds under
+  `isolation: none` are unchanged.
+
+### Fixed
+
+- **An upgrade of the caddy package no longer takes every site down at the
+  next restart** (#417). Upgrading caddy replaces its binary without
+  `cap_net_bind_service`, which DROP's non-root Caddy needs to bind 80/443.
+  Nothing broke until the next DROP restart, often a reboot days later.
+  `install.sh` now installs an apt hook (`/etc/apt/apt.conf.d/99drop-caddy-cap`)
+  that re-grants the capability after every package run. **An existing box gets
+  it when a trusted `install.sh` is run as root with `--bootstrap`** (copied
+  in, as docs/HETZNER-DEPLOY.md describes; never the drop-owned
+  `/opt/drop/install.sh`). A CI deploy's `--provision` does not refresh
+  provisioning logic. The hook grants the capability only to a root-owned
+  regular file that only root can write. If Caddy is refused a
+  privileged port anyway, DROP now fails Caddy's start at once with the
+  `setcap` command that fixes it, instead of a generic timeout after 10s.
+
+
 ## [1.8.2] - 2026-11-26
 
 ### Security

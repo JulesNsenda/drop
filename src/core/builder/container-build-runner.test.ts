@@ -106,6 +106,72 @@ describe('executeCommandInContainer', () => {
     expect(homeEntries).toEqual(['HOME=/tmp']);
   });
 
+  describe('build env (#419)', () => {
+    const saved = { ...process.env };
+    afterEach(() => {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+    });
+
+    async function envOf(env: Record<string, string>): Promise<Record<string, string>> {
+      const docker = makeDockerMock();
+      await executeCommandInContainer(docker, { ...baseOpts, env });
+      const entries = docker.createContainer.mock.calls[0][0].Env as string[];
+      return Object.fromEntries(entries.map((e) => [e.slice(0, e.indexOf('=')), e.slice(e.indexOf('=') + 1)]));
+    }
+
+    it('passes no host variable except the proxy ones', async () => {
+      for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy']) {
+        delete process.env[k];
+      }
+      process.env.GITHUB_TOKEN = 'ghp_secret';
+      process.env.SMTP_PASSWORD = 'mail-secret';
+      process.env.PGPASSWORD = 'pg-secret';
+      process.env.HTTPS_PROXY = 'http://proxy.internal:3128';
+
+      const env = await envOf({ NODE_ENV: 'production' });
+
+      // Windows env names are case-insensitive, so https_proxy shows up there
+      // too; compare names ignoring case.
+      const names = new Set(Object.keys(env).map((k) => k.toUpperCase()));
+      expect([...names].sort()).toEqual(['HOME', 'HTTPS_PROXY', 'NODE_ENV']);
+      expect(env.HTTPS_PROXY).toBe('http://proxy.internal:3128');
+      expect(env.HOME).toBe('/tmp');
+    });
+
+    it("never passes PATH, so the image's own PATH (go in /usr/local/go/bin) stands", async () => {
+      process.env.PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin';
+
+      const env = await envOf({ PATH: '/app/bin', GOOS: 'linux' });
+
+      expect(env.PATH).toBeUndefined();
+      expect(env.GOOS).toBe('linux');
+    });
+
+    it('still refuses reserved-prefix overrides and keeps the platform-set DROP_GIT_COMMIT', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const env = await envOf({ DROP_API_KEY: 'k', AWS_SECRET_ACCESS_KEY: 's', DROP_GIT_COMMIT: 'abc123' });
+
+        expect(env.DROP_API_KEY).toBeUndefined();
+        expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+        expect(env.DROP_GIT_COMMIT).toBe('abc123');
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('DROP_API_KEY, AWS_SECRET_ACCESS_KEY'));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('lets an app override a proxy variable but never HOME', async () => {
+      process.env.HTTPS_PROXY = 'http://proxy.internal:3128';
+
+      const env = await envOf({ HTTPS_PROXY: 'http://app-proxy:8080', HOME: '/root' });
+
+      expect(env.HTTPS_PROXY).toBe('http://app-proxy:8080');
+      expect(env.HOME).toBe('/tmp');
+    });
+  });
+
   it('sets AutoRemove so the container cleans itself up', async () => {
     const docker = makeDockerMock();
     await executeCommandInContainer(docker, baseOpts);
