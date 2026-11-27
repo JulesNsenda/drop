@@ -229,6 +229,33 @@ describe('DropPlatform.rollbackApp (#296)', () => {
     expect(startSpy).not.toHaveBeenCalled();
   }, 20000);
 
+  // #423: the pull used to happen after restoreInto had already swapped the tree.
+  it('refuses before restoring when the runtime image cannot be fetched', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await deployV1('site');
+    await badRedeploy('site', appPath);
+    const rt = fakeRuntime as unknown as { prepareStart?: (appType: string) => Promise<void> };
+    rt.prepareStart = jest.fn().mockRejectedValue(new Error('toomanyrequests: 429 Too Many Requests'));
+    try {
+      const deleteSpy = jest.spyOn(fakeRuntime, 'delete');
+
+      await expect(platform.rollbackApp('site')).rejects.toThrow(/toomanyrequests/);
+
+      // The bad deploy is still what is on disk and serving; nothing was taken down.
+      expect(await fs.readFile(path.join(appPath, 'index.html'), 'utf-8')).toBe('<h1>v2 broken</h1>');
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(getStateManager().getApp('site')?.status).toBe('running');
+
+      // The snapshot was not consumed: once the pull works, the rollback does too.
+      delete rt.prepareStart;
+      await platform.rollbackApp('site');
+      expect(await fs.readFile(path.join(appPath, 'index.html'), 'utf-8')).toBe('<h1>v1</h1>');
+    } finally {
+      delete rt.prepareStart;
+    }
+  }, 20000);
+
   it('refuses while the app is busy, and releases its own guard afterwards', async () => {
     platform = makePlatform();
     await platform.start();

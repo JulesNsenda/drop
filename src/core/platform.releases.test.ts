@@ -286,6 +286,31 @@ describe('release directories (#298 step 3)', () => {
     expect(await getRollbackStore()!.get('site')).toBeNull();
   }, 30000);
 
+  // #423: the pull used to land after commitServedPath had already swapped the records.
+  it('a release rollback whose image cannot be fetched commits nothing', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createApp('site', OPT_IN);
+    await deploy('site', appPath);
+    const firstRelease = current('site')!;
+    await redeploy('site', appPath, '<h1>site v2</h1>');
+    const secondRelease = current('site')!;
+    const rt = fakeRuntime as unknown as { prepareStart?: (appType: string) => Promise<void> };
+    rt.prepareStart = jest.fn().mockRejectedValue(new Error('toomanyrequests: 429 Too Many Requests'));
+    try {
+      const deleteSpy = jest.spyOn(fakeRuntime, 'delete');
+
+      await expect(platform.rollbackApp('site')).rejects.toThrow(/toomanyrequests/);
+
+      expect(current('site')?.path).toBe(secondRelease.path);
+      expect(previous('site')?.path).toBe(firstRelease.path);
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(getStateManager().getApp('site')?.status).toBe('running');
+    } finally {
+      delete rt.prepareStart;
+    }
+  }, 30000);
+
   it('a failed start discards the new release and leaves the serving one recorded', async () => {
     platform = makePlatform();
     await platform.start();

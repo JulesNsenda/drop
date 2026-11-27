@@ -223,6 +223,58 @@ describe('DropPlatform.restartApp', () => {
     expect(result.status).toBe('running');
   }, 20000);
 
+  // #423: a failed image pull used to land AFTER the delete, leaving nothing serving.
+  it('fetches what the start needs before deleting, and keeps the old instance when that fails', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+
+    const rt = fakeRuntime as unknown as { prepareStart?: (appType: string) => Promise<void> };
+    const prepareStart = jest.fn().mockRejectedValue(new Error('toomanyrequests: 429 Too Many Requests'));
+    rt.prepareStart = prepareStart;
+    try {
+      const deleteSpy = jest.spyOn(fakeRuntime, 'delete');
+      const startSpy = jest.spyOn(fakeRuntime, 'start');
+      startSpy.mockClear();
+
+      await expect(platform!.restartApp('site')).rejects.toThrow(/toomanyrequests/);
+
+      expect(prepareStart).toHaveBeenCalledWith('static');
+      expect(deleteSpy).not.toHaveBeenCalled();
+      expect(startSpy).not.toHaveBeenCalled();
+      expect((await fakeRuntime.getStatus('site'))?.status).toBe('running');
+      expect(getStateManager().getApp('site')?.status).toBe('running');
+
+      // And on success it runs first: the image is in hand before the old instance goes.
+      prepareStart.mockReset().mockResolvedValue(undefined);
+      await platform!.restartApp('site');
+      expect(prepareStart.mock.invocationCallOrder[0]).toBeLessThan(deleteSpy.mock.invocationCallOrder[0]);
+    } finally {
+      delete rt.prepareStart;
+    }
+  }, 20000);
+
+  it('still records why, when the image cannot be fetched for an app that is not running', async () => {
+    platform = makePlatform();
+    await platform.start();
+    const appPath = await createStaticApp('site');
+    await deploy('site', appPath);
+    await fakeRuntime.delete('site');
+
+    const rt = fakeRuntime as unknown as { prepareStart?: (appType: string) => Promise<void> };
+    rt.prepareStart = jest.fn().mockRejectedValue(new Error('toomanyrequests: 429 Too Many Requests'));
+    try {
+      await expect(platform!.restartApp('site')).rejects.toThrow(/toomanyrequests/);
+
+      expect(getStateManager().getApp('site')).toEqual(
+        expect.objectContaining({ status: 'errored', error: expect.stringMatching(/toomanyrequests/) })
+      );
+    } finally {
+      delete rt.prepareStart;
+    }
+  }, 20000);
+
   it('fails visibly, without starting, when the old process survives delete', async () => {
     platform = makePlatform();
     await platform.start();
