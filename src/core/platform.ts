@@ -10028,6 +10028,11 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
         throw new StaleDependenciesError(appName);
       }
 
+      // Before restoreInto too: a failed pull refuses the rollback rather than
+      // leaving the restored tree under the old, still-running instance (#423).
+      // By recorded type: the tree on disk is not the one that will start.
+      await this.runtime?.prepareStart?.(this.appTypeOf(appName, config));
+
       const appPath = this.servingPathOf(appName, config, state);
       // Re-checked right before the irreversible step: the awaits above could
       // have outlived a suspension, and restoreInto empties the app directory.
@@ -10133,6 +10138,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
 
     // Not running, or not something traffic can be cut over for: serve the
     // previous release from the next start, as a snapshot rollback would.
+    // Fetched before the release is committed: a failed pull must not leave
+    // currentRelease naming a release that never started (#423).
+    await this.prepareStartAt(release.path);
     // Re-checked before the first write; a second check after it would leave
     // the outputDirectory written and the release not committed (a torn rollback).
     this.assertStartable(appName);
@@ -10145,6 +10153,19 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     await this.restoreGitCommit(appName, release.gitCommit);
     const info = await this.doRestart(appName);
     return { meta, info };
+  }
+
+  /**
+   * Fetch what a start from `appPath` needs (Docker: its runtime image) while the
+   * live version still serves. Callers run it before their first step that cannot
+   * be undone, so a failed pull (a registry 429) refuses the operation instead of
+   * leaving it half-done (#423). The image then sits in the local cache, so the
+   * start's own pull is cheap. A no-op for a runtime with nothing to fetch.
+   */
+  private async prepareStartAt(appPath: string): Promise<void> {
+    if (!this.detector || !this.runtime?.prepareStart) return;
+    const detection = await this.detector.detect(appPath, { silent: true });
+    await this.runtime.prepareStart(detection.type);
   }
 
   /**
@@ -10598,6 +10619,23 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
     // Before the delete below: a refused restart leaves a running app running.
     await this.assertDependenciesCurrent(appName, appPath);
 
+    // Fetch what the new start needs (Docker: its runtime image) while the old
+    // version still serves, as buildAndSwap does: the delete below is what
+    // takes it away, and a failed pull after that left nothing serving (#423).
+    let detection: DetectionResult;
+    try {
+      detection = await this.detector.detect(appPath, { silent: true });
+      await this.runtime.prepareStart?.(detection.type);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to restart';
+      this.logger.appEvent('error', appName, message);
+      // Nothing was replaced: a running app keeps serving, and keeps its status.
+      if (!isRunning) await this.stateManager.setAppStatus(appName, 'errored', { error: message });
+      throw error;
+    }
+    // The pull can take minutes: re-checked before the delete, as buildAndSwap does.
+    this.assertStartable(appName);
+
     try {
       // Delete, not stop: PM2's env update on a bare restart/start is a
       // merge, so a removed secret would keep being injected; delete forces
@@ -10605,7 +10643,6 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       // spec built below is what actually ends up running.
       await this.replaceLiveProcess(appName);
 
-      const detection = await this.detector.detect(appPath, { silent: true });
       const { spec, port } = await this.buildFreshStartSpec(appName, appPath, detection);
       // Also here, even though a plain restart opens no deploy episode and
       // the store will discard it — so that a start site is never the one
@@ -12515,6 +12552,9 @@ window.DROP_CONFIG = ${JSON.stringify(envVars, null, 2)};
       ? pending.releasePath
       : this.servingPathOf(appName, config, this.stateManager?.getApp(appName));
     await this.assertDependenciesCurrent(appName, heldPath);
+    // Also before the hold is cleared: a failed pull keeps the build held, rather
+    // than discarding it while the old version still serves (#423).
+    await this.prepareStartAt(heldPath);
 
     // Claimed BEFORE the held state is cleared, so a refusal keeps the build
     // held and nothing else can be writing this app while it swaps.

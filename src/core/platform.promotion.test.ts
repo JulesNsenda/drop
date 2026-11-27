@@ -196,6 +196,20 @@ describe('promoteApp', () => {
     expect(handleStartApp).not.toHaveBeenCalled();
   });
 
+  // #423: a failed pull used to come after the hold was cleared, discarding the build.
+  it('keeps the build held when the runtime image cannot be fetched', async () => {
+    (platform as any).detector = { detect: jest.fn().mockResolvedValue({ type: 'static' }) };
+    (platform as any).runtime = {
+      prepareStart: jest.fn().mockRejectedValue(new Error('toomanyrequests: 429 Too Many Requests')),
+    };
+
+    await expect(platform.promoteApp('app')).rejects.toThrow(/toomanyrequests/);
+
+    expect(updateConfig).not.toHaveBeenCalled();
+    expect(handleStartApp).not.toHaveBeenCalled();
+    expect((platform as any).appsInProgress.has('app')).toBe(false);
+  });
+
   it('releases the in-progress guard even when the start throws', async () => {
     // Otherwise a failed promotion wedges the app out of every future deploy.
     handleStartApp.mockRejectedValue(new Error('start failed'));
