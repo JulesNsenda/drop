@@ -4,6 +4,7 @@
 
 import * as fs from 'fs/promises';
 import {
+  bindDeniedHint,
   CaddyServer,
   getCaddyServer,
   resetCaddyServer,
@@ -403,6 +404,88 @@ describe('CaddyServer', () => {
       // Should not attempt to start
       expect(mockExecSync).not.toHaveBeenCalled();
       expect(testConfig.onLog).toHaveBeenCalledWith('Caddy not available - skipping start');
+    });
+
+    describe('a refused privileged bind (#417)', () => {
+      // Caddy 2.11's own line, captured from a non-root Caddy with no capability.
+      const REAL_LINE =
+        '{"level":"error","ts":1795724034.23318,"msg":"loading initial config: loading new config: ' +
+        'http app module: start: listening on :80: listen tcp :80: bind: permission denied"}';
+
+      /** A Caddy that writes one stderr line and then, if `exits`, exits 1 as a fatal error does. */
+      function spawnEmitting(stderrLine: string, exits = true): void {
+        mockSpawn.mockImplementation(() => {
+          let onExit: ((code: number, signal: null) => void) | undefined;
+          const proc = {
+            stdout: { on: jest.fn() },
+            stderr: {
+              on: jest.fn((event: string, cb: (d: Buffer) => void) => {
+                if (event !== 'data') return;
+                setTimeout(() => {
+                  cb(Buffer.from(stderrLine));
+                  if (exits) setTimeout(() => onExit?.(1, null), 5);
+                }, 5);
+              }),
+            },
+            on: jest.fn((event: string, cb: (code: number, signal: null) => void) => {
+              if (event === 'exit') onExit = cb;
+            }),
+            kill: jest.fn(),
+            once: jest.fn(),
+          };
+          return proc;
+        });
+      }
+
+      it('fails at once with the fix instead of waiting out the startup timeout', async () => {
+        const onError = jest.fn();
+        mockExecSync.mockReturnValue(Buffer.from('/usr/bin/caddy\n'));
+        mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+        spawnEmitting(REAL_LINE);
+        const server = new CaddyServer({ ...testConfig, onError });
+
+        const began = Date.now();
+        await expect(server.start()).rejects.toThrow(bindDeniedHint('80', '/usr/bin/caddy'));
+
+        expect(Date.now() - began).toBeLessThan(5000);
+        expect(server.getStatus()).toBe('error');
+        expect(onError).toHaveBeenCalledWith(bindDeniedHint('80', '/usr/bin/caddy'));
+      });
+
+      it('names the port for an IPv6 listener too', async () => {
+        mockFetch.mockRejectedValue(new Error('ECONNREFUSED'));
+        spawnEmitting('Error: listen tcp [::]:443: bind: permission denied');
+        const server = new CaddyServer(testConfig);
+
+        await expect(server.start()).rejects.toThrow('Caddy may not bind port 443.');
+      });
+
+      it('does not fail a Caddy that is up when a log line merely contains the text', async () => {
+        let polls = 0;
+        mockFetch.mockImplementation(async () => {
+          polls++;
+          if (polls < 3) throw new Error('ECONNREFUSED');
+          return { ok: true, text: jest.fn().mockResolvedValue('') } as unknown as Response;
+        });
+        spawnEmitting('upstream said: listen tcp :25: bind: permission denied', false);
+        const server = new CaddyServer(testConfig);
+
+        await server.start();
+
+        expect(server.getStatus()).toBe('running');
+      });
+
+      it('gives the setcap fix on Linux only', () => {
+        const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        try {
+          Object.defineProperty(process, 'platform', { value: 'linux' });
+          expect(bindDeniedHint('443', '/opt/bin/caddy')).toContain('sudo setcap cap_net_bind_service=+ep /opt/bin/caddy');
+          Object.defineProperty(process, 'platform', { value: 'darwin' });
+          expect(bindDeniedHint('443', '/opt/bin/caddy')).not.toContain('setcap');
+        } finally {
+          Object.defineProperty(process, 'platform', platform);
+        }
+      });
     });
   });
 
