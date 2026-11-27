@@ -205,7 +205,7 @@ jest.mock('fs/promises', () => {
     }),
     rename: jest.fn().mockResolvedValue(undefined),
     rm: jest.fn().mockResolvedValue(undefined),
-    readFile: jest.fn().mockImplementation(async (filePath: string) => {
+    readFile: jest.fn().mockImplementation(async (filePath: string, ...rest: unknown[]) => {
       // Return package.json for test apps
       if (filePath.endsWith('package.json')) {
         return JSON.stringify({
@@ -217,7 +217,9 @@ jest.mock('fs/promises', () => {
           },
         });
       }
-      return actual.readFile(filePath);
+      // Forward the encoding (#416): without it a real file comes back as a
+      // Buffer, and a dev box with DROP installed has a real Caddyfile.
+      return actual.readFile(filePath, ...rest);
     }),
     stat: jest.fn().mockImplementation(async (_filePath: string) => {
       // Mock directory stats
@@ -1991,7 +1993,7 @@ describe('resolveBuildEnv / resolveDependencies (M1: build-time env + browser-re
   afterAll(() => {
     // Restore the file-level default so later-running suites (if any) aren't
     // affected — this suite is the last in the file, but keep it hygienic.
-    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: string) => {
+    (fsPromises.readFile as jest.Mock).mockImplementation(async (filePath: string, ...rest: unknown[]) => {
       if (filePath.endsWith('package.json')) {
         return JSON.stringify({
           name: 'test-app',
@@ -2000,7 +2002,7 @@ describe('resolveBuildEnv / resolveDependencies (M1: build-time env + browser-re
         });
       }
       const actual = jest.requireActual('fs/promises') as typeof fsPromises;
-      return actual.readFile(filePath as never);
+      return (actual.readFile as (...a: unknown[]) => Promise<unknown>)(filePath, ...rest);
     });
   });
 
